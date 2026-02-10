@@ -13,7 +13,7 @@ def test_real_pipeline():
     config_path = "config/config.yaml"
     
     # Force CPU to avoid OOM
-    device = "cpu"
+    device = "cuda"
     print(f"Using device: {device}")
 
     # Initialize
@@ -33,7 +33,7 @@ def test_real_pipeline():
     full_path = os.path.join(data_cfg['dir_path'], data_cfg['train_path'])
     print(f"Data path: {full_path}")
 
-    generator.fit(data_source=full_path, epochs=1, save_path=results_dir)
+    generator.fit(data_source=full_path, epochs=10, save_path=results_dir)
     print("Fit completed.")
     
     # Test Generation

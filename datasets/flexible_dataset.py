@@ -8,11 +8,13 @@ from torch.utils.data import Dataset
 from tqdm import tqdm
 
 from utils.math.sbto_utils import compute_sbto_components
+from utils.math.math_tools import yaw_from_quat, yaw_to_rot_matrix
 from utils.math.rotation_conversions import (
     rotation_6d_to_matrix, 
     matrix_to_rotation_6d, 
     axis_angle_to_quaternion, 
-    quaternion_to_matrix
+    quaternion_to_matrix,
+    matrix_to_quaternion
 )
 
 class FlexibleWindowDataset(Dataset):

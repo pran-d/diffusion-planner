@@ -13,6 +13,9 @@ from config.configure import load_config, get_data_path, get_save_path, get_norm
 from models.model import RobotDiffuser
 from datasets.flexible_dataset import FlexibleWindowDataset
 from utils.math.sbto_utils import reconstruct_sbto_trajectory
+from utils.math.math_tools import yaw_from_quat, yaw_to_rot_matrix
+from utils.math.rotation_conversions import quaternion_to_matrix, matrix_to_quaternion
+
 
 def apply_condition_dropout(cond, dropout_prob: float):
     if cond is None or dropout_prob <= 0.0:
@@ -312,7 +315,7 @@ class MotionGenerator:
     def generate_trajectory(self, 
                             initial_condition: Dict, 
                             goal_condition: Union[Dict, np.ndarray],
-                            stitch_steps: int = 1, 
+                            stitch_steps: int = 5, 
                             num_samples: int = 1):
         """
         Generate trajectory.
@@ -336,11 +339,7 @@ class MotionGenerator:
         # 1. Process Initial Condition
         # We assume initial_condition contains raw history to compute encoded state
         # robot: (H, 36), obj: (H, 7)
-        # We need to turn this into `curr_state_tens` and `current_anchors`
-        
-        # Check input format. If user passes already processed tensor, use it?
-        # Let's stick to world frame history for API clean-ness.
-        
+    
         r_hist = initial_condition['robot'] # (H, 36)
         o_hist = initial_condition['obj']   # (H, 7)
         
@@ -348,40 +347,45 @@ class MotionGenerator:
         if r_hist.ndim == 2: r_hist = r_hist[None, ...]
         if o_hist.ndim == 2: o_hist = o_hist[None, ...]
         
-        # Replicate for num_samples
-        # But wait, num_samples is usually creating variations from ONE condition.
-        # If user passes multiple conditions, num_samples likely means per condition?
-        # Let's assume input is 1 condition, and we replicate.
-        
-        if r_hist.shape[0] != 1:
-             # Just use as is, assume user knows what they are doing with batching?
-             # For now, let's assume 1 input condition for simplicity, or handle batching.
-             pass
-
         # We first need to "update_condition" to get features from raw history
-        curr_state_tens, current_anchors = self._update_condition(r_hist, o_hist, goal_condition)
+        curr_state_tens, current_anchors = self._update_condition(r_hist, o_hist, goal_condition=None)
         
         # Now replicate for num_samples
-        # curr_state_tens: (1, H, D) -> (num_samples, H, D)
-        curr_state_tens = curr_state_tens.repeat(num_samples, 1, 1).to(self.device)
+        if curr_state_tens.shape[0] == 1 and num_samples > 1:
+            curr_state_tens = curr_state_tens.repeat(num_samples, 1, 1).to(self.device)
         
-        current_anchors['ref_pos'] = np.repeat(current_anchors['ref_pos'], num_samples, axis=0)
-        current_anchors['ref_quat'] = np.repeat(current_anchors['ref_quat'], num_samples, axis=0)
+        # 2. Process Goal (Absolute Frame, matching Training Pipeline)
         
-        # 2. Process Goal
-        # If goal is already vector, normalize it
+        # Goal Parsing
         if isinstance(goal_condition, (np.ndarray, list)):
-             task_params = torch.tensor(goal_condition).float()
+             gc = np.array(goal_condition) # (7,) or (1, 7) or (B, 7)
+             if gc.ndim == 1: gc = gc[None, :]
+             
+             # If broadcasting needed
+             if gc.shape[0] == 1 and curr_state_tens.shape[0] // num_samples > 1:
+                 # Match original batch size B
+                 B = curr_state_tens.shape[0] // num_samples
+                 gc = np.repeat(gc, B, axis=0)
+
+             task_params = torch.from_numpy(gc).float()
+
         else:
              # Assume dict, maybe extract?
              raise ValueError("Goal condition format not supported yet")
         
-        # Normalize task params
-        task_params = self.dataset._normalize("task_params", task_params) # (D,) or (1, D)
-        if task_params.ndim == 1:
-            task_params = task_params.unsqueeze(0)
+        # Normalize (Absolute) task params
+        task_params = self.dataset._normalize("task_params", task_params) # (B, D)
         
-        task_tens = task_params.repeat(num_samples, 1).to(self.device)
+        # Replicate for num_samples
+        if task_params.shape[0] == 1 and num_samples > 1:
+            task_params = task_params.repeat(num_samples, 1)
+        
+        task_tens = task_params.to(self.device)
+        curr_state_tens = curr_state_tens.to(self.device)
+        
+        # Update anchors for reconstruction
+        current_anchors['ref_pos'] = np.repeat(current_anchors['ref_pos'], num_samples, axis=0)
+        current_anchors['ref_quat'] = np.repeat(current_anchors['ref_quat'], num_samples, axis=0)
         
         history_size = self.dataset.history_size
         stitched_segments = []
