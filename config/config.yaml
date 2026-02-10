@@ -1,0 +1,58 @@
+auto_conf: False
+resume: False
+resume_checkpoint: 1000
+
+data:
+  dir_path: "/home/pranish/pranav/diffusion-mp/simple_diffusion/"
+  train_path: "test_datasets/Box_Height_FoLM"
+  batch_size: 512
+  num_features: 48
+  num_observations: 45
+  num_timesteps: 50
+  state_history: 1
+
+model:
+  type: "dfot"
+  backbone_type: "dit1d"
+  state_condition: True
+  task_condition: True
+  external_cond_dropout: 0.1
+  hidden_size: 128
+  depth: 12
+  num_heads: 8
+  mlp_ratio: 4.0
+  pos_emb_type: "sinusoidal_1d"
+
+noise_scheduler:
+  deterministic_inference: True
+  train_timesteps: 400
+  inference_timesteps: 20
+  prediction_type: "v_prediction"
+  beta_schedule: "squaredcos_cap_v2" 
+  return_steps: False
+
+training:
+  num_epochs: 10000
+  batches_per_epoch: 256
+  learning_rate: 0.0005
+  save_dir: "/home/pranish/pranav/diffusion-mp/simple_diffusion/runs/runs/ablations/study7/"
+  log_dir: "/home/pranish/pranav/diffusion-mp/simple_diffusion/runs/logs/ablations/study7/"
+  suffix: "_trajectory_goal"
+  save_every: 20
+  condition_dropout_prob: 
+    state: 0.1
+    task: 0.1
+  add_obs_noise: True
+  add_goal_noise: True
+  state_conditioning_noise_level:
+    joints: 0.01
+    body_z: 0.01
+    body_rot6d: 0.02
+    obj_rel_pos: 0.01
+    obj_rel_rot6d: 0.02
+    # joint_vel: 0.2
+    # body_lin_vel: 0.1
+    # body_ang_vel: 0.1
+    # obj_lin_vel: 0.1
+    # obj_ang_vel: 0.1
+    task_params: 0.02
