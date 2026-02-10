@@ -1,0 +1,425 @@
+import torch
+import numpy as np
+import yaml
+import os
+import time
+from typing import List, Dict, Union, Optional
+from torch.utils.data import DataLoader
+from torch.amp import GradScaler
+from torch import nn, optim
+from tqdm import tqdm
+
+from config.configure import load_config, get_data_path, get_save_path, get_norm_path
+from models.model import RobotDiffuser
+from datasets.flexible_dataset import FlexibleWindowDataset
+from utils.math.sbto_utils import reconstruct_sbto_trajectory
+
+def apply_condition_dropout(cond, dropout_prob: float):
+    if cond is None or dropout_prob <= 0.0:
+        return cond
+    if not torch.is_tensor(cond):
+        cond = torch.as_tensor(cond)
+    if torch.rand(1).item() < dropout_prob:
+        return torch.zeros_like(cond)
+    return cond
+
+class MotionGenerator:
+    def __init__(self, config_path: str = "config/config.yaml", device: str = None):
+        self.config_path = config_path
+        
+        # Load Config
+        with open(config_path, 'r') as file:
+            raw_config = yaml.safe_load(file)
+        
+        self.model_cfg, self.data_cfg, self.training_cfg, self.noise_cfg = load_config(
+            config_path, raw_config.get("auto_conf", False)
+        )
+        
+        self.device = torch.device(device if device else ("cuda" if torch.cuda.is_available() else "cpu"))
+        
+        # Initialize Model
+        self.diffuser = RobotDiffuser(
+            model_config=self.model_cfg, 
+            data_config=self.data_cfg,
+            training_config=self.training_cfg, 
+            noise_scheduler_config=self.noise_cfg,
+            mode='inference', # Default to inference, but 'train' or 'inference' just sets up scheduler mainly
+            device=self.device
+        )
+        
+        self.dataset = None # To be initialized in fit or loaded
+
+        # Try to load existing stats if available to be ready for inference
+        self._setup_dataset_structure(load_stats=True)
+
+
+    def _setup_dataset_structure(self, load_stats=True):
+        """Helper to init a dummy dataset just for stats/normalization logic."""
+        norm_path = get_norm_path(self.model_cfg, self.training_cfg, self.data_cfg)
+        
+        # If we have stats, we can init a dataset without data just for utils
+        if load_stats and norm_path and os.path.exists(norm_path):
+             # We create a dummy dataset with empty buffer just to load stats
+             self.dataset = FlexibleWindowDataset(
+                data_root=None,
+                data_buffer=[], # Empty
+                config=self.data_cfg, 
+                calculate_stats=False, 
+                norm_path=norm_path,
+                noise_cfg={}
+            )
+
+    def load_weights(self, path_or_epoch: Union[str, int]):
+        """Load weights from path or epoch number."""
+        if isinstance(path_or_epoch, int):
+            self.diffuser.loadWeights(path_or_epoch)
+        else:
+            if os.path.exists(path_or_epoch):
+                self.diffuser.load_weights_from_file(path_or_epoch)
+            else:
+                # Try as epoch number
+                try:
+                    self.diffuser.loadWeights(int(path_or_epoch))
+                except:
+                    raise ValueError(f"Could not load weights from {path_or_epoch}")
+
+    def fit(self, 
+            data_source: Union[str, List[Dict]], 
+            task_params: Optional[List[Dict]] = None,
+            epochs: int = None, 
+            save_path: str = None):
+        """
+        Train the model.
+        
+        Args:
+            data_source: Path to data folder (str) or list of trajectory dicts.
+            task_params: Optional list of task parameters (e.g. goals) aligned with data_source.
+            epochs: Number of epochs to train. Overrides config if provided.
+            save_path: Path to save model checkpoints. Overrides config if provided.
+        """
+        
+        if epochs is None:
+            epochs = self.training_cfg.get("num_epochs", 100)
+        
+        # Setup Data
+        norm_path = get_norm_path(self.model_cfg, self.training_cfg, self.data_cfg)
+        
+        data_root = None
+        data_buffer = None
+        
+        if isinstance(data_source, str):
+            data_root = data_source
+        else:
+            data_buffer = data_source
+
+        # Check if stats exist, else calculate
+        calculate_stats = True
+        if norm_path and os.path.exists(norm_path):
+            print(f"Found existing normalization stats at {norm_path}, reusing...")
+            calculate_stats = False
+
+        self.dataset = FlexibleWindowDataset(
+            data_root=data_root,
+            data_buffer=data_buffer,
+            task_params_buffer=task_params,
+            config=self.data_cfg, 
+            calculate_stats=calculate_stats, 
+            norm_path=norm_path,
+            noise_cfg=self.training_cfg.get("state_conditioning_noise_level", {}),
+            add_noise=self.training_cfg.get("add_obs_noise", False), 
+            add_goal_noise=self.training_cfg.get("add_goal_noise", False)
+        )
+        
+        # Create DataLoader
+        train_dataloader = DataLoader(
+            self.dataset, 
+            batch_size=self.data_cfg["batch_size"], 
+            num_workers=4,
+            shuffle=True,
+            pin_memory=True
+        ) # Removed persistent_workers to avoid pickling issues in some envs, add back if needed
+
+        # Optimizer & Scheduler
+        optimizer = torch.optim.AdamW(
+            self.diffuser.model.parameters(), 
+            lr=self.training_cfg.get("learning_rate", 1e-4),
+        )
+        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+            optimizer, T_max=epochs, eta_min=1e-6
+        )
+        scaler = GradScaler()
+        
+        self.diffuser.model.train()
+        
+        state_condition = self.model_cfg.get("state_condition", False)
+        task_condition = self.model_cfg.get("task_condition", False)
+        dropout_probs = self.training_cfg.get("condition_dropout_prob", {})
+        
+        print(f"Starting training for {epochs} epochs...")
+        
+        for epoch in range(epochs):
+            epoch_losses = []
+            pbar = tqdm(train_dataloader, desc=f"Epoch {epoch+1}/{epochs}")
+            
+            for step, batch in enumerate(pbar):
+                
+                batch_data = list(batch)
+                prediction_target = batch_data[0].to(self.device)
+                
+                state_cond = None
+                task_cond = None
+                idx = 1
+                
+                if state_condition:
+                    state_cond = batch_data[idx].to(self.device)
+                    state_cond = apply_condition_dropout(state_cond, dropout_probs.get("state", 0.0))
+                    idx += 1
+                
+                if task_condition:
+                    task_cond = batch_data[idx].to(self.device)
+                    task_cond = apply_condition_dropout(task_cond, dropout_probs.get("task", 0.0))
+                    idx += 1
+                
+                # Construct cond
+                cond = []
+                if state_cond is not None: cond.append(state_cond)
+                if task_cond is not None: cond.append(task_cond)
+                
+                model_cond = tuple(cond) if len(cond) > 0 else None
+                if len(cond) == 1: model_cond = cond[0]
+                
+                bs, ts, _ = prediction_target.shape
+                timesteps = torch.randint(
+                    0, self.diffuser.noise_scheduler.config.num_train_timesteps, (bs, ts,), device=self.device
+                ).long()
+                
+                with torch.autocast(device_type="cuda" if self.device.type=="cuda" else "cpu", dtype=torch.float32):
+                    diff_output = self.diffuser.model(
+                        prediction_target, 
+                        model_cond, 
+                        timesteps=timesteps, 
+                    )
+                    pred_loss = diff_output["loss"]
+                    loss = pred_loss.mean()
+
+                optimizer.zero_grad()
+                scaler.scale(loss).backward()
+                scaler.unscale_(optimizer)
+                nn.utils.clip_grad_norm_(self.diffuser.model.parameters(), 1.0)
+                scaler.step(optimizer)
+                scaler.update()
+                
+                epoch_losses.append(loss.item())
+                pbar.set_postfix({"loss": f"{loss.item():.4f}"})
+            
+            scheduler.step()
+            mean_loss = np.mean(epoch_losses)
+            print(f"Epoch {epoch+1} Mean Loss: {mean_loss:.5f}")
+            
+            # Save Checkpoint
+            if save_path:
+                # Check if save_path serves as a directory or a specific file prefix
+                is_dir_like = not (save_path.endswith('.pt') or save_path.endswith('.pth'))
+                
+                if is_dir_like:
+                     os.makedirs(save_path, exist_ok=True)
+                     fpath = os.path.join(save_path, f"model_{epoch+1}.pth")
+                else:
+                     os.makedirs(os.path.dirname(save_path), exist_ok=True)
+                     base, ext = os.path.splitext(save_path)
+                     fpath = f"{base}_{epoch+1}{ext}"
+                
+                checkpoint = {
+                    "model": self.diffuser.model.state_dict(),
+                    "optimizer": optimizer.state_dict(),
+                    "scaler": scaler.state_dict(),
+                    "scheduler": scheduler.state_dict()
+                }
+                torch.save(checkpoint, fpath)
+            elif (epoch + 1) % self.training_cfg.get("save_every", 50) == 0:
+                 # Default save
+                 save_dir = get_save_path(self.model_cfg, self.data_cfg, self.training_cfg)
+                 os.makedirs(save_dir, exist_ok=True)
+                 checkpoint = {
+                    "model": self.diffuser.model.state_dict(),
+                    # ...
+                 }
+                 torch.save(checkpoint, os.path.join(save_dir, f"model_{epoch}.pth"))
+
+
+    def _update_condition(self, robot_world_history, obj_world_history, goal_condition=None):
+        """
+        Update condition for next autoregressive step.
+        """
+        if self.dataset is None:
+             raise RuntimeError("Dataset not initialized. Call fit() or manually init dataset.")
+
+        B, H, _ = robot_world_history.shape
+        next_states = []
+        next_anchors = {'ref_pos': [], 'ref_quat': []}
+
+        for b in range(B):
+            r_slice = robot_world_history[b]
+            o_slice = obj_world_history[b]
+            
+            raw_chunk = {
+                'base': r_slice[:, :7],       
+                'joints': r_slice[:, 7:36],
+                'obj': o_slice[:, :7]
+            }
+            
+            # Helper to extract batch goal
+            tp = None
+            if goal_condition is not None:
+                if isinstance(goal_condition, (np.ndarray, torch.Tensor)) and len(goal_condition) == B:
+                    tp = goal_condition[b]
+                else: 
+                     # Fallback/Broadcast or dict
+                     tp = goal_condition
+
+            feats, new_anch = self.dataset._compute_transform(raw_chunk, t_start=0, task_params=tp)
+            
+            current_parts = []
+            obs_start_idx = self.dataset.num_features - self.dataset.num_observations
+            cumulative_dim = 0
+            
+            for key in self.dataset.feature_order:
+                if key in feats:
+                    part = torch.from_numpy(feats[key]).float()
+                    part = self.dataset._normalize(key, part) 
+                    
+                    part_dim = part.shape[-1]
+                    part_end = cumulative_dim + part_dim
+                    
+                    if part_end > obs_start_idx:
+                        local_start = max(0, obs_start_idx - cumulative_dim)
+                        current_parts.append(part[-H:, local_start:])
+                    
+                    cumulative_dim += part_dim
+            
+            c_state = torch.cat(current_parts, dim=-1)
+            next_states.append(c_state)
+            next_anchors['ref_pos'].append(new_anch['ref_pos'])
+            next_anchors['ref_quat'].append(new_anch['ref_quat'])
+
+        next_state_tens = torch.stack(next_states)
+        batched_anchor = {
+            'ref_pos': np.stack(next_anchors['ref_pos']),
+            'ref_quat': np.stack(next_anchors['ref_quat']),
+        }
+        return next_state_tens, batched_anchor
+
+    def generate_trajectory(self, 
+                            initial_condition: Dict, 
+                            goal_condition: Union[Dict, np.ndarray],
+                            stitch_steps: int = 1, 
+                            num_samples: int = 1):
+        """
+        Generate trajectory.
+        
+        Args:
+            initial_condition: Dictionary with 'robot' (H, 36) and 'obj' (H, 7) history in world frame.
+                               OR indices or whatever dataset expects.
+                               However, standard inference logic assumes we start from normalized state tensor.
+                               For flexibility, let's assume the user passes world-frame history, 
+                               and we use dataset logic to normalize it.
+            goal_condition: Goal parameters (e.g. final object pos).
+            
+        Returns:
+            np.ndarray of shape (num_samples, T_total, D)
+        """
+        if self.dataset is None:
+             raise RuntimeError("Dataset not initialized. Call fit() or setup.")
+
+        self.diffuser.model.eval()
+        
+        # 1. Process Initial Condition
+        # We assume initial_condition contains raw history to compute encoded state
+        # robot: (H, 36), obj: (H, 7)
+        # We need to turn this into `curr_state_tens` and `current_anchors`
+        
+        # Check input format. If user passes already processed tensor, use it?
+        # Let's stick to world frame history for API clean-ness.
+        
+        r_hist = initial_condition['robot'] # (H, 36)
+        o_hist = initial_condition['obj']   # (H, 7)
+        
+        # If single sample provided, add batch dim
+        if r_hist.ndim == 2: r_hist = r_hist[None, ...]
+        if o_hist.ndim == 2: o_hist = o_hist[None, ...]
+        
+        # Replicate for num_samples
+        # But wait, num_samples is usually creating variations from ONE condition.
+        # If user passes multiple conditions, num_samples likely means per condition?
+        # Let's assume input is 1 condition, and we replicate.
+        
+        if r_hist.shape[0] != 1:
+             # Just use as is, assume user knows what they are doing with batching?
+             # For now, let's assume 1 input condition for simplicity, or handle batching.
+             pass
+
+        # We first need to "update_condition" to get features from raw history
+        curr_state_tens, current_anchors = self._update_condition(r_hist, o_hist, goal_condition)
+        
+        # Now replicate for num_samples
+        # curr_state_tens: (1, H, D) -> (num_samples, H, D)
+        curr_state_tens = curr_state_tens.repeat(num_samples, 1, 1).to(self.device)
+        
+        current_anchors['ref_pos'] = np.repeat(current_anchors['ref_pos'], num_samples, axis=0)
+        current_anchors['ref_quat'] = np.repeat(current_anchors['ref_quat'], num_samples, axis=0)
+        
+        # 2. Process Goal
+        # If goal is already vector, normalize it
+        if isinstance(goal_condition, (np.ndarray, list)):
+             task_params = torch.tensor(goal_condition).float()
+        else:
+             # Assume dict, maybe extract?
+             raise ValueError("Goal condition format not supported yet")
+        
+        # Normalize task params
+        task_params = self.dataset._normalize("task_params", task_params) # (D,) or (1, D)
+        if task_params.ndim == 1:
+            task_params = task_params.unsqueeze(0)
+        
+        task_tens = task_params.repeat(num_samples, 1).to(self.device)
+        
+        history_size = self.dataset.history_size
+        stitched_segments = []
+        
+        # 3. Autoregressive Loop
+        for step in range(stitch_steps):
+            # A. Inference
+            normalized_sample = self.diffuser.getSample(
+                num_trajectories=num_samples,
+                state_cond=curr_state_tens,
+                goal_cond=task_tens,
+                deterministic=True
+            ) # (B, T, D_out)
+            
+            # B. Denormalize
+            samples_btc = normalized_sample
+            tensor_btc = torch.from_numpy(samples_btc).float().to(self.device)
+            denorm_btc = self.dataset.denormalize_global(tensor_btc)
+            future_traj_np = denorm_btc.cpu().numpy()
+            
+            # C. Reconstruct World Frame
+            anchor_arr = np.concatenate([current_anchors['ref_pos'], current_anchors['ref_quat']], axis=-1)
+            
+            res = reconstruct_sbto_trajectory(anchor_arr, future_traj_np)
+            r_world, o_world = res[0], res[1]
+            
+            # Store Segment
+            # Robot(36) + Object(7)
+            segment_world = np.concatenate([r_world[..., :36], o_world[..., :7]], axis=-1)
+            stitched_segments.append(segment_world)
+            
+            # D. Update Condition for next step
+            if step < stitch_steps - 1:
+                r_hist_new = r_world[:, -history_size:, :]
+                o_hist_new = o_world[:, -history_size:, :]
+                curr_state_tens, current_anchors = self._update_condition(r_hist_new, o_hist_new)
+                curr_state_tens = curr_state_tens.to(self.device)
+        
+        full_trajectory = np.concatenate(stitched_segments, axis=1)
+        return full_trajectory
+

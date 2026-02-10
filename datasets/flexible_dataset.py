@@ -1,4 +1,5 @@
 import numpy as np
+from typing import List, Dict, Union, Optional
 import torch
 import os
 import glob
@@ -21,16 +22,20 @@ class FlexibleWindowDataset(Dataset):
     and assembles features based on a configurable order.
     """
     def __init__(self, 
-                 data_root, 
-                 config, 
+                 data_root=None, 
+                 config=None, 
                  feature_order=None, 
                  norm_path=None, 
                  calculate_stats=False,
                  noise_cfg=None, 
                  add_noise=False,
-                 add_goal_noise=False):
+                 add_goal_noise=False,
+                 data_buffer: Optional[List[Dict]] = None,
+                 task_params_buffer: Optional[List[Dict]] = None):
         
         self.data_root = data_root
+        self.data_buffer = data_buffer
+        self.task_params_buffer = task_params_buffer
         self.noise_cfg = noise_cfg or {}
         self.num_observations = config.get("num_observations", 45)
         self.num_features = config.get("num_features", 48)
@@ -49,9 +54,21 @@ class FlexibleWindowDataset(Dataset):
         ]
         
         # Load file list
-        self.file_paths = sorted(glob.glob(os.path.join(data_root, "*.npz")))
-        if not self.file_paths:
-            print(f"Warning: No .npz files found in {data_root}")
+        if self.data_buffer is None:
+            if not self.data_root:
+                raise ValueError("Either data_root or data_buffer must be provided.")
+            self.file_paths = sorted(glob.glob(os.path.join(data_root, "*.npz")))
+            if not self.file_paths:
+                print(f"Warning: No .npz files found in {data_root}")
+            
+            # Load files into memory buffer
+            print(f"Loading {len(self.file_paths)} files into memory...")
+            self.data_buffer = []
+            for fpath in tqdm(self.file_paths, desc="Loading Data"):
+                with np.load(fpath, allow_pickle=True) as data:
+                    self.data_buffer.append({k: data[k] for k in data.files})
+        else:
+            self.file_paths = [] 
         
         # Index all windows: (file_idx, start_time_idx)
         self.indices = []
@@ -67,50 +84,53 @@ class FlexibleWindowDataset(Dataset):
             
     def _index_dataset(self):
         """
-        Iterate through files to determine valid window start indices.
+        Iterate through buffer to determine valid window start indices.
         """
         print("Indexing dataset...")
-        for i, fpath in enumerate(self.file_paths):
+        
+        # Index from memory
+        for i, data in enumerate(self.data_buffer):
             try:
-                with np.load(fpath, allow_pickle=True) as data:
-                     # Identify Length & Batch
-                    B, T = 1, 0
-                    if 'body_pos_w' in data:
-                        arr = data['body_pos_w']
-                        if arr.ndim == 4: # (N, T, K, 3)
-                            B, T = arr.shape[0], arr.shape[1]
-                        else:
-                            T = arr.shape[0]
+                # Identify Length & Batch
+                B, T = 1, 0
+                if 'body_pos_w' in data:
+                    arr = data['body_pos_w']
+                    if arr.ndim == 4: # (N, T, K, 3)
+                        B, T = arr.shape[0], arr.shape[1]
                     else:
-                        continue 
-                    
-                    # Apply downsampling effectively reduces T
-                    T_down = T // self.downsample
-
-                    min_start = 0
-                    max_start = T_down - 1
-                                        
-                    if max_start >= min_start:
-                        starts = np.arange(min_start, max_start + 1, self.stride)
-                        for b in range(B):
-                            for s in starts:
-                                self.indices.append((i, b, s))
-                            
+                        T = arr.shape[0]
+                else:
+                    continue 
+                
+                # Apply downsampling
+                T_down = T // self.downsample
+                min_start = 0
+                max_start = T_down - 1
+                                    
+                if max_start >= min_start:
+                    starts = np.arange(min_start, max_start + 1, self.stride)
+                    for b in range(B):
+                        for s in starts:
+                            self.indices.append((i, b, s))
             except Exception as e:
-                print(f"Error indexing {fpath}: {e}")
+                print(f"Error indexing buffer item {i}: {e}")
         print(f"Indexed {len(self.indices)} windows.")
 
-    def _load_raw_trajectory(self, fpath, batch_idx):
+    def _load_raw_trajectory(self, buffer_idx, batch_idx):
         """Generalized loader for different schema."""
         raw = {}
-        with np.load(fpath, allow_pickle=True) as data:
-            # RL Rollout Schema
-            if 'body_pos_w' in data:
+        
+        data = self.data_buffer[buffer_idx]
+        
+        # Helper to extract from data dict or file
+        def process_data(data_dict):
+            is_batched = False
+            if 'body_pos_w' in data_dict:
                 # Determine batching
-                is_batched = data['body_pos_w'].ndim == 4
+                is_batched = data_dict['body_pos_w'].ndim == 4
                 
                 def extract(key):
-                    arr = data[key]
+                    arr = data_dict[key]
                     if is_batched:
                         arr = arr[batch_idx]
                     return arr[::self.downsample]
@@ -127,21 +147,48 @@ class FlexibleWindowDataset(Dataset):
                 obj_pos = extract('object_pos_w')
                 obj_quat = extract('object_quat_w')
                 raw['obj'] = np.concatenate([obj_pos, obj_quat], axis=-1)
-                
-                # Velocities (if needed)
-                # ...
-                
+
+        process_data(data)
+        
+        if self.task_params_buffer is not None:
+            # Extract task params
+            tp_data = self.task_params_buffer[buffer_idx]
+
+            # We need to construct the final vector.
+            # If tp_data is dict:
+            vals = []
+            if isinstance(tp_data, dict):
+                for k, v in tp_data.items():
+                    arr = np.array(v)
+                    # Use is_batched status from data directly
+                    if 'body_pos_w' in data and data['body_pos_w'].ndim == 4:
+                        arr = arr[batch_idx]
+                    
+                    if arr.ndim == 0: arr = arr[None]
+                    vals.append(arr)
+                raw['task_params'] = np.concatenate(vals, axis=-1)
+            else:
+                # Assume it is the array directly
+                arr = np.array(tp_data)
+                if 'body_pos_w' in data and data['body_pos_w'].ndim == 4:
+                    arr = arr[batch_idx]
+                raw['task_params'] = arr
+        
+        if 'task_params' not in raw:
+             pass 
+
         return raw
 
-    def _compute_task_params(self, obj_traj):
+    def _compute_task_params(self, obj_seq):
         """
-        Compute task parameters from object trajectory.
-        obj_traj: (W, 7)
+        Compute task params from object sequence if strictly needed.
+        Default: return final object pose (goal).
         """
-        # Example: Final Z position
-        return obj_traj[-1, 2:3]
+        if len(obj_seq) > 0:
+            return obj_seq[-1]
+        return np.zeros(7)
 
-    def _compute_transform(self, raw_data, t_start):
+    def _compute_transform(self, raw_data, t_start, task_params=None):
         """
         Compute relative features for the window starting at t_start.
         Returns a dictionary of available features.
@@ -187,7 +234,12 @@ class FlexibleWindowDataset(Dataset):
         # Unpack to (W, ...)
         feats = {k: v[0] for k, v in comps.items()}
 
-        task_params = self._compute_task_params(raw_data['obj'])
+        if task_params is None:
+            if 'task_params' in raw_data:
+                task_params = raw_data['task_params']
+            else:
+                task_params = self._compute_task_params(raw_data['obj'])
+            
         feats['task_params'] = task_params
         
         anchor = {}
@@ -247,9 +299,14 @@ class FlexibleWindowDataset(Dataset):
 
     def __getitem__(self, idx):
         file_idx, batch_idx, t_start = self.indices[idx]
-        fpath = self.file_paths[file_idx]
         
-        raw_traj = self._load_raw_trajectory(fpath, batch_idx)
+        if self.data_buffer is not None:
+            # Use file_idx as index into buffer
+            raw_traj = self._load_raw_trajectory(file_idx, batch_idx)
+        else:
+            fpath = self.file_paths[file_idx]
+            raw_traj = self._load_raw_trajectory(fpath, batch_idx)
+        
         features, anchor = self._compute_transform(raw_traj, t_start)
         
         # Assemble Windowed Feature Vector
@@ -291,7 +348,12 @@ class FlexibleWindowDataset(Dataset):
         # Use a subset if dataset is huge, else full pass
         for idx in tqdm(range(len(self.indices))):
             file_idx, batch_idx, t_start = self.indices[idx]
-            raw_traj = self._load_raw_trajectory(self.file_paths[file_idx], batch_idx)
+            
+            if self.data_buffer is not None:
+                raw_traj = self._load_raw_trajectory(file_idx, batch_idx)
+            else:
+                raw_traj = self._load_raw_trajectory(self.file_paths[file_idx], batch_idx)
+
             feats, _ = self._compute_transform(raw_traj, t_start)
             
             for k, v in feats.items():
