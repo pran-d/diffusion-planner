@@ -54,10 +54,34 @@ class FlexibleWindowDataset(Dataset):
         
         # Load file list
         task_list_path = config.get("task_list_path", None)
+        
+        # Try to resolve path if provided
+        if task_list_path:
+             # 1. Absolute or CWD relative
+             if not os.path.exists(task_list_path):
+                 # 2. Relative to data_root (usually includes train_path)
+                 possible_1 = os.path.join(data_root, task_list_path)
+                 if os.path.exists(possible_1):
+                     task_list_path = possible_1
+                 else:
+                     # 3. Relative to base dir_path (if separate)
+                     base_dir = config.get("dir_path", "")
+                     possible_2 = os.path.join(base_dir, task_list_path)
+                     if os.path.exists(possible_2):
+                         task_list_path = possible_2
+                         
         if task_list_path and os.path.exists(task_list_path):
              print(f"Loading task list from {task_list_path}")
              with open(task_list_path, 'r') as f:
                  tasks = yaml.safe_load(f)
+             
+             # Unpack the task list (handle if it's a dict or list)
+             if isinstance(tasks, dict):
+                 # Maybe keys are task names? Or 'train'/'test' keys?
+                 # Assume simple list for now, or extract 'tasks' key
+                 if 'tasks' in tasks: tasks = tasks['tasks']
+                 else: tasks = list(tasks.keys())
+                 
              # Expected format: list of folder names
              self.file_paths = []
              for t in tasks:
@@ -68,6 +92,8 @@ class FlexibleWindowDataset(Dataset):
                  else:
                      print(f"Warning: {p} not found.")
         else:
+            if task_list_path:
+                print(f"Warning: task_list_path '{task_list_path}' configured but not found. Falling back to glob.")
             self.file_paths = sorted(glob.glob(os.path.join(data_root, "**/*.npz"), recursive=True))
 
         if not self.file_paths:
@@ -115,7 +141,7 @@ class FlexibleWindowDataset(Dataset):
 
                     min_start = self.start_timestep // self.downsample
                     w_size = self.window_size + self.history_size
-                    max_start = min_start
+                    max_start = max(min_start, T_down - w_size)
                                         
                     if max_start >= min_start:
                         starts = np.arange(min_start, max_start + 1, self.stride)
@@ -321,14 +347,14 @@ class FlexibleWindowDataset(Dataset):
         return future_states, current_state, task_params, anchor
 
     def _calculate_stats(self):
-        """Iterate entire dataset to compute mean/std for each feature type."""
+        """Iterate entire dataset (or subset) to compute mean/std for each feature type."""
         print("Calculating normalization stats (mean/std)...")
         sums = {}
         sq_sums = {}
         counts = {}
         
         # Use a subset if dataset is huge, else full pass
-        for idx in tqdm(range(len(self.indices))):
+        for idx in range(len(self.indices)):
             file_idx, batch_idx, t_start = self.indices[idx]
             raw_traj = self._load_raw_trajectory(self.file_paths[file_idx], batch_idx)
             feats, _ = self._compute_transform(raw_traj, t_start)

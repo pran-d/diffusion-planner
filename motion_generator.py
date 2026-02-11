@@ -278,7 +278,7 @@ class MotionGenerator:
         # We target a full reconstruction of length T*k to ensure we recover the trailing frames 
         # (which are usually lost in integer division downsampling).
         original_times = np.arange(T) * k
-        target_length = T * k
+        target_length = T * k + (k - 1)
         target_times = np.arange(target_length)
         
         new_T = len(target_times)
@@ -360,7 +360,7 @@ class MotionGenerator:
                     
                     if part_end > obs_start_idx:
                         local_start = max(0, obs_start_idx - cumulative_dim)
-                        current_parts.append(part[-H:, local_start:])
+                        current_parts.append(part[:H, local_start:])
                     
                     cumulative_dim += part_dim
             

@@ -51,7 +51,7 @@ def update_condition(dataset, robot_world_history, obj_world_history):
                 # Filter for observation features
                 if part_end > obs_start_idx:
                     local_start = max(0, obs_start_idx - cumulative_dim)
-                    current_parts.append(part[-H:, local_start:])
+                    current_parts.append(part[:H, local_start:])
                 
                 cumulative_dim += part_dim
         
@@ -88,7 +88,8 @@ def interpolate_trajectory(trajectory, downsample_factor):
     
     # Original knots at 0, k, 2k, ...
     original_times = np.arange(T) * k
-    target_times = np.arange(original_times[-1] + 1)
+    target_length = T * k + (k - 1)
+    target_times = np.arange(target_length)
     
     new_T = len(target_times)
     interpolated = np.zeros((B, new_T, D))
@@ -100,7 +101,8 @@ def interpolate_trajectory(trajectory, downsample_factor):
     
     for b in range(B):
         # 1. Linear Interpolation for all dims
-        f = interp1d(original_times, trajectory[b], axis=0, kind='linear')
+        f = interp1d(original_times, trajectory[b], axis=0, kind='linear', 
+                     fill_value=(trajectory[b][0], trajectory[b][-1]), bounds_error=False)
         interpolated[b] = f(target_times)
         
         # 2. Slerp for Rotation dims
@@ -110,7 +112,11 @@ def interpolate_trajectory(trajectory, downsample_factor):
                  q_vals = trajectory[b, :, sl]
                  rot = R.from_quat(q_vals)
                  slerp = Slerp(original_times, rot)
-                 interp_q = slerp(target_times).as_quat()
+                 
+                 # Clamp times for Slerp to avoid extrapolation error
+                 clamped_times = np.clip(target_times, original_times[0], original_times[-1])
+                 
+                 interp_q = slerp(clamped_times).as_quat()
                  interpolated[b, :, sl] = interp_q
     
     if not is_batched:
