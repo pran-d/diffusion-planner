@@ -56,6 +56,20 @@ class BufferDataset(FlexibleWindowDataset):
     def _index_dataset(self):
         print("Indexing buffer dataset...")
         
+        # Handle List Input by batching it immediately (User requested simplification)
+        if isinstance(self.data_buffer, list):
+            print(f"Batching {len(self.data_buffer)} trajectories from list...")
+            batched = {}
+            if len(self.data_buffer) > 0:
+                keys = self.data_buffer[0].keys()
+                for k in keys:
+                    try:
+                        # Stack to (B, T, ...)
+                        batched[k] = np.stack([item[k] for item in self.data_buffer], axis=0)
+                    except ValueError as e:
+                        print(f"Warning: Could not stack key {k}: {e}")
+            self.data_buffer = batched
+            
         data = self.data_buffer
         B, T = 1, 0
         
