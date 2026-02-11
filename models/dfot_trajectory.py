@@ -58,32 +58,17 @@ class DFoTTrajectory(nn.Module):
         
         self.x_shape = torch.Size([data_config['num_features']])
         self.state_condition = model_config.get("state_condition", False)
-        self.history_condition = model_config.get("history_condition", False)
-        self.goal_condition = model_config.get("goal_condition", False)
         self.task_condition = model_config.get("task_condition", False)
         
         state_dim = model_config['hidden_size'] if self.state_condition else 0
         task_dim = model_config.get("hidden_size", 64) if self.task_condition else 0
-        goal_dim = model_config.get("hidden_size", 64) if self.goal_condition else 0
-        history_dim = model_config.get("hidden_size", 64) if self.history_condition else 0
-        history_len = data_config.get("state_history", 1)
 
-        self.external_cond_dim = state_dim + history_dim + goal_dim + task_dim
+        self.external_cond_dim = state_dim + task_dim
             
         if self.state_condition:
             self.state_embedding = MLP(
                 in_dim=data_config.get("num_observations", 86),
                 out_dim=model_config.get("hidden_size", 64)
-            )
-
-        if self.history_condition:
-            self.history_embedding = HistoryAttention(history_dim, history_len)
-        
-        if self.goal_condition:
-            self.goal_embedding = nn.Sequential(
-                nn.Linear(data_config.get("num_goal_features", 10), model_config.get("hidden_size", 64)),
-                nn.ReLU(),
-                nn.Linear(model_config.get("hidden_size", 64), model_config.get("hidden_size", 64)),
             )
 
         if self.task_condition:
@@ -246,8 +231,6 @@ class DFoTTrajectory(nn.Module):
              x = x.permute(0, 2, 1) # (B, C, T)
         
         state_cond = None
-        history_cond = None
-        goal_cond = None
         task_cond = None
 
         if model_cond is not None:
@@ -255,12 +238,6 @@ class DFoTTrajectory(nn.Module):
                 idx = 0
                 if self.state_condition:
                     if len(model_cond) > idx: state_cond = model_cond[idx]
-                    idx += 1
-                if self.history_condition:
-                    if len(model_cond) > idx: history_cond = model_cond[idx]
-                    idx += 1
-                if self.goal_condition:
-                    if len(model_cond) > idx: goal_cond = model_cond[idx]
                     idx += 1
                 if self.task_condition:
                     if len(model_cond) > idx: task_cond = model_cond[idx]
@@ -270,10 +247,6 @@ class DFoTTrajectory(nn.Module):
                 # Single condition provided
                 if self.state_condition:
                     state_cond = model_cond
-                elif self.history_condition:
-                    history_cond = model_cond
-                elif self.goal_condition:
-                    goal_cond = model_cond
                 elif self.task_condition:
                     task_cond = model_cond
         
@@ -284,17 +257,6 @@ class DFoTTrajectory(nn.Module):
                 # (B, 1, D)
                 s_cond = s_cond.unsqueeze(1)
             cond_list.append(s_cond)
-        if self.history_condition and history_cond is not None:
-            h_cond = self.history_embedding(history_cond)
-            if h_cond.ndim == 2:
-                # (B, 1, C)
-                h_cond = h_cond.unsqueeze(1)
-            cond_list.append(h_cond)
-        if self.goal_condition and goal_cond is not None:           
-            goal_emb = self.goal_embedding(goal_cond) # (B, D) or (B, T, D)
-            if goal_emb.ndim == 2:
-                goal_emb = goal_emb.unsqueeze(1)
-            cond_list.append(goal_emb)
         if self.task_condition and task_cond is not None:
             t_cond = self.task_embedding(task_cond)
             if t_cond.ndim == 2:
@@ -341,8 +303,6 @@ class DFoTTrajectory(nn.Module):
         Sampling method.
         """
         state_cond_input = None
-        history_cond_input = None
-        goal_cond = None
         task_cond = None
 
         if isinstance(model_cond, (list, tuple)):
@@ -358,22 +318,12 @@ class DFoTTrajectory(nn.Module):
             if len(flat_cond) > idx and self.state_condition: 
                 state_cond_input = flat_cond[idx]
                 idx += 1
-            if len(flat_cond) > idx and self.history_condition:
-                history_cond_input = flat_cond[idx]
-                idx += 1
-            if len(flat_cond) > idx and self.goal_condition: 
-                goal_cond = flat_cond[idx]
-                idx += 1
             if len(flat_cond) > idx and self.task_condition:
                 task_cond = flat_cond[idx]
                 idx += 1
         else:
             if self.state_condition:
                 state_cond_input = model_cond
-            elif self.history_condition:
-                history_cond_input = model_cond
-            elif self.goal_condition:
-                goal_cond = model_cond
             elif self.task_condition:
                 task_cond = model_cond
 
@@ -382,12 +332,6 @@ class DFoTTrajectory(nn.Module):
             if mask_goal: state_cond_input[:, -3:] = 0.0
             s_cond = self.state_embedding(state_cond_input) # (B, C)
             cond_list.append(s_cond)
-        if self.history_condition and history_cond_input is not None:
-            s_cond = self.history_embedding(history_cond_input) # (B, C)
-            cond_list.append(s_cond)
-        if self.goal_condition and goal_cond is not None:
-            goal_emb = self.goal_embedding(goal_cond) # (B, D)
-            cond_list.append(goal_emb)
         if self.task_condition and task_cond is not None:
             t_cond = self.task_embedding(task_cond) # (B, D)
             cond_list.append(t_cond)
@@ -482,7 +426,7 @@ class DFoTTrajectory(nn.Module):
         return_all: bool = False,
         pbar: Optional[tqdm] = None,
         cfg_w: float = 0.0,
-    ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+    ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:\
         
         x_shape = self.x_shape
 
