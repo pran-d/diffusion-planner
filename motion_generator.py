@@ -275,9 +275,11 @@ class MotionGenerator:
         B, T, D = trajectory.shape
         # Original knots at 0, k, 2k, ...
         # If we have T knots, the duration is roughly (T-1)*k. 
-        # e.g. T=3, k=2 -> 0, 2, 4. Interpolate to 0, 1, 2, 3, 4.
+        # We target a full reconstruction of length T*k to ensure we recover the trailing frames 
+        # (which are usually lost in integer division downsampling).
         original_times = np.arange(T) * k
-        target_times = np.arange(original_times[-1] + 1)
+        target_length = T * k
+        target_times = np.arange(target_length)
         
         new_T = len(target_times)
         interpolated = np.zeros((B, new_T, D))
@@ -289,7 +291,9 @@ class MotionGenerator:
         
         for b in range(B):
             # 1. Linear Interpolation for all dims
-            f = interp1d(original_times, trajectory[b], axis=0, kind='linear')
+            # Use fill_value to extend last pose to the end of the bin (nearest neighbor for tail)
+            f = interp1d(original_times, trajectory[b], axis=0, kind='linear', 
+                         fill_value=(trajectory[b][0], trajectory[b][-1]), bounds_error=False)
             interpolated[b] = f(target_times)
             
             # 2. Slerp for Rotation dims
@@ -301,7 +305,11 @@ class MotionGenerator:
                      q_vals = trajectory[b, :, sl]
                      rot = R.from_quat(q_vals)
                      slerp = Slerp(original_times, rot)
-                     interp_q = slerp(target_times).as_quat()
+                     
+                     # Clamp times for Slerp to avoid extrapolation error (equivalent to nearest)
+                     clamped_times = np.clip(target_times, original_times[0], original_times[-1])
+                     
+                     interp_q = slerp(clamped_times).as_quat()
                      interpolated[b, :, sl] = interp_q
         
         return interpolated
