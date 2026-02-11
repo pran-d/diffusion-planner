@@ -11,7 +11,7 @@ from tqdm import tqdm
 
 from config.configure import load_config, get_data_path, get_save_path, get_norm_path
 from models.model import RobotDiffuser
-from datasets.flexible_dataset import FlexibleWindowDataset
+from datasets.buffer_dataset import BufferDataset
 from utils.math.sbto_utils import reconstruct_sbto_trajectory
 from utils.math.math_tools import yaw_from_quat, yaw_to_rot_matrix
 from utils.math.rotation_conversions import quaternion_to_matrix, matrix_to_quaternion
@@ -63,9 +63,9 @@ class MotionGenerator:
         # If we have stats, we can init a dataset without data just for utils
         if load_stats and norm_path and os.path.exists(norm_path):
              # We create a dummy dataset with empty buffer just to load stats
-             self.dataset = FlexibleWindowDataset(
-                data_root=None,
-                data_buffer=[], # Empty
+             dummy_buffer = {'body_pos_w': np.zeros((1, 1, 1, 3))}
+             self.dataset = BufferDataset(
+                data_buffer=dummy_buffer, 
                 config=self.data_cfg, 
                 calculate_stats=False, 
                 norm_path=norm_path,
@@ -106,28 +106,21 @@ class MotionGenerator:
         
         # Setup Data
         norm_path = get_norm_path(self.model_cfg, self.training_cfg, self.data_cfg)
-        
-        data_root = None
-        data_buffer = None
-        
+
         if isinstance(data_source, str):
-            data_root = data_source
-        else:
-            data_buffer = data_source
-
-        # Check if stats exist, else calculate
-        calculate_stats = True
-        if norm_path and os.path.exists(norm_path):
-            print(f"Found existing normalization stats at {norm_path}, reusing...")
-            calculate_stats = False
-
-        self.dataset = FlexibleWindowDataset(
-            data_root=data_root,
-            data_buffer=data_buffer,
-            task_params_buffer=task_params,
+            raise ValueError("MotionGenerator.fit no longer supports file paths. Please load data into a buffer first.")
+        
+        # Assume data_source is the batched buffer (dict)
+        # If task_params passed separately, verify it matches
+        if task_params is not None:
+            if isinstance(data_source, dict):
+                data_source['task_params'] = np.array(task_params)  
+        
+        self.dataset = BufferDataset(
+            data_buffer=data_source,
             config=self.data_cfg, 
-            calculate_stats=calculate_stats, 
-            norm_path=norm_path,
+            calculate_stats=True, 
+            norm_path=norm_path, # will overwrite if provided
             noise_cfg=self.training_cfg.get("state_conditioning_noise_level", {}),
             add_noise=self.training_cfg.get("add_obs_noise", False), 
             add_goal_noise=self.training_cfg.get("add_goal_noise", False)
@@ -166,6 +159,22 @@ class MotionGenerator:
             
             for step, batch in enumerate(pbar):
                 
+                if batch[0].shape[0] < self.data_cfg["batch_size"]:
+                    # Pad the batch by repeating elements if it's smaller than batch_size
+                    current_bs = batch[0].shape[0]
+                    target_bs = self.data_cfg["batch_size"]
+                    repeats = (target_bs + current_bs - 1) // current_bs
+                    
+                    new_batch = []
+                    for item in batch:
+                        if isinstance(item, torch.Tensor):
+                            dims = [1] * item.dim()
+                            dims[0] = repeats
+                            new_batch.append(item.repeat(*dims)[:target_bs])
+                    else:
+                            new_batch.append(item)
+                    batch = new_batch
+            
                 batch_data = list(batch)
                 prediction_target = batch_data[0].to(self.device)
                 
@@ -220,18 +229,24 @@ class MotionGenerator:
             print(f"Epoch {epoch+1} Mean Loss: {mean_loss:.5f}")
             
             # Save Checkpoint
-            if save_path:
-                # Check if save_path serves as a directory or a specific file prefix
-                is_dir_like = not (save_path.endswith('.pt') or save_path.endswith('.pth'))
-                
-                if is_dir_like:
-                     os.makedirs(save_path, exist_ok=True)
-                     fpath = os.path.join(save_path, f"model_{epoch+1}.pth")
+            if (epoch + 1) % self.training_cfg.get("save_every", 50) == 0:
+                if save_path:
+                    # Check if save_path serves as a directory or a specific file prefix
+                    is_dir_like = not (save_path.endswith('.pt') or save_path.endswith('.pth'))
+                    
+                    if is_dir_like:
+                        os.makedirs(save_path, exist_ok=True)
+                        fpath = os.path.join(save_path, f"model_{epoch+1}.pth")
+                    else:
+                        os.makedirs(os.path.dirname(save_path), exist_ok=True)
+                        base, ext = os.path.splitext(save_path)
+                        fpath = f"{base}_{epoch+1}{ext}"
                 else:
-                     os.makedirs(os.path.dirname(save_path), exist_ok=True)
-                     base, ext = os.path.splitext(save_path)
-                     fpath = f"{base}_{epoch+1}{ext}"
-                
+                    # Default save
+                    save_dir = get_save_path(self.model_cfg, self.data_cfg, self.training_cfg)
+                    os.makedirs(save_dir, exist_ok=True)
+                    fpath = os.path.join(save_dir, f"model_{epoch}.pth")
+               
                 checkpoint = {
                     "model": self.diffuser.model.state_dict(),
                     "optimizer": optimizer.state_dict(),
@@ -239,15 +254,6 @@ class MotionGenerator:
                     "scheduler": scheduler.state_dict()
                 }
                 torch.save(checkpoint, fpath)
-            elif (epoch + 1) % self.training_cfg.get("save_every", 50) == 0:
-                 # Default save
-                 save_dir = get_save_path(self.model_cfg, self.data_cfg, self.training_cfg)
-                 os.makedirs(save_dir, exist_ok=True)
-                 checkpoint = {
-                    "model": self.diffuser.model.state_dict(),
-                    # ...
-                 }
-                 torch.save(checkpoint, os.path.join(save_dir, f"model_{epoch}.pth"))
 
 
     def _update_condition(self, robot_world_history, obj_world_history, goal_condition=None):
@@ -315,7 +321,7 @@ class MotionGenerator:
     def generate_trajectory(self, 
                             initial_condition: Dict, 
                             goal_condition: Union[Dict, np.ndarray],
-                            stitch_steps: int = 5, 
+                            stitch_steps: int = 1, 
                             num_samples: int = 1):
         """
         Generate trajectory.

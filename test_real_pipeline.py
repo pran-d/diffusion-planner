@@ -2,8 +2,68 @@ import numpy as np
 import torch
 import os
 import sys
+import glob
+import yaml
+from tqdm import tqdm
 from motion_generator import MotionGenerator
 from utils.visualize.visualize import MjVisualizer
+
+def load_data_to_buffer(data_root):
+    file_paths = sorted(glob.glob(os.path.join(data_root, "**/*.npz"), recursive=True))
+    if not file_paths:
+        print(f"No files found in {data_root}")
+        return {}
+    
+    buffer_lists = {}
+    print(f"Loading {len(file_paths)} files from {data_root}...")
+    
+    # We will assume uniform structure for now
+    for fpath in tqdm(file_paths):
+        try:
+            with np.load(fpath, allow_pickle=True) as data:
+                # RL Schema keys
+                rl_keys = ['body_pos_w', 'body_quat_w', 'joint_pos', 'object_pos_w', 'object_quat_w', 'task_params']
+                # SBTO Schema keys
+                sbto_keys = ['base_xyz_quat', 'actuator_pos', 'obj_0_xyz_quat']
+                
+                keys_found = [k for k in rl_keys if k in data]
+                if not keys_found:
+                    keys_found = [k for k in sbto_keys if k in data]
+                
+                if not keys_found:
+                    continue
+                    
+                # Determining if batched
+                is_batched = False
+                if 'body_pos_w' in data:
+                    if data['body_pos_w'].ndim == 4: is_batched = True
+                elif 'base_xyz_quat' in data:
+                    if data['base_xyz_quat'].ndim == 3: is_batched = True
+                
+                for k in keys_found:
+                    arr = data[k]
+                    if not is_batched:
+                        arr = arr[None, ...] # Add batch dim
+                    
+                    if k not in buffer_lists:
+                        buffer_lists[k] = []
+                    buffer_lists[k].append(arr)
+                    
+        except Exception as e:
+            print(f"Error loading {fpath}: {e}")
+
+    final_buffer = {}
+    for k, v in buffer_lists.items():
+        try:
+            final_buffer[k] = np.concatenate(v, axis=0) # Concat along batch dim
+        except Exception as e:
+            print(f"Error concatenating key {k}: {e}")
+            
+    print("Buffer loaded. Shapes:")
+    for k in final_buffer:
+        print(f"  {k}: {final_buffer[k].shape}")
+        
+    return final_buffer
 
 def test_real_pipeline():
     print("========================================")
@@ -18,12 +78,20 @@ def test_real_pipeline():
 
     # Initialize
     generator = MotionGenerator(config_path=config_path, device=device)
+
+    # Load weights from config if resume_checkpoint is present
+    with open(config_path, 'r') as f:
+        raw_cfg = yaml.safe_load(f)
+    if raw_cfg["resume"] and 'resume_checkpoint' in raw_cfg and raw_cfg['resume_checkpoint'] is not None:
+        ckpt = raw_cfg['resume_checkpoint']
+        print(f"Loading weights from config checkpoint: {ckpt}")
+        generator.load_weights(ckpt)
     
     # Modify data config to limit load if possible? 
     # The dataset loader loads everything in the path.
     # Hopefully it's not too big.
     
-    print("Calling fit() (1 epoch)...")
+    print("Calling fit()...")
     # Save to temp dir
     results_dir = "results/test_real"
     os.makedirs(results_dir, exist_ok=True)
@@ -33,7 +101,13 @@ def test_real_pipeline():
     full_path = os.path.join(data_cfg['dir_path'], data_cfg['train_path'])
     print(f"Data path: {full_path}")
 
-    generator.fit(data_source=full_path, epochs=10, save_path=results_dir)
+    # Load data into buffer
+    data_buffer = load_data_to_buffer(full_path)
+    if not data_buffer:
+        print("Data load failed.")
+        return
+
+    generator.fit(data_source=data_buffer, epochs=300, save_path=results_dir)
     print("Fit completed.")
     
     # Test Generation
@@ -45,23 +119,15 @@ def test_real_pipeline():
         return
 
     sample_idx = 0
-    sample_data = generator.dataset.data_buffer[sample_idx]
+    sample_data = {}
+    for k,v in generator.dataset.data_buffer.items():
+        sample_data[k] = v[sample_idx] # Extract single sample
     
     # We need history. 
     # history_size is in config, usually 1?
     H = generator.data_cfg.get('state_history', 1)
     
-    # Extract raw data. The loader already downsamples in _load_raw_trajectory, 
-    # but here we are accessing the RAW buffer before downsampling/windowing?
-    # No, FlexibleWindowDataset.__init__ loads files into data_buffer.
-    # Then _load_raw_trajectory processes them.
-    
-    # FlexibleWindowDataset structure:
-    # self.data_buffer is a list of raw dicts loaded from files.
-    # They are likely full trajectories.
-    
-    # We need to manually slice the start to simulate history.
-    # Let's approximate.
+    # Extract raw data.
     
     body_pos = sample_data['body_pos_w'] # (T, 1, 3) probably
     body_quat = sample_data['body_quat_w'] # (T, 1, 4)
@@ -129,7 +195,7 @@ def test_real_pipeline():
         
         # Create time array (assuming 0.01 dt or similar, but generic is fine)
         T_steps = traj_sample.shape[0]
-        t = np.arange(T_steps) * 0.1 # dummy time
+        t = np.arange(T_steps) * 0.01 # dummy time
         
         vis.visualize_trajectory(
             t=t,

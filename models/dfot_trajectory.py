@@ -88,7 +88,7 @@ class DFoTTrajectory(nn.Module):
 
         if self.task_condition:
             self.task_embedding = MLP(
-                in_dim=1,
+                in_dim=data_config.get("num_task_params", 10),
                 out_dim=model_config.get("hidden_size", 64) 
             )
   
@@ -248,6 +248,7 @@ class DFoTTrajectory(nn.Module):
         state_cond = None
         history_cond = None
         goal_cond = None
+        task_cond = None
 
         if model_cond is not None:
             if isinstance(model_cond, (list, tuple)):
@@ -261,6 +262,9 @@ class DFoTTrajectory(nn.Module):
                 if self.goal_condition:
                     if len(model_cond) > idx: goal_cond = model_cond[idx]
                     idx += 1
+                if self.task_condition:
+                    if len(model_cond) > idx: task_cond = model_cond[idx]
+                    idx += 1
 
             else:
                 # Single condition provided
@@ -270,6 +274,8 @@ class DFoTTrajectory(nn.Module):
                     history_cond = model_cond
                 elif self.goal_condition:
                     goal_cond = model_cond
+                elif self.task_condition:
+                    task_cond = model_cond
         
         cond_list = []
         if self.state_condition and state_cond is not None:
@@ -289,8 +295,8 @@ class DFoTTrajectory(nn.Module):
             if goal_emb.ndim == 2:
                 goal_emb = goal_emb.unsqueeze(1)
             cond_list.append(goal_emb)
-        if self.task_condition and state_cond is not None:
-            t_cond = self.task_embedding(state_cond[..., -1:])
+        if self.task_condition and task_cond is not None:
+            t_cond = self.task_embedding(task_cond)
             if t_cond.ndim == 2:
                 t_cond = t_cond.unsqueeze(1)
             cond_list.append(t_cond)
@@ -337,6 +343,7 @@ class DFoTTrajectory(nn.Module):
         state_cond_input = None
         history_cond_input = None
         goal_cond = None
+        task_cond = None
 
         if isinstance(model_cond, (list, tuple)):
             # Flatten list if nested
@@ -357,14 +364,18 @@ class DFoTTrajectory(nn.Module):
             if len(flat_cond) > idx and self.goal_condition: 
                 goal_cond = flat_cond[idx]
                 idx += 1
-
+            if len(flat_cond) > idx and self.task_condition:
+                task_cond = flat_cond[idx]
+                idx += 1
         else:
             if self.state_condition:
                 state_cond_input = model_cond
-            if self.history_condition:
+            elif self.history_condition:
                 history_cond_input = model_cond
-            if self.goal_condition:
+            elif self.goal_condition:
                 goal_cond = model_cond
+            elif self.task_condition:
+                task_cond = model_cond
 
         cond_list = []
         if self.state_condition and state_cond_input is not None:
@@ -377,8 +388,8 @@ class DFoTTrajectory(nn.Module):
         if self.goal_condition and goal_cond is not None:
             goal_emb = self.goal_embedding(goal_cond) # (B, D)
             cond_list.append(goal_emb)
-        if self.task_condition and state_cond_input is not None:
-            t_cond = self.task_embedding(state_cond_input[..., -1:]) # (B, D)
+        if self.task_condition and task_cond is not None:
+            t_cond = self.task_embedding(task_cond) # (B, D)
             cond_list.append(t_cond)
         
         # If we have external conditions (init_cond), pass them as conditions

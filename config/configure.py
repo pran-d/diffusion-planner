@@ -1,6 +1,41 @@
 import yaml
 import os 
 
+def recursive_merge(d1, d2):
+    """
+    Recursively merge dictionary d2 into d1.
+    """
+    for k, v in d2.items():
+        if isinstance(v, dict) and k in d1 and isinstance(d1[k], dict):
+            recursive_merge(d1[k], v)
+        else:
+            d1[k] = v
+    return d1
+
+def load_yaml_with_includes(path):
+    with open(path, 'r') as f:
+        conf = yaml.safe_load(f) or {}
+
+    if 'includes' in conf:
+        includes = conf.pop('includes')
+        base_dir = os.path.dirname(path)
+        # We start with an empty dict and merge includes in order
+        merged_conf = {}
+        for inc in includes:
+            if not os.path.isabs(inc):
+                inc_path = os.path.abspath(inc)
+            else:
+                inc_path = inc
+                
+            inc_conf = load_yaml_with_includes(inc_path)
+            recursive_merge(merged_conf, inc_conf)
+        
+        # Finally merge the main config on top
+        recursive_merge(merged_conf, conf)
+        return merged_conf
+    
+    return conf
+
 def load_config(config_path: str, auto_conf: bool = False) -> dict:
     """Load configuration from a YAML file.
     Args:
@@ -9,15 +44,19 @@ def load_config(config_path: str, auto_conf: bool = False) -> dict:
     Returns:
         tuple: (model_cfg, data_cfg, training_cfg)
     """
-
-    with open(config_path, 'r') as file:
-        config = yaml.safe_load(file)
+    
+    config = load_yaml_with_includes(config_path)
     
     model_cfg = config.get('model', {})
     data_cfg = config.get('data', {})
     training_cfg = config.get('training', {})
     noise_sched_cfg = config.get('noise_scheduler', {})
     
+    # Propagate root-level keys to training_cfg for backward compatibility / convenience
+    for key in ['save_dir', 'log_dir', 'suffix']:
+        if key in config:
+            training_cfg[key] = config[key]
+
     save_dir = get_save_path(model_cfg, data_cfg, training_cfg)
     saved_config_path = os.path.join(save_dir, "config.yaml")
     

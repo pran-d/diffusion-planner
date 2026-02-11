@@ -71,27 +71,17 @@ def run_visualization(stitched_trajs, xml_path):
     print("Optimization Complete. Visualizing first sample...")
     print("Controls: SPACE=Pause, ARROWS=Step, ESC=Exit")
     
-    # Use first sample
-    traj = stitched_trajs[0] # (Total_T, 43)
-    
-    t = 0
-    while vis.viewer.is_running():
-        state = traj[t]
-        # state is [robot(36), obj(7)]
-        # Assuming model qpos matches this concatenation
-        vis.update_data(state)
-        
-        time.sleep(1.0/30.0)
-        
-        if not vis.paused['active']:
-            t = (t + 1) % len(traj)
-        
-        if vis.step_request['delta'] != 0:
-            t = (t + vis.step_request['delta']) % len(traj)
-            vis.step_request['delta'] = 0
-            
-        if vis.exit_request['active']:
-            break
+    # Use first sample (num_samples, T, D) -> (T, D)
+    if stitched_trajs.ndim == 3:
+        traj = stitched_trajs[0] 
+    else:
+        traj = stitched_trajs
+
+    T_steps = traj.shape[0]
+    t = np.arange(T_steps) * 0.01
+
+    vis.visualize_trajectory(t=t, x_traj=traj, repeat=True)
+
     vis.close()
 
 def main():
@@ -102,6 +92,7 @@ def main():
     parser.add_argument("--save_path", type=str, default="results/inference.npy")
     parser.add_argument("--sample_idx", type=int, default=0, help="Initial condition index")
     parser.add_argument("--visualize", action="store_true")
+    parser.add_argument("--device", type=str, default="cuda", help="Device for inference (cuda or cpu)")
     args = parser.parse_args()
 
     # 1. Load Config
@@ -110,7 +101,7 @@ def main():
         raw_config = yaml.safe_load(file)
     model_cfg, data_cfg, training_cfg, noise_cfg = load_config(config_path, raw_config.get("auto_conf", False))
     
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    device = torch.device(args.device if torch.cuda.is_available() else "cpu")
     
     # 2. Setup Dataset & Stats
     data_path = get_data_path(data_cfg)

@@ -139,7 +139,7 @@ train_dataloader = DataLoader(
 )
 
 # Load MuJoCo
-xml_path = "mj_model.xml"
+xml_path = "./mj_model.xml"
 mj_model = mujoco.MjModel.from_xml_path(xml_path)
 mj_data = mujoco.MjData(mj_model)
 
@@ -168,6 +168,22 @@ for epoch in range(starting_epoch, num_epochs):
         
         if training_cfg.get("batches_per_epoch") and step >= training_cfg["batches_per_epoch"]:
             break
+
+        if batch[0].shape[0] < data_cfg["batch_size"]:
+            # Pad the batch by repeating elements if it's smaller than batch_size
+            current_bs = batch[0].shape[0]
+            target_bs = data_cfg["batch_size"]
+            repeats = (target_bs + current_bs - 1) // current_bs
+            
+            new_batch = []
+            for item in batch:
+                if isinstance(item, torch.Tensor):
+                    dims = [1] * item.dim()
+                    dims[0] = repeats
+                    new_batch.append(item.repeat(*dims)[:target_bs])
+            else:
+                    new_batch.append(item)
+            batch = new_batch
 
         state_cond = None
         task_cond = None    

@@ -1,14 +1,16 @@
 auto_conf: False
 resume: False
-resume_checkpoint: 1000
+resume_checkpoint: 240
 
 data:
   dir_path: "/home/pranish/pranav/diffusion-mp/simple_diffusion/"
   train_path: "test_datasets/Box_Height_FoLM"
-  batch_size: 512
+  batch_size: 256
   num_features: 48
+  num_task_params: 1
   num_observations: 45
-  num_timesteps: 50
+  start_timestep: 0
+  num_timesteps: 561
   state_history: 1
 
 model:
@@ -16,8 +18,8 @@ model:
   backbone_type: "dit1d"
   state_condition: True
   task_condition: True
-  external_cond_dropout: 0.1
-  hidden_size: 128
+  external_cond_dropout: 0.02
+  hidden_size: 256
   depth: 12
   num_heads: 8
   mlp_ratio: 4.0
@@ -32,18 +34,18 @@ noise_scheduler:
   return_steps: False
 
 training:
-  num_epochs: 10000
-  batches_per_epoch: 256
+  save_dir: "./runs/"
+  log_dir: "./logs/"
+  suffix: "_diffusion_generator"
+  num_epochs: 5000
+  batches_per_epoch: 512
   learning_rate: 0.0005
-  save_dir: "/home/pranish/pranav/diffusion-mp/simple_diffusion/runs/runs/ablations/study7/"
-  log_dir: "/home/pranish/pranav/diffusion-mp/simple_diffusion/runs/logs/ablations/study7/"
-  suffix: "_trajectory_goal"
   save_every: 20
   condition_dropout_prob: 
     state: 0.1
     task: 0.1
-  add_obs_noise: True
-  add_goal_noise: True
+  add_obs_noise: False
+  add_goal_noise: False
   state_conditioning_noise_level:
     joints: 0.01
     body_z: 0.01
