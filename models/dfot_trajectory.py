@@ -148,7 +148,7 @@ class DFoTTrajectory(nn.Module):
         if self.noise_scheduler is not None:
             betas = self.noise_scheduler.betas
 
-        self.max_tokens = data_config['num_timesteps']
+        self.max_tokens = data_config['num_timesteps'] // data_config.get('downsample', 1)
 
         self.diffusion_model = DiscreteDiffusion(
             cfg=diffusion_cfg,

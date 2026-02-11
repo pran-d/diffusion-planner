@@ -37,7 +37,7 @@ class FlexibleWindowDataset(Dataset):
         self.num_observations = config.get("num_observations", 45)
         self.num_features = config.get("num_features", 48)
         self.history_size = config.get("state_history", 4)
-        self.window_size = config.get("num_timesteps", 50)
+        self.window_size = config.get("num_timesteps", 50) // config.get("downsample", 1)
         self.stride = config.get("stride", 1)
         self.downsample = config.get("downsample", 1)
         self.start_timestep = config.get("start_timestep", 0)
@@ -66,10 +66,6 @@ class FlexibleWindowDataset(Dataset):
                  if os.path.exists(p):
                      self.file_paths.append(p)
                  else:
-                     # Fallback to recursively finding npz if strict path doesn't exist?
-                     # Or maybe just try the folder itself if user pointed to folder?
-                     # But user specifically said "batched top_trajectories.npz from these folders"
-                     # So strict check is safer.
                      print(f"Warning: {p} not found.")
         else:
             self.file_paths = sorted(glob.glob(os.path.join(data_root, "**/*.npz"), recursive=True))
@@ -176,13 +172,12 @@ class FlexibleWindowDataset(Dataset):
                 
         return raw
 
-    def _compute_task_params(self, obj_traj):
+    def _compute_task_params(self, full_obj_traj):
         """
-        Compute task parameters from object trajectory.
-        obj_traj: (W, 7)
+        Compute task parameters from FULL object trajectory.
+        obj_traj: (T_full, 7)
         """
-        # Example: Final Z position
-        return obj_traj[-1, 2:3]
+        return full_obj_traj[-1, 2:3]
 
     def _compute_transform(self, raw_data, t_start):
         """
@@ -195,6 +190,7 @@ class FlexibleWindowDataset(Dataset):
         read_start = max(0, t_start)
         read_end = t_start + w_size
         
+        # Note: raw_data contains the FULL trajectory (downsampled)
         base = raw_data['base'][read_start : read_end]      # (valid_len, 7)
         joints = raw_data['joints'][read_start : read_end]  # (valid_len, 29)
         obj = raw_data['obj'][read_start : read_end]        # (valid_len, 7)

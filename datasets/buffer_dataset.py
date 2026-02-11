@@ -29,7 +29,7 @@ class BufferDataset(FlexibleWindowDataset):
         self.num_observations = config.get("num_observations", 45)
         self.num_features = config.get("num_features", 48)
         self.history_size = config.get("state_history", 4)
-        self.window_size = config.get("num_timesteps", 50)
+        self.window_size = config.get("num_timesteps", 50) // config.get("downsample", 1)
         self.stride = config.get("stride", 1)
         self.downsample = config.get("downsample", 1)
         self.start_timestep = config.get("start_timestep", 0)
@@ -93,10 +93,8 @@ class BufferDataset(FlexibleWindowDataset):
             
         T_down = T // self.downsample
         min_start = self.start_timestep // self.downsample
-        
-        # Replicating FlexibleWindowDataset logic strictly
-        # It currently forces max_start = min_start
-        max_start = min_start 
+        w_size = self.window_size + self.history_size
+        max_start = max(min_start, T_down - w_size)
         
         if max_start >= min_start:
              starts = np.arange(min_start, max_start + 1, self.stride)

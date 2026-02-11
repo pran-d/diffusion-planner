@@ -4,6 +4,9 @@ import yaml
 import os
 import argparse
 import time
+from scipy.interpolate import interp1d
+from scipy.spatial.transform import Rotation as R
+from scipy.spatial.transform import Slerp
 from config.configure import load_config, get_data_path, get_save_path, get_norm_path
 from models.model import RobotDiffuser
 from datasets.flexible_dataset import FlexibleWindowDataset
@@ -63,6 +66,57 @@ def update_condition(dataset, robot_world_history, obj_world_history):
         'ref_quat': np.stack(next_anchors['ref_quat']),
     }
     return next_state_tens, batched_anchor
+
+def interpolate_trajectory(trajectory, downsample_factor):
+    """
+    Interpolate trajectory if downsample > 1.
+    trajectory: (B, T, D)
+    """
+    k = downsample_factor
+    if k <= 1:
+        return trajectory
+
+    print(f"Interpolating trajectory with downsample factor {k}...")
+    
+    # Ensure B, T, D shape
+    is_batched = True
+    if trajectory.ndim == 2:
+        trajectory = trajectory[None, ...]
+        is_batched = False
+        
+    B, T, D = trajectory.shape
+    
+    # Original knots at 0, k, 2k, ...
+    original_times = np.arange(T) * k
+    target_times = np.arange(original_times[-1] + 1)
+    
+    new_T = len(target_times)
+    interpolated = np.zeros((B, new_T, D))
+
+    # Indices for Slerp
+    # Robot Quat: 3:7 (indices 3,4,5,6)
+    # Object Quat: 39:43 (indices 39,40,41,42)
+    quat_indices = [slice(3, 7), slice(39, 43)]
+    
+    for b in range(B):
+        # 1. Linear Interpolation for all dims
+        f = interp1d(original_times, trajectory[b], axis=0, kind='linear')
+        interpolated[b] = f(target_times)
+        
+        # 2. Slerp for Rotation dims
+        for sl in quat_indices:
+            # Only if the quat slice is valid
+            if sl.stop <= D:
+                 q_vals = trajectory[b, :, sl]
+                 rot = R.from_quat(q_vals)
+                 slerp = Slerp(original_times, rot)
+                 interp_q = slerp(target_times).as_quat()
+                 interpolated[b, :, sl] = interp_q
+    
+    if not is_batched:
+        interpolated = interpolated[0]
+        
+    return interpolated
 
 def run_visualization(stitched_trajs, xml_path):
     from utils.visualize.visualize import MjVisualizer
@@ -130,6 +184,7 @@ def main():
 
     # 4. Prepare Initial Condition
     print(f"Loading initial condition (Sample {args.sample_idx})...")
+
     _, curr_state, task_params, anchor = dataset[args.sample_idx]
     
     curr_state_tens = curr_state.unsqueeze(0).repeat(args.num_samples, 1, 1).to(device)
@@ -184,6 +239,10 @@ def main():
     os.makedirs(os.path.dirname(args.save_path), exist_ok=True)
     np.save(args.save_path, full_trajectory)
     print(f"Stitched trajectory saved to {args.save_path} (Shape: {full_trajectory.shape})")
+
+    if dataset.downsample > 1:
+         full_trajectory = interpolate_trajectory(full_trajectory, dataset.downsample)
+
 
     # 7. Visualize
     if args.visualize:

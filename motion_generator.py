@@ -8,6 +8,9 @@ from torch.utils.data import DataLoader
 from torch.amp import GradScaler
 from torch import nn, optim
 from tqdm import tqdm
+from scipy.interpolate import interp1d
+from scipy.spatial.transform import Rotation as R
+from scipy.spatial.transform import Slerp
 
 from config.configure import load_config, get_data_path, get_save_path, get_norm_path
 from models.model import RobotDiffuser
@@ -255,6 +258,53 @@ class MotionGenerator:
                 }
                 torch.save(checkpoint, fpath)
 
+    def _interpolate_trajectory(self, trajectory):
+        """
+        Interpolate trajectory if downsample > 1.
+        trajectory: (B, T, D)
+        """
+        # If dataset not initialized, can't check downsample, but fit() or _setup calls it.
+        if self.dataset is None:
+             return trajectory
+
+        k = self.dataset.downsample
+        if k <= 1:
+            return trajectory
+
+        print(f"Interpolating trajectory with downsample factor {k}...")
+        B, T, D = trajectory.shape
+        # Original knots at 0, k, 2k, ...
+        # If we have T knots, the duration is roughly (T-1)*k. 
+        # e.g. T=3, k=2 -> 0, 2, 4. Interpolate to 0, 1, 2, 3, 4.
+        original_times = np.arange(T) * k
+        target_times = np.arange(original_times[-1] + 1)
+        
+        new_T = len(target_times)
+        interpolated = np.zeros((B, new_T, D))
+
+        # Indices for Slerp
+        # Robot Quat: 3:7 (indices 3,4,5,6)
+        # Object Quat: 39:43 (indices 39,40,41,42)
+        quat_indices = [slice(3, 7), slice(39, 43)]
+        
+        for b in range(B):
+            # 1. Linear Interpolation for all dims
+            f = interp1d(original_times, trajectory[b], axis=0, kind='linear')
+            interpolated[b] = f(target_times)
+            
+            # 2. Slerp for Rotation dims
+            for sl in quat_indices:
+                # Need consistent quaternion sign for Slerp?
+                # R.from_quat usually handles, but let's be safe.
+                # Only if the quat slice is valid
+                if sl.stop <= D:
+                     q_vals = trajectory[b, :, sl]
+                     rot = R.from_quat(q_vals)
+                     slerp = Slerp(original_times, rot)
+                     interp_q = slerp(target_times).as_quat()
+                     interpolated[b, :, sl] = interp_q
+        
+        return interpolated
 
     def _update_condition(self, robot_world_history, obj_world_history, goal_condition=None):
         """
@@ -431,5 +481,10 @@ class MotionGenerator:
                 curr_state_tens = curr_state_tens.to(self.device)
         
         full_trajectory = np.concatenate(stitched_segments, axis=1)
+
+        # Interpolate if needed (based on dataset downsample config)
+        if hasattr(self, 'dataset') and self.dataset is not None:
+             full_trajectory = self._interpolate_trajectory(full_trajectory)
+
         return full_trajectory
 

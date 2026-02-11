@@ -36,7 +36,7 @@ class SimpleTrajectoryDiffuser(nn.Module):
         # --- 1. Dimensions & Configs ---
         # Input shape: (C,) - number of channels per timestep
         self.x_shape = torch.Size((data_config["num_features"],)) 
-        self.max_tokens = data_config['num_timesteps']
+        self.max_tokens = data_config['num_timesteps'] // data_config.get('downsample', 1)
         
         self.hidden_size = model_config.get("hidden_size", 256)
         

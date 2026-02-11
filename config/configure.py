@@ -68,7 +68,7 @@ def load_config(config_path: str, auto_conf: bool = False) -> dict:
     return model_cfg, data_cfg, training_cfg, noise_sched_cfg
 
 def get_run_path(model_cfg: dict, data_cfg: dict, training_cfg: dict) -> str:
-    input_size = data_cfg.get('num_timesteps', 'unknown')
+    input_size = data_cfg.get('num_timesteps', 'unknown') // data_cfg.get('downsample', 1)
     num_channels = data_cfg.get('num_features', 'unknown')
     suffix = training_cfg.get('suffix', '')
     save_dir = f"{model_cfg.get('type', 'model')}_ts{input_size}_f{num_channels}"

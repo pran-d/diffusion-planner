@@ -27,7 +27,7 @@ class RobotDiffuser():
         self.save_dir = get_save_path(model_config, data_config, training_config)
 
         model_type = self.model_cfg['type']
-        self.input_size = data_config['num_timesteps']
+        self.input_size = data_config['num_timesteps'] // data_config.get('downsample', 1)
         
         self.num_channels = data_config['num_features']
             
