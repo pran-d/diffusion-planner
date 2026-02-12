@@ -12,7 +12,7 @@ import yaml
 import mujoco
 
 from diffusers import EMAModel
-from datasets.flexible_dataset import FlexibleWindowDataset
+from datasets import FlexibleWindowDataset, ConditionalStateDataset
 from models.model import RobotDiffuser
 from config.configure import load_config, get_data_path, get_save_path, get_log_path, get_norm_path
 
@@ -52,9 +52,16 @@ model_cfg, data_cfg, training_cfg, noise_schedule_cfg = load_config("config/conf
 save_dir = get_save_path(model_cfg, data_cfg, training_cfg)
 os.makedirs(save_dir, exist_ok=True)
 
+data_path = get_data_path(data_cfg)
+norm_path = get_norm_path(model_cfg, training_cfg, data_cfg)
+
 # Preserve resume parameters from the current config
+calculate_stats = True
 if config.get("resume", False):        
     resume_checkpoint = config.get("resume_checkpoint", 0)
+    if norm_path and os.path.exists(norm_path):
+        print(f"Found existing normalization stats at {norm_path}, loading...")
+        calculate_stats=False
 else:
     saved_config_path = os.path.join(save_dir, "config.yaml")
     # Save the current configuration
@@ -72,21 +79,6 @@ state_condition = model_cfg.get("state_condition", False)
 task_condition = model_cfg.get("task_condition", False)
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-
-data_path = get_data_path(data_cfg)
-norm_path = get_norm_path(model_cfg, training_cfg, data_cfg)
-
-calculate_stats = True
-if norm_path and os.path.exists(norm_path):
-    print(f"Found existing normalization stats at {norm_path}, loading...")
-    calculate_stats=False
-
-dataset = FlexibleWindowDataset(
-    data_root=data_path, config=data_cfg, 
-    calculate_stats=calculate_stats, norm_path=norm_path,
-    noise_cfg=training_cfg.get("state_conditioning_noise_level", {}),
-    add_noise=training_cfg.get("add_obs_noise", False), add_goal_noise=training_cfg.get("add_goal_noise", False)
-)
 
 diffuser = RobotDiffuser(
     model_config=model_cfg,
@@ -127,6 +119,21 @@ if config.get("resume", False):
             scheduler.load_state_dict(checkpoint["scheduler"])
         if "scaler" in checkpoint:
             scaler.load_state_dict(checkpoint["scaler"])
+
+if data_cfg.get("dataset_class", "flexible") == "conditional":
+    dataset = ConditionalStateDataset(
+        dataset_path=data_path, config=data_cfg, 
+        state_condition=state_condition, history_condition=False, 
+        task_condition=task_condition, action_condition=False, 
+        load_norm=True, norm_path=norm_path
+    )
+else:
+    dataset = FlexibleWindowDataset(
+        data_root=data_path, config=data_cfg, 
+        calculate_stats=calculate_stats, norm_path=norm_path,
+        noise_cfg=training_cfg.get("state_conditioning_noise_level", {}),
+        add_noise=training_cfg.get("add_obs_noise", False), add_goal_noise=training_cfg.get("add_goal_noise", False)
+    )
 
 train_dataloader = DataLoader(
     dataset, 
@@ -222,10 +229,10 @@ for epoch in range(starting_epoch, num_epochs):
         
         bs, ts, _ = prediction_target.shape
 
-        timesteps = torch.randint(
-            0, diffuser.noise_scheduler.config.num_train_timesteps, (bs, ts,), device=device
-        ).long()
-        # timesteps = None
+        # timesteps = torch.randint(
+        #     0, diffuser.noise_scheduler.config.num_train_timesteps, (bs, ts,), device=device
+        # ).long()
+        timesteps = None
         with torch.autocast(device_type="cuda", dtype=torch.float32):
             diff_output = diffuser.model(
                 prediction_target, 

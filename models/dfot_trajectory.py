@@ -226,9 +226,9 @@ class DFoTTrajectory(nn.Module):
         masks: (B, T) - Boolean mask indicating valid tokens
         timesteps: (B, T) - Per-token timesteps (noise levels)
         """
-        # DFoT expects x as (B, T, C)
-        if hasattr(self, 'backbone_type') and self.backbone_type == 'unet1d':
-             x = x.permute(0, 2, 1) # (B, C, T)
+        # Create default mask (all valid initially)
+        if masks is None:
+            masks = torch.ones((x.shape[0], x.shape[1]), dtype=torch.bool, device=x.device)
         
         state_cond = None
         task_cond = None
@@ -286,7 +286,7 @@ class DFoTTrajectory(nn.Module):
         else:
             k = timesteps
         
-        model_pred, model_out, loss = self.diffusion_model(x, ext_cond, k, masks)
+        model_pred, model_out, loss = self.diffusion_model(x, ext_cond, k)
         
         # Reweight loss using masks
         loss = self._reweight_loss(loss, masks)
@@ -298,7 +298,7 @@ class DFoTTrajectory(nn.Module):
         }
         return output_dict
 
-    def sample(self, num_trajectories, model_cond=None, mask_goal=False, cfg_w=0.0):
+    def sample(self, num_trajectories, model_cond=None, cfg_w=0.0):
         """
         Sampling method.
         """
@@ -329,7 +329,6 @@ class DFoTTrajectory(nn.Module):
 
         cond_list = []
         if self.state_condition and state_cond_input is not None:
-            if mask_goal: state_cond_input[:, -3:] = 0.0
             s_cond = self.state_embedding(state_cond_input) # (B, C)
             cond_list.append(s_cond)
         if self.task_condition and task_cond is not None:
@@ -426,7 +425,7 @@ class DFoTTrajectory(nn.Module):
         return_all: bool = False,
         pbar: Optional[tqdm] = None,
         cfg_w: float = 0.0,
-    ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:\
+    ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
         
         x_shape = self.x_shape
 

@@ -75,18 +75,13 @@ class FlexibleWindowDataset(Dataset):
              with open(task_list_path, 'r') as f:
                  tasks = yaml.safe_load(f)
              
-             # Unpack the task list (handle if it's a dict or list)
              if isinstance(tasks, dict):
-                 # Maybe keys are task names? Or 'train'/'test' keys?
-                 # Assume simple list for now, or extract 'tasks' key
                  if 'tasks' in tasks: tasks = tasks['tasks']
                  else: tasks = list(tasks.keys())
                  
-             # Expected format: list of folder names
              self.file_paths = []
              for t in tasks:
-                 # Check for top_trajectories.npz in the folder
-                 p = os.path.join(data_root, t, "top_trajectories.npz")
+                 p = os.path.join(data_root, t, "best_trajectory.npz")
                  if os.path.exists(p):
                      self.file_paths.append(p)
                  else:
@@ -114,6 +109,7 @@ class FlexibleWindowDataset(Dataset):
     def _index_dataset(self):
         """
         Iterate through files to determine valid window start indices.
+        Mimics create_dataset.py padding and windowing logic.
         """
         print("Indexing dataset...")
         for i, fpath in enumerate(self.file_paths):
@@ -139,12 +135,12 @@ class FlexibleWindowDataset(Dataset):
                     # Apply downsampling effectively reduces T
                     T_down = T // self.downsample
 
-                    min_start = self.start_timestep // self.downsample
+                    T_padded = T_down + 2    
                     w_size = self.window_size + self.history_size
-                    max_start = max(min_start, T_down - w_size)
-                                        
-                    if max_start >= min_start:
-                        starts = np.arange(min_start, max_start + 1, self.stride)
+                    num_windows = T_padded - w_size + 1
+                    
+                    if num_windows > 0:
+                        starts = np.arange(0, num_windows, self.stride)
                         for b in range(B):
                             for s in starts:
                                 self.indices.append((i, b, s))
@@ -196,6 +192,15 @@ class FlexibleWindowDataset(Dataset):
                 raw['joints'] = extract('actuator_pos')
                 raw['obj'] = extract('obj_0_xyz_quat')
                 
+                # Velocities
+                if 'base_linvel_angvel' in data:
+                    raw['base_vel'] = extract('base_linvel_angvel')
+                if 'actuator_vel' in data:
+                    raw['joints_vel'] = extract('actuator_vel')
+                if 'obj_0_linvel_angvel' in data:
+                    raw['obj_vel'] = extract('obj_0_linvel_angvel')
+
+                
         return raw
 
     def _compute_task_params(self, full_obj_traj):
@@ -203,7 +208,7 @@ class FlexibleWindowDataset(Dataset):
         Compute task parameters from FULL object trajectory.
         obj_traj: (T_full, 7)
         """
-        return full_obj_traj[-1, 2:3]
+        return full_obj_traj[-1, :2]
 
     def _compute_transform(self, raw_data, t_start):
         """
@@ -211,33 +216,52 @@ class FlexibleWindowDataset(Dataset):
         Returns a dictionary of available features.
         """
         w_size = self.window_size + self.history_size
-        
+
+        # Calculate raw indices based on padded timeline (pad=1 at start)
+        raw_start = t_start - 1
+        raw_end = raw_start + w_size
+        raw_len = raw_data['base'].shape[0]
+
         # Handle boundary/padding
-        read_start = max(0, t_start)
-        read_end = t_start + w_size
+        read_start = max(0, raw_start)
+        read_end = min(raw_len, raw_end)
         
-        # Note: raw_data contains the FULL trajectory (downsampled)
+        # Extract available data
         base = raw_data['base'][read_start : read_end]      # (valid_len, 7)
         joints = raw_data['joints'][read_start : read_end]  # (valid_len, 29)
         obj = raw_data['obj'][read_start : read_end]        # (valid_len, 7)
         
-        # 1. Pad Front (if t_start < 0)
-        pad_front = max(0, -t_start)
+        base_vel = None
+        joints_vel = None
+        obj_vel = None
+        if 'base_vel' in raw_data:
+            base_vel = raw_data['base_vel'][read_start : read_end]
+        if 'joints_vel' in raw_data:
+            joints_vel = raw_data['joints_vel'][read_start : read_end]
+        if 'obj_vel' in raw_data:
+            obj_vel = raw_data['obj_vel'][read_start : read_end]
+
+        # 1. Pad Front (if raw_start < 0)
+        pad_front = max(0, -raw_start)
         if pad_front > 0:
             base = np.pad(base, ((pad_front, 0), (0,0)), mode='edge')
             joints = np.pad(joints, ((pad_front, 0), (0,0)), mode='edge')
             obj = np.pad(obj, ((pad_front, 0), (0,0)), mode='edge')
+            if base_vel is not None: base_vel = np.pad(base_vel, ((pad_front, 0), (0,0)), mode='edge')
+            if joints_vel is not None: joints_vel = np.pad(joints_vel, ((pad_front, 0), (0,0)), mode='edge')
+            if obj_vel is not None: obj_vel = np.pad(obj_vel, ((pad_front, 0), (0,0)), mode='edge')
         
-        # 2. Pad Back (if total length < w_size)
-        curr_len = base.shape[0]
-        if curr_len < w_size:
-            pad_back = w_size - curr_len
+        # 2. Pad Back (if raw_end > raw_len)
+        pad_back = max(0, raw_end - raw_len)
+        if pad_back > 0:
             base = np.pad(base, ((0, pad_back), (0,0)), mode='edge')
             joints = np.pad(joints, ((0, pad_back), (0,0)), mode='edge')
             obj = np.pad(obj, ((0, pad_back), (0,0)), mode='edge')
+            if base_vel is not None: base_vel = np.pad(base_vel, ((0, pad_back), (0,0)), mode='edge')
+            if joints_vel is not None: joints_vel = np.pad(joints_vel, ((0, pad_back), (0,0)), mode='edge')
+            if obj_vel is not None: obj_vel = np.pad(obj_vel, ((0, pad_back), (0,0)), mode='edge')
             
-        # Define Reference Frame (at history_size - 1)
-        # This is the "current state" anchor
+        # Define Reference Frame.
         ref_idx = min(self.history_size - 1, w_size - 1)
         
         # --- Computations (SBTO Logic) ---
@@ -246,13 +270,16 @@ class FlexibleWindowDataset(Dataset):
             base=base[None, ...],   # (1, W, 7)
             joints=joints[None, ...], 
             obj=obj[None, ...],
-            ref_idx=ref_idx
+            ref_idx=ref_idx,
+            base_vel=base_vel[None, ...] if base_vel is not None else None,
+            joints_vel=joints_vel[None, ...] if joints_vel is not None else None,
+            obj_vel=obj_vel[None, ...] if obj_vel is not None else None,
         )
         
         # Unpack to (W, ...)
         feats = {k: v[0] for k, v in comps.items()}
 
-        task_params = self._compute_task_params(raw_data['obj'])
+        task_params = self._compute_task_params(obj)
         feats['task_params'] = task_params
         
         anchor = {}
@@ -263,17 +290,21 @@ class FlexibleWindowDataset(Dataset):
         return feats, anchor
     
     def _normalize(self, key, tensor):
-        """Apply mean-std normalization."""
+        """Apply min-max normalization to [-1, 1]."""
         if not self.stats:
             return tensor
             
-        mean_k = f"mean_{key}"
-        std_k = f"std_{key}"
+        min_k = f"min_{key}"
+        max_k = f"max_{key}"
         
-        if mean_k in self.stats and std_k in self.stats:
-            mean = self.stats[mean_k].to(tensor.device)
-            std = self.stats[std_k].to(tensor.device)
-            return (tensor - mean) / (std + 1e-6)
+        if min_k in self.stats and max_k in self.stats:
+            min_val = self.stats[min_k].to(tensor.device)
+            max_val = self.stats[max_k].to(tensor.device)
+            
+            denom = max_val - min_val
+            denom[denom < 1e-6] = 1.0
+
+            return 2 * (tensor - min_val) / denom - 1
             
         return tensor
     
@@ -347,11 +378,10 @@ class FlexibleWindowDataset(Dataset):
         return future_states, current_state, task_params, anchor
 
     def _calculate_stats(self):
-        """Iterate entire dataset (or subset) to compute mean/std for each feature type."""
-        print("Calculating normalization stats (mean/std)...")
-        sums = {}
-        sq_sums = {}
-        counts = {}
+        """Iterate entire dataset (or subset) to compute min/max for each feature type."""
+        print("Calculating normalization stats (min/max)...")
+        mins = {}
+        maxs = {}
         
         # Use a subset if dataset is huge, else full pass
         for idx in range(len(self.indices)):
@@ -360,35 +390,22 @@ class FlexibleWindowDataset(Dataset):
             feats, _ = self._compute_transform(raw_traj, t_start)
             
             for k, v in feats.items():
-                # Apply noise during stats calculation if enabled
-                v = v.astype(np.float64) # Use float64 for precision accumulation
-                v_sum = np.sum(v, axis=0)
-                v_sq_sum = np.sum(v**2, axis=0)
-                v_count = v.shape[0]
+                v = v.astype(np.float64) 
+                v_min = np.min(v, axis=0)
+                v_max = np.max(v, axis=0)
                 
-                if k not in sums:
-                    sums[k] = v_sum
-                    sq_sums[k] = v_sq_sum
-                    counts[k] = v_count
+                if k not in mins:
+                    mins[k] = v_min
+                    maxs[k] = v_max
                 else:
-                    sums[k] += v_sum
-                    sq_sums[k] += v_sq_sum
-                    counts[k] += v_count
+                    mins[k] = np.minimum(mins[k], v_min)
+                    maxs[k] = np.maximum(maxs[k], v_max)
         
         # Store
         self.stats = {}
-        for k in sums:
-            mean = sums[k] / counts[k]
-            # Var = E[X^2] - (E[X])^2
-            var = (sq_sums[k] / counts[k]) - (mean ** 2)
-            var = np.maximum(var, 0) # Clip negative 0
-            std = np.sqrt(var)
-           
-            # Clip small std to prevent division explosion
-            std = np.maximum(std, 1e-4)
-
-            self.stats[f"mean_{k}"] = torch.as_tensor(mean).float()
-            self.stats[f"std_{k}"] = torch.as_tensor(std).float()
+        for k in mins:
+            self.stats[f"min_{k}"] = torch.as_tensor(mins[k]).float()
+            self.stats[f"max_{k}"] = torch.as_tensor(maxs[k]).float()
             
         # Save
         if self.norm_path:
@@ -405,30 +422,30 @@ class FlexibleWindowDataset(Dataset):
                 self.stats[k] = torch.from_numpy(data[k]).float()
         
         # Precompute global stats for concatenated features
-        means = []
-        stds = []
+        mins = []
+        maxs = []
         for key in self.feature_order:
              # Check if key exists in stats (it should if we computed it)
-             # Note: stats keys are "mean_key", "std_key"
-             mk, sk = f"mean_{key}", f"std_{key}"
-             if mk in self.stats and sk in self.stats:
-                 means.append(self.stats[mk])
-                 stds.append(self.stats[sk])
+             # Note: stats keys are "min_key", "max_key"
+             mk, MK = f"min_{key}", f"max_{key}"
+             if mk in self.stats and MK in self.stats:
+                 mins.append(self.stats[mk])
+                 maxs.append(self.stats[MK])
              else:
                  # Warn or handle missing
                  pass
         
-        if means:
-            self.global_mean = torch.cat(means, dim=-1)
-            self.global_std = torch.cat(stds, dim=-1)
+        if mins:
+            self.global_min = torch.cat(mins, dim=-1)
+            self.global_max = torch.cat(maxs, dim=-1)
 
     def denormalize_global(self, tensor):
         """Denormalize a concatenated feature tensor using global stats."""
-        if hasattr(self, 'global_mean') and hasattr(self, 'global_std'):
+        if hasattr(self, 'global_min') and hasattr(self, 'global_max'):
             device = tensor.device
-            mean = self.global_mean.to(device)
-            std = self.global_std.to(device)
-            return (tensor * std) + mean
+            min_val = self.global_min.to(device)
+            max_val = self.global_max.to(device)
+            return ((tensor + 1) / 2) * (max_val - min_val) + min_val
         return tensor
 
     def __len__(self):

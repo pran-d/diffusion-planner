@@ -217,9 +217,7 @@ def main():
         )
         
         # B. Denormalize
-        samples_btc = normalized_sample
-        tensor_btc = torch.from_numpy(samples_btc).float().to(device)
-        denorm_btc = dataset.denormalize_global(tensor_btc)
+        denorm_btc = dataset.denormalize_global(normalized_sample)
         future_traj_np = denorm_btc.cpu().numpy()
         
         # C. Reconstruct World Frame

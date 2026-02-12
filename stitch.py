@@ -17,6 +17,7 @@ import time
 import numpy as np
 import torch
 import matplotlib.pyplot as plt
+import yaml
 
 from config.configure import load_config, get_data_path, get_norm_path
 from models.model import RobotDiffuser
@@ -166,8 +167,7 @@ def autoregressive_rollout(args, diffuser, dataset, model_cfg, data_cfg, noise_c
             # normalized_sample is (B, T, C)
             
             # 2. Denormalize
-            norm_tensor = torch.from_numpy(normalized_sample).float().to(diffuser.device)
-            denorm_tensor = dataset.denormalize_global(norm_tensor)
+            denorm_tensor = dataset.denormalize_global(normalized_sample)
             future_traj = denorm_tensor.cpu().numpy()
             
             # 3. Anchor Construction
@@ -232,7 +232,7 @@ def autoregressive_rollout(args, diffuser, dataset, model_cfg, data_cfg, noise_c
                         # Filter for observation features (current state)
                         if part_end > obs_start_idx:
                             local_start = max(0, obs_start_idx - cumulative_dim)
-                            current_parts.append(part[-history_size:, local_start:])
+                            current_parts.append(part[:history_size, local_start:])
                         
                         cumulative_dim += part_dim
                 
@@ -311,23 +311,27 @@ if __name__ == "__main__":
     )
 
     if args.save_path:
-        if args.save_path.endswith(".npy"):
-            np.save(args.save_path, stitched)
-        elif args.save_path.endswith(".npz"):
+        # Append traj_num to avoid overwrite if looping
+        base, ext = os.path.splitext(args.save_path)
+        path_with_idx = f"{base}_{args.traj_num}{ext}"
+        
+        if path_with_idx.endswith(".npy"):
+            np.save(path_with_idx, stitched)
+        elif path_with_idx.endswith(".npz"):
             to_save = stitched
             if to_save.ndim == 3: 
                 to_save = to_save[0]
                 
             save_dict = {
-                'body_pos_w': to_save[:, 0:3][:, None, :],   # (T, 1, 3) for compatibility with [:, 0, :] indexing
+                'body_pos_w': to_save[:, 0:3][:, None, :],   # (T, 1, 3) 
                 'body_quat_w': to_save[:, 3:7][:, None, :],  # (T, 1, 4)
                 'joint_pos': to_save[:, 7:36],               # (T, 29)
                 'object_pos_w': to_save[:, 36:39],           # (T, 3)
                 'object_quat_w': to_save[:, 39:43]           # (T, 4)
             }
             
-            np.savez(args.save_path, **save_dict)
-        print(f"Saved stitched trajectory to {args.save_path}")
+            np.savez(path_with_idx, **save_dict)
+        print(f"Saved stitched trajectory to {path_with_idx}")
 
     # Single Trajectory
     if stitched.ndim == 3: stitched = stitched[0] # Should be (T, D) if single? Or handled by visualize_trajectory check?

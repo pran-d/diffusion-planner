@@ -122,7 +122,7 @@ class RobotDiffuser():
             **sample_kwargs
         )
         
-        return sample.detach().cpu().numpy()
+        return sample.detach()
 
     
     def save_ema_weights(self, parameters: Iterable[torch.nn.Parameter], path):

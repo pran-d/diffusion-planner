@@ -200,10 +200,9 @@ class BufferDataset(FlexibleWindowDataset):
         return future_states, current_state, task_params, anchor
 
     def _calculate_stats(self):
-        print("Calculating normalization stats from buffer...")
-        sums = {}
-        sq_sums = {}
-        counts = {}
+        print("Calculating normalization stats from buffer (min/max)...")
+        mins = {}
+        maxs = {}
         
         # Iterate all indices
         for idx in tqdm(range(len(self.indices))):
@@ -213,42 +212,33 @@ class BufferDataset(FlexibleWindowDataset):
             
             for k, v in feats.items():
                 v = v.astype(np.float64)
-                v_sum = np.sum(v, axis=0)
-                v_sq_sum = np.sum(v**2, axis=0)
-                v_count = v.shape[0]
+                v_min = np.min(v, axis=0)
+                v_max = np.max(v, axis=0)
                 
-                if k not in sums:
-                    sums[k] = v_sum
-                    sq_sums[k] = v_sq_sum
-                    counts[k] = v_count
+                if k not in mins:
+                    mins[k] = v_min
+                    maxs[k] = v_max
                 else:
-                    sums[k] += v_sum
-                    sq_sums[k] += v_sq_sum
-                    counts[k] += v_count
+                    mins[k] = np.minimum(mins[k], v_min)
+                    maxs[k] = np.maximum(maxs[k], v_max)
         
         self.stats = {}
-        for k in sums:
-            mean = sums[k] / counts[k]
-            var = (sq_sums[k] / counts[k]) - (mean ** 2)
-            var = np.maximum(var, 0)
-            std = np.sqrt(var)
-            std = np.maximum(std, 1e-4)
-
-            self.stats[f"mean_{k}"] = torch.as_tensor(mean).float()
-            self.stats[f"std_{k}"] = torch.as_tensor(std).float()
+        for k in mins:
+            self.stats[f"min_{k}"] = torch.as_tensor(mins[k]).float()
+            self.stats[f"max_{k}"] = torch.as_tensor(maxs[k]).float()
             
         # Also compute global stats for denormalize_global
         self._compute_global_stats()
         
     def _compute_global_stats(self):
-        means = []
-        stds = []
+        mins = []
+        maxs = []
         for key in self.feature_order:
-             mk, sk = f"mean_{key}", f"std_{key}"
-             if mk in self.stats and sk in self.stats:
-                 means.append(self.stats[mk])
-                 stds.append(self.stats[sk])
+             mk, MK = f"min_{key}", f"max_{key}"
+             if mk in self.stats and MK in self.stats:
+                 mins.append(self.stats[mk])
+                 maxs.append(self.stats[MK])
         
-        if means:
-            self.global_mean = torch.cat(means, dim=-1)
-            self.global_std = torch.cat(stds, dim=-1)
+        if mins:
+            self.global_min = torch.cat(mins, dim=-1)
+            self.global_max = torch.cat(maxs, dim=-1)

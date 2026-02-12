@@ -465,10 +465,8 @@ class MotionGenerator:
             ) # (B, T, D_out)
             
             # B. Denormalize
-            samples_btc = normalized_sample
-            tensor_btc = torch.from_numpy(samples_btc).float().to(self.device)
-            denorm_btc = self.dataset.denormalize_global(tensor_btc)
-            future_traj_np = denorm_btc.cpu().numpy()
+            denorm_btc = self.dataset.denormalize_global(normalized_sample)
+            future_traj_np = denorm_btc.detach().cpu().numpy()
             
             # C. Reconstruct World Frame
             anchor_arr = np.concatenate([current_anchors['ref_pos'], current_anchors['ref_quat']], axis=-1)
