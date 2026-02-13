@@ -4,6 +4,7 @@ import os
 import glob
 import re
 import yaml
+import collections
 from torch.utils.data import Dataset
 from tqdm import tqdm
 
@@ -29,7 +30,8 @@ class FlexibleWindowDataset(Dataset):
         calculate_stats=False,
         noise_cfg=None, 
         add_noise=False,
-        add_goal_noise=False
+        add_goal_noise=False,
+        cache_size=None # Deprecated
     ):
         
         self.data_root = data_root
@@ -81,7 +83,7 @@ class FlexibleWindowDataset(Dataset):
                  
              self.file_paths = []
              for t in tasks:
-                 p = os.path.join(data_root, t, "best_trajectory.npz")
+                 p = os.path.join(data_root, t, "top_trajectories.npz")
                  if os.path.exists(p):
                      self.file_paths.append(p)
                  else:
@@ -94,10 +96,15 @@ class FlexibleWindowDataset(Dataset):
         if not self.file_paths:
             print(f"Warning: No .npz files found in {data_root}")
         
-        # Index all windows: (file_idx, start_time_idx)
+        # 1. Index dataset (determine B, T for all files)
         self.indices = []
         self._index_dataset()
         
+        # 2. Preload processed data to RAM (Speed Optimization for small-medium datasets)
+        # Replacing LRU cache with full load (~500MB for 4k trajectories)
+        self.ram_cache = []
+        self._preload_dataset()
+
         # Normalization
         self.norm_path = norm_path
         self.stats = {}
@@ -105,6 +112,83 @@ class FlexibleWindowDataset(Dataset):
             self._calculate_stats()
         elif norm_path and os.path.exists(norm_path):
             self._load_stats()
+
+    def _preload_dataset(self):
+        print(f"Preloading {len(self.file_paths)} files into RAM...")
+        for fpath in tqdm(self.file_paths, desc="Loading Data"):
+            self.ram_cache.append(self._load_and_process_file(fpath))
+
+    def _load_and_process_file(self, fpath):
+        """
+        Loads file and returns dict of (N, T, D) arrays with downsampling applied.
+        """
+        raw = {}
+        processed = {}
+        try:
+            with np.load(fpath, allow_pickle=True) as data:
+                # RL Rollout Schema
+                if 'body_pos_w' in data:
+                    is_batched = data['body_pos_w'].ndim == 4
+                    # Helper to get (N, T, D)
+                    def extract(key):
+                        arr = data[key] # (N, T, ...) or (T, ...)
+                        if not is_batched:
+                            arr = arr[None, ...] # Make (1, T, ...)
+                        return arr[:, ::self.downsample]
+                    
+                    # Base (Merge pos+quat)
+                    body_pos = extract('body_pos_w') 
+                    body_quat = extract('body_quat_w')
+                    # Expect (N, T, K, 3). Take K=0
+                    # If (N, T, D), then just take it.
+                    if body_pos.ndim == 4:
+                         processed['base'] = np.concatenate([body_pos[:, :, 0, :], body_quat[:, :, 0, :]], axis=-1)
+                    else:
+                         # Assume already (N, T, 3) 
+                         processed['base'] = np.concatenate([body_pos, body_quat], axis=-1)
+
+                    processed['joints'] = extract('joint_pos')
+                    processed['obj'] = np.concatenate([extract('object_pos_w'), extract('object_quat_w')], axis=-1)
+                    
+                elif 'base_xyz_quat' in data:
+                    # SBTO Schema
+                    is_batched = data['base_xyz_quat'].ndim == 3
+                     # Helper
+                    def extract(key):
+                        arr = data[key]
+                        if not is_batched:
+                            arr = arr[None, ...]
+                        return arr[:, ::self.downsample]
+
+                    processed['base'] = extract('base_xyz_quat')
+                    processed['joints'] = extract('actuator_pos')
+                    processed['obj'] = extract('obj_0_xyz_quat')
+                    
+                    if 'base_linvel_angvel' in data:
+                        processed['base_vel'] = extract('base_linvel_angvel')
+                    if 'actuator_vel' in data:
+                        processed['joints_vel'] = extract('actuator_vel')
+                    if 'obj_0_linvel_angvel' in data:
+                        processed['obj_vel'] = extract('obj_0_linvel_angvel')
+                
+                # Metadata
+                if 'fps' in data:
+                    fps_val = data['fps'].item() if data['fps'].ndim == 0 else data['fps'][0]
+                    B_dim = processed['base'].shape[0]
+                    processed['fps'] = np.repeat(fps_val, B_dim)
+                    
+        except Exception as e:
+            print(f"Failed to load {fpath}: {e}")
+            # Return dummy or handle error? indices should prevent access if validation worked.
+            # But indices() only reads header. 
+            pass 
+            
+        return processed
+
+    def _get_single_traj(self, file_idx, batch_idx):
+        """Get (T, D) dict for a specific trajectory."""
+        file_data = self.ram_cache[file_idx]
+        return {k: v[batch_idx] for k, v in file_data.items()}
             
     def _index_dataset(self):
         """
@@ -149,165 +233,113 @@ class FlexibleWindowDataset(Dataset):
                 print(f"Error indexing {fpath}: {e}")
         print(f"Indexed {len(self.indices)} windows.")
 
-    def _load_raw_trajectory(self, fpath, batch_idx):
-        """Generalized loader for different schema."""
-        raw = {}
-        with np.load(fpath, allow_pickle=True) as data:
-            # RL Rollout Schema
-            if 'body_pos_w' in data:
-                # Determine batching
-                is_batched = data['body_pos_w'].ndim == 4
-                
-                def extract(key):
-                    arr = data[key]
-                    if is_batched:
-                        arr = arr[batch_idx]
-                    return arr[::self.downsample]
-                
-                # Base
-                body_pos = extract('body_pos_w') # (T, K, 3)
-                body_quat = extract('body_quat_w')
-                raw['base'] = np.concatenate([body_pos[:, 0, :], body_quat[:, 0, :]], axis=-1)
-                
-                # Joints
-                raw['joints'] = extract('joint_pos')
-                
-                # Object
-                obj_pos = extract('object_pos_w')
-                obj_quat = extract('object_quat_w')
-                raw['obj'] = np.concatenate([obj_pos, obj_quat], axis=-1)
-                
-            elif 'base_xyz_quat' in data:
-                # SBTO OmniRetarget Dataset Schema
-                # Check for batching
-                is_batched = data['base_xyz_quat'].ndim == 3
-                
-                def extract(key):
-                    arr = data[key]
-                    if is_batched:
-                        arr = arr[batch_idx]
-                    return arr[::self.downsample]
-
-                raw['base'] = extract('base_xyz_quat')
-                raw['joints'] = extract('actuator_pos')
-                raw['obj'] = extract('obj_0_xyz_quat')
-                
-                # Velocities
-                if 'base_linvel_angvel' in data:
-                    raw['base_vel'] = extract('base_linvel_angvel')
-                if 'actuator_vel' in data:
-                    raw['joints_vel'] = extract('actuator_vel')
-                if 'obj_0_linvel_angvel' in data:
-                    raw['obj_vel'] = extract('obj_0_linvel_angvel')
-
-                
-        return raw
-
-    def _compute_task_params(self, full_obj_traj):
-        """
-        Compute task parameters from FULL object trajectory.
-        obj_traj: (T_full, 7)
-        """
-        return full_obj_traj[-1, :2]
-
-    def _compute_transform(self, raw_data, t_start):
-        """
-        Compute relative features for the window starting at t_start.
-        Returns a dictionary of available features.
-        """
+    def _compute_transform(self, raw_traj, t_start):
+        # raw_traj contains full trajectory (downsampled)
+        # t_start is the index of the start of the window
+        
+        T_traj = raw_traj['base'].shape[0]
         w_size = self.window_size + self.history_size
-
-        # Calculate raw indices based on padded timeline (pad=1 at start)
         raw_start = t_start - 1
         raw_end = raw_start + w_size
-        raw_len = raw_data['base'].shape[0]
-
-        # Handle boundary/padding
+        
+        # Read with padding
         read_start = max(0, raw_start)
-        read_end = min(raw_len, raw_end)
+        read_end = min(T_traj, raw_end)
         
-        # Extract available data
-        base = raw_data['base'][read_start : read_end]      # (valid_len, 7)
-        joints = raw_data['joints'][read_start : read_end]  # (valid_len, 29)
-        obj = raw_data['obj'][read_start : read_end]        # (valid_len, 7)
+        # Slice
+        b_slice = raw_traj['base'][read_start:read_end]
+        j_slice = raw_traj['joints'][read_start:read_end]
+        o_slice = raw_traj['obj'][read_start:read_end]
         
-        base_vel = None
-        joints_vel = None
-        obj_vel = None
-        if 'base_vel' in raw_data:
-            base_vel = raw_data['base_vel'][read_start : read_end]
-        if 'joints_vel' in raw_data:
-            joints_vel = raw_data['joints_vel'][read_start : read_end]
-        if 'obj_vel' in raw_data:
-            obj_vel = raw_data['obj_vel'][read_start : read_end]
-
-        # 1. Pad Front (if raw_start < 0)
+        # Pad
         pad_front = max(0, -raw_start)
-        if pad_front > 0:
-            base = np.pad(base, ((pad_front, 0), (0,0)), mode='edge')
-            joints = np.pad(joints, ((pad_front, 0), (0,0)), mode='edge')
-            obj = np.pad(obj, ((pad_front, 0), (0,0)), mode='edge')
-            if base_vel is not None: base_vel = np.pad(base_vel, ((pad_front, 0), (0,0)), mode='edge')
-            if joints_vel is not None: joints_vel = np.pad(joints_vel, ((pad_front, 0), (0,0)), mode='edge')
-            if obj_vel is not None: obj_vel = np.pad(obj_vel, ((pad_front, 0), (0,0)), mode='edge')
+        pad_back = max(0, raw_end - T_traj)
         
-        # 2. Pad Back (if raw_end > raw_len)
-        pad_back = max(0, raw_end - raw_len)
-        if pad_back > 0:
-            base = np.pad(base, ((0, pad_back), (0,0)), mode='edge')
-            joints = np.pad(joints, ((0, pad_back), (0,0)), mode='edge')
-            obj = np.pad(obj, ((0, pad_back), (0,0)), mode='edge')
-            if base_vel is not None: base_vel = np.pad(base_vel, ((0, pad_back), (0,0)), mode='edge')
-            if joints_vel is not None: joints_vel = np.pad(joints_vel, ((0, pad_back), (0,0)), mode='edge')
-            if obj_vel is not None: obj_vel = np.pad(obj_vel, ((0, pad_back), (0,0)), mode='edge')
+        if pad_front > 0 or pad_back > 0:
+            p = ((pad_front, pad_back), (0,0))
+            b_slice = np.pad(b_slice, p, mode='edge')
+            j_slice = np.pad(j_slice, p, mode='edge')
+            o_slice = np.pad(o_slice, p, mode='edge')
             
-        # Define Reference Frame.
-        ref_idx = min(self.history_size - 1, w_size - 1)
+        # Velocity
+        if 'base_vel' in raw_traj:
+            bv = raw_traj['base_vel'][read_start:read_end]
+            jv = raw_traj['joints_vel'][read_start:read_end]
+            ov = raw_traj['obj_vel'][read_start:read_end]
+            if pad_front > 0 or pad_back > 0:
+                p = ((pad_front, pad_back), (0,0))
+                bv = np.pad(bv, p, mode='edge')
+                jv = np.pad(jv, p, mode='edge')
+                ov = np.pad(ov, p, mode='edge')
+        else:
+            bv, jv, ov = None, None, None
+            
+        # Reference frame for SBTO
+        # "Current state" is usually history_size.
+        ref_idx = min(self.history_size, w_size - 1)
         
-        # --- Computations (SBTO Logic) ---
-        # Use centralized logic from sbto_utils
-        comps, anchors = compute_sbto_components(
-            base=base[None, ...],   # (1, W, 7)
-            joints=joints[None, ...], 
-            obj=obj[None, ...],
-            ref_idx=ref_idx,
-            base_vel=base_vel[None, ...] if base_vel is not None else None,
-            joints_vel=joints_vel[None, ...] if joints_vel is not None else None,
-            obj_vel=obj_vel[None, ...] if obj_vel is not None else None,
+        # Batched SBTO call (Expects B, T, D)
+        b_in = b_slice[np.newaxis, ...]
+        j_in = j_slice[np.newaxis, ...]
+        o_in = o_slice[np.newaxis, ...]
+        
+        bv_in = bv[np.newaxis, ...] if bv is not None else None
+        jv_in = jv[np.newaxis, ...] if jv is not None else None
+        ov_in = ov[np.newaxis, ...] if ov is not None else None
+
+        features_b, anchor_b = compute_sbto_components(
+            b_in, j_in, o_in, ref_idx,
+            base_vel=bv_in, joints_vel=jv_in, obj_vel=ov_in
         )
         
-        # Unpack to (W, ...)
-        feats = {k: v[0] for k, v in comps.items()}
-
-        task_params = self._compute_task_params(obj)
-        feats['task_params'] = task_params
+        # Unwrap batch dim
+        features = {k: v[0] for k, v in features_b.items() if v is not None}
         
-        anchor = {}
-        anchor['ref_pos'] = anchors['ref_pos'][0, 0]
-        anchor['ref_quat'] = anchors['ref_quat'][0, 0]
-        anchor['task_params'] = task_params
+        # Helper to squeeze anchor dims
+        def _sq(x):
+            if x.shape[0] == 1: return x.squeeze(0)
+            return x
 
-        return feats, anchor
-    
-    def _normalize(self, key, tensor):
-        """Apply min-max normalization to [-1, 1]."""
-        if not self.stats:
-            return tensor
-            
-        min_k = f"min_{key}"
-        max_k = f"max_{key}"
+        anchor = {k: _sq(v[0]) for k, v in anchor_b.items()}
         
-        if min_k in self.stats and max_k in self.stats:
-            min_val = self.stats[min_k].to(tensor.device)
-            max_val = self.stats[max_k].to(tensor.device)
-            
-            denom = max_val - min_val
-            denom[denom < 1e-6] = 1.0
+        # Add task params
+        features["task_params"] = self._compute_task_params(raw_traj['obj'])
+        
+        # Add metadata to anchor
+        if 'fps' in raw_traj:
+            anchor['fps'] = raw_traj['fps']
 
-            return 2 * (tensor - min_val) / denom - 1
+        return features, anchor
+
+    def _compute_task_params(self, obj_traj):
+        # Default: Object X, Y displacement from start to end of trajectory
+        if obj_traj.shape[0] > 0:
+            return (obj_traj[-1, :2] - obj_traj[0, :2]) # (2,)
+        return np.zeros(2)
+
+    def _normalize(self, key, val):
+        min_k = self.stats.get(f"min_{key}")
+        max_k = self.stats.get(f"max_{key}")
+        
+        if min_k is None or max_k is None:
+            return val
             
-        return tensor
-    
+        dev = val.device
+        min_v = min_k.to(dev)
+        max_v = max_k.to(dev)
+        
+        # simple min-max to [-1, 1]
+        diff = max_v - min_v
+        # Prevent div zero
+        mask = diff < 1e-6
+        if mask.any():
+            diff = diff.clone()
+            diff[mask] = 1.0
+            
+        norm = (val - min_v) / diff
+        norm = norm * 2 - 1
+        return norm
+
     def _add_rotation_noise(self, tensor, noise_level):
         """Add noise to rotation features (e.g., 6D)."""
         # tensor: (T, 6)
@@ -343,9 +375,11 @@ class FlexibleWindowDataset(Dataset):
 
     def __getitem__(self, idx):
         file_idx, batch_idx, t_start = self.indices[idx]
-        fpath = self.file_paths[file_idx]
         
-        raw_traj = self._load_raw_trajectory(fpath, batch_idx)
+        # Use RAM-cached data
+        raw_traj = self._get_single_traj(file_idx, batch_idx)
+        
+        # Compute features
         features, anchor = self._compute_transform(raw_traj, t_start)
         
         # Assemble Windowed Feature Vector
@@ -378,30 +412,107 @@ class FlexibleWindowDataset(Dataset):
         return future_states, current_state, task_params, anchor
 
     def _calculate_stats(self):
-        """Iterate entire dataset (or subset) to compute min/max for each feature type."""
+        """
+        Optimized stats calculation:
+        1. Groups windows by file to minimize IO (load once per file).
+        2. Vectorizes operations where possible in large chunks.
+        """
         print("Calculating normalization stats (min/max)...")
         mins = {}
         maxs = {}
         
-        # Use a subset if dataset is huge, else full pass
+        # Group indices by file/batch to avoid repeated IO
+        file_map = {}
         for idx in range(len(self.indices)):
             file_idx, batch_idx, t_start = self.indices[idx]
-            raw_traj = self._load_raw_trajectory(self.file_paths[file_idx], batch_idx)
-            feats, _ = self._compute_transform(raw_traj, t_start)
+            key = (file_idx, batch_idx)
+            if key not in file_map:
+                file_map[key] = []
+            file_map[key].append(t_start)
             
-            for k, v in feats.items():
-                v = v.astype(np.float64) 
-                v_min = np.min(v, axis=0)
-                v_max = np.max(v, axis=0)
+        # Process each file once
+        for (file_idx, batch_idx), starts in tqdm(file_map.items(), desc="Computing stats"):
+            raw_traj = self._get_single_traj(file_idx, batch_idx)
+            
+            # 1. Update Task Params stats (constant per trajectory)
+            if 'task_params' in raw_traj:
+                task_params = raw_traj['task_params']
+            else:
+                task_params = self._compute_task_params(raw_traj['obj']) # (D_task,)
+            
+            tp_min = task_params
+            tp_max = task_params
+            
+            if "task_params" not in mins:
+                mins["task_params"] = tp_min
+                maxs["task_params"] = tp_max
+            else:
+                mins["task_params"] = np.minimum(mins["task_params"], tp_min)
+                maxs["task_params"] = np.maximum(maxs["task_params"], tp_max)
+            
+            # 2. Process Windows in Batches
+            BATCH_SIZE = 256 # Process windows in chunks to manage memory
+            
+            w_size = self.window_size + self.history_size
+            ref_idx = min(self.history_size, w_size - 1)
+            raw_len = raw_traj['base'].shape[0]
+
+            # Pre-allocate generic buffer lists
+            batch_data = {
+                "base": [], "joints": [], "obj": [],
+                "base_vel": [], "joints_vel": [], "obj_vel": []
+            }
+            
+            has_vel = 'base_vel' in raw_traj
+            
+            for s in starts:
+                raw_start = s - 1
+                raw_end = raw_start + w_size
                 
-                if k not in mins:
-                    mins[k] = v_min
-                    maxs[k] = v_max
-                else:
-                    mins[k] = np.minimum(mins[k], v_min)
-                    maxs[k] = np.maximum(maxs[k], v_max)
-        
-        # Store
+                # Logic mimicking _compute_transform padding
+                read_start = max(0, raw_start)
+                read_end = min(raw_len, raw_end)
+                
+                # Slicing
+                b_slice = raw_traj['base'][read_start:read_end]
+                j_slice = raw_traj['joints'][read_start:read_end]
+                o_slice = raw_traj['obj'][read_start:read_end]
+                
+                pad_front = max(0, -raw_start)
+                pad_back = max(0, raw_end - raw_len)
+                
+                if pad_front > 0 or pad_back > 0:
+                    pad_width = ((pad_front, pad_back), (0,0))
+                    b_slice = np.pad(b_slice, pad_width, mode='edge')
+                    j_slice = np.pad(j_slice, pad_width, mode='edge')
+                    o_slice = np.pad(o_slice, pad_width, mode='edge')
+                
+                batch_data["base"].append(b_slice)
+                batch_data["joints"].append(j_slice)
+                batch_data["obj"].append(o_slice)
+                
+                if has_vel:
+                     bv = raw_traj['base_vel'][read_start:read_end] if 'base_vel' in raw_traj else np.zeros_like(b_slice) 
+                     jv = raw_traj['joints_vel'][read_start:read_end] if 'joints_vel' in raw_traj else np.zeros_like(j_slice)
+                     ov = raw_traj['obj_vel'][read_start:read_end] if 'obj_vel' in raw_traj else np.zeros_like(o_slice) 
+                     
+                     if pad_front > 0 or pad_back > 0:
+                         pad_width = ((pad_front, pad_back), (0,0))
+                         bv = np.pad(bv, pad_width, mode='edge')
+                         jv = np.pad(jv, pad_width, mode='edge')
+                         ov = np.pad(ov, pad_width, mode='edge')
+                     batch_data["base_vel"].append(bv)
+                     batch_data["joints_vel"].append(jv)
+                     batch_data["obj_vel"].append(ov)
+
+                if len(batch_data["base"]) >= BATCH_SIZE:
+                    self._update_batch_stats(mins, maxs, batch_data, ref_idx, has_vel)
+                    batch_data = {k: [] for k in batch_data}
+            
+            if len(batch_data["base"]) > 0:
+                 self._update_batch_stats(mins, maxs, batch_data, ref_idx, has_vel)
+
+        # Store to stats dict
         self.stats = {}
         for k in mins:
             self.stats[f"min_{k}"] = torch.as_tensor(mins[k]).float()
@@ -414,6 +525,36 @@ class FlexibleWindowDataset(Dataset):
             np_stats = {k: v.numpy() for k, v in self.stats.items()}
             np.savez(self.norm_path, **np_stats)
             print(f"Stats saved to {self.norm_path}")
+            
+        self._update_global_stats()
+
+    def _update_batch_stats(self, mins, maxs, batch_data, ref_idx, has_vel):
+        base = np.stack(batch_data["base"]) # (B, W, 7)
+        joints = np.stack(batch_data["joints"])
+        obj = np.stack(batch_data["obj"])
+        
+        base_vel = np.stack(batch_data["base_vel"]) if has_vel else None
+        joints_vel = np.stack(batch_data["joints_vel"]) if has_vel else None
+        obj_vel = np.stack(batch_data["obj_vel"]) if has_vel else None
+        
+        comps, _ = compute_sbto_components(
+            base, joints, obj, ref_idx,
+            base_vel=base_vel, joints_vel=joints_vel, obj_vel=obj_vel
+        )
+        
+        for k, v in comps.items():
+            if v is None: continue
+            v = v.astype(np.float64)
+            # v is (B, W, D). Min/Max over B(0) and W(1)
+            v_min = np.min(v, axis=(0, 1))
+            v_max = np.max(v, axis=(0, 1))
+            
+            if k not in mins:
+                mins[k] = v_min
+                maxs[k] = v_max
+            else:
+                mins[k] = np.minimum(mins[k], v_min)
+                maxs[k] = np.maximum(maxs[k], v_max)
 
     def _load_stats(self):
         print(f"Loading stats from {self.norm_path}")
@@ -421,19 +562,18 @@ class FlexibleWindowDataset(Dataset):
             for k in data.keys():
                 self.stats[k] = torch.from_numpy(data[k]).float()
         
+        self._update_global_stats()
+        
+    def _update_global_stats(self):
         # Precompute global stats for concatenated features
         mins = []
         maxs = []
         for key in self.feature_order:
-             # Check if key exists in stats (it should if we computed it)
-             # Note: stats keys are "min_key", "max_key"
+             # Check if key exists in stats
              mk, MK = f"min_{key}", f"max_{key}"
              if mk in self.stats and MK in self.stats:
                  mins.append(self.stats[mk])
                  maxs.append(self.stats[MK])
-             else:
-                 # Warn or handle missing
-                 pass
         
         if mins:
             self.global_min = torch.cat(mins, dim=-1)

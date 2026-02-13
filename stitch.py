@@ -33,7 +33,7 @@ def parse_args():
     parser = argparse.ArgumentParser("Autoregressive diffusion stitching")
     parser.add_argument("--epoch", type=int, default=0)
     parser.add_argument("--traj_num", type=int, default=0)
-    parser.add_argument("--stitch_steps", type=int, default=3)
+    parser.add_argument("--stitch_steps", type=int, default=1)
     parser.add_argument("--text", type=str, default=None)
     parser.add_argument("--generate", action="store_true")
     parser.add_argument("--custom_goal", type=float, nargs=7, default=None)
@@ -42,7 +42,9 @@ def parse_args():
     parser.add_argument("--headless", action="store_true", help="Run without visualization")
     parser.add_argument("--seed", type=int, default=None)
     parser.add_argument("--batch_size", type=int, default=1, help="Batch size for generation")
-    parser.add_argument("--cfg_w", type=float, default=0.0, help="Classifier-free guidance weight")
+    parser.add_argument("--cfg_w", type=float, default=1.0, help="Classifier-free guidance weight")
+    parser.add_argument("--batch_idx", type=int, default=0, help="Batch index within the file")
+    parser.add_argument("--start_time", type=int, default=0, help="Start timestep")
     parser.add_argument("--return_all", action="store_true", help="Return all generated trajectories instead of just the best one")
     parser.add_argument("--type", type=str, default="clean",
                         help="Type of current state to use: clean, noised, home, zero, copy_pos, random, random_swap")
@@ -77,18 +79,42 @@ def load_env_and_data():
 # Main stitching logic
 # -----------------------------------------------------------------------------
 
+
+def resolve_start_index(dataset, args):
+    """
+    Find the linear index in the dataset corresponding to (traj_num, batch_idx, start_time).
+    """
+    target = (args.traj_num, args.batch_idx, args.start_time)
+    try:
+        idx = dataset.indices.index(target)
+        print(f"Resolved (Traj {args.traj_num}, Batch {args.batch_idx}, Time {args.start_time}) -> Index {idx}")
+        return idx
+    except ValueError:
+        if args.batch_idx == 0 and args.start_time == 0:
+            print(f"Coordinate {target} not found. Using {args.traj_num} as linear index.")
+            return args.traj_num
+        else:
+            print(f"Error: Could not find trajectory {target} in dataset indices.")
+            return None
+
 def autoregressive_rollout(args, diffuser, dataset, model_cfg, data_cfg, noise_cfg, visualizer):
     num_T = data_cfg["num_timesteps"]
     history_size = data_cfg["state_history"]
     
+    # Resolve starting linear index
+    start_linear_idx = resolve_start_index(dataset, args)
+    if start_linear_idx is None:
+        return None, None, None
+
     generated_segments = []
+    fps = None
 
     # Stitch Loop
     for i in range(args.stitch_steps):
         print(f"Segment {i+1}/{args.stitch_steps}")
 
         # Determine indices/batch
-        indices = [args.traj_num + i * num_T] * args.batch_size
+        indices = [start_linear_idx + i * num_T] * args.batch_size
 
         # Load initial batch via Dataset
         curr_states_list = []
@@ -102,12 +128,11 @@ def autoregressive_rollout(args, diffuser, dataset, model_cfg, data_cfg, noise_c
             goal_cond_list.append(task)
             anchors_list.append(anch)
 
-        task_parameter = anchors_list[0]['task_params'] 
-
-        # current_state: (B, 1, F_obs)
         curr_state_tens = torch.stack(curr_states_list).to(diffuser.device)
-        
-        # goal condition: (B, 1) or whatever `task` is
+
+        if fps is None and anchors_list and 'fps' in anchors_list[0]:
+            fps = anchors_list[0]['fps']
+
         goal_cond_tens = torch.stack(goal_cond_list).to(diffuser.device)
         
         # Anchor: dictionary of arrays
@@ -255,7 +280,7 @@ def autoregressive_rollout(args, diffuser, dataset, model_cfg, data_cfg, noise_c
     # Post-Processing / Return
     # -----------------------------------------------
     if not generated_segments:
-        return None, None, None, None
+        return None, None, None
         
     stitched = np.concatenate(generated_segments, axis=1) # (B, Total_T, D)
     
@@ -263,7 +288,7 @@ def autoregressive_rollout(args, diffuser, dataset, model_cfg, data_cfg, noise_c
     best_idx = 0    
     if args.generate and args.batch_size > 1:
         best_distance = float('inf')
-        goal_obj_height = args.task_height if args.task_height is not None else task_parameter
+        goal_obj_height = args.task_params
         for b in range(0, args.batch_size):
             final_obj_height = stitched[b, -1, 36 + 2] # obj z-pos is at index 36+2
             if abs(final_obj_height - goal_obj_height) < best_distance:
@@ -273,7 +298,7 @@ def autoregressive_rollout(args, diffuser, dataset, model_cfg, data_cfg, noise_c
     
     stitched = stitched[best_idx]
     
-    return stitched, None
+    return stitched, None, fps
 
 
 # -----------------------------------------------------------------------------
@@ -306,7 +331,7 @@ if __name__ == "__main__":
         device=device,
     )
 
-    stitched, guidance_vec = autoregressive_rollout(
+    stitched, guidance_vec, fps = autoregressive_rollout(
         args, diffuser, dataset, model_cfg, data_cfg, noise_cfg, visualizer
     )
 
@@ -327,7 +352,8 @@ if __name__ == "__main__":
                 'body_quat_w': to_save[:, 3:7][:, None, :],  # (T, 1, 4)
                 'joint_pos': to_save[:, 7:36],               # (T, 29)
                 'object_pos_w': to_save[:, 36:39],           # (T, 3)
-                'object_quat_w': to_save[:, 39:43]           # (T, 4)
+                'object_quat_w': to_save[:, 39:43],          # (T, 4)
+                'fps': fps
             }
             
             np.savez(path_with_idx, **save_dict)

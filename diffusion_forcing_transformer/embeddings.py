@@ -288,16 +288,17 @@ class RandomEmbeddingDropout(nn.Module):
         Randomly nullify the input embeddings with a probability p during training. For inference, the embeddings are nullified only if mask is provided.
         Args:
             emb: input embeddings of shape (B, ...)
-            mask: mask tensor of shape (B, ). Only allowed during inference. If provided, embeddings for masked batches will be zeroed.
+            mask: mask tensor of shape (B, F). Only allowed during inference. If provided, embeddings for masked batches will be zeroed.
         """
         if mask is not None:
             assert not self.training, "embedding mask is only allowed during inference"
-            assert mask.ndim == 1, "embedding mask should be of shape (B,)"
+            assert mask.ndim == 2, "embedding mask should be of shape (B, F)"
 
         if self.training and self.p > 0:
             mask = torch.rand(emb.shape[:1], device=emb.device) < self.p
         if mask is not None:
-            mask = rearrange(mask, "... -> ..." + " 1" * (emb.ndim - 1))
+            while mask.ndim < emb.ndim:
+                mask = mask.unsqueeze(-1)
             emb = torch.where(mask, torch.zeros_like(emb), emb)
         return emb
 

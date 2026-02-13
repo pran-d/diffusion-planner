@@ -51,11 +51,16 @@ class RobotDiffuser():
         elif model_type == "latent_diffusion":
             self.model = UNetDiffuser(inp_size=self.input_size, num_channels=self.num_channels).to(self.device)
         elif model_type == "dfot":
-            self.model = DFoTTrajectory(self.model_cfg, self.data_cfg, self.noise_schedule_cfg, self.noise_scheduler).to(self.device)
+            self.model = DFoTTrajectory(self.model_cfg, self.data_cfg, self.noise_schedule_cfg, self.training_cfg, self.noise_scheduler).to(self.device)
         elif model_type == "dit1d_wrapper":
             self.model = SimpleTrajectoryDiffuser(self.model_cfg, self.data_cfg, self.noise_schedule_cfg, self.noise_scheduler).to(self.device)
         else:
             raise ValueError(f"Unknown model type: {model_type}")           
+        
+        if mode == "train":
+            self.model.train()
+        else:
+            self.model.eval()
         
     def loadWeights(self, policy_num, ema=False):
         if ema:
@@ -82,7 +87,7 @@ class RobotDiffuser():
         else:
             self.model.load_state_dict(weights)
 
-    def getSample(self, num_trajectories=1, state_cond=None, goal_cond=None, deterministic=False, cfg_w=0.0):
+    def getSample(self, num_trajectories=1, state_cond=None, goal_cond=None, deterministic=False, cfg_w=1.0):
         """
         Run reverse diffusion to generate trajectories.
         """

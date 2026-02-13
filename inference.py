@@ -150,9 +150,13 @@ def main():
     parser.add_argument("--num_samples", type=int, default=1)
     parser.add_argument("--stitch_steps", type=int, default=1)
     parser.add_argument("--save_path", type=str, default="results/inference.npy")
-    parser.add_argument("--sample_idx", type=int, default=0, help="Initial condition index")
+    parser.add_argument("--sample_idx", type=int, default=0, help="Initial condition index (Overridden if traj_idx is set)")
+    parser.add_argument("--traj_idx", type=int, default=None, help="Trajectory (file) index")
+    parser.add_argument("--batch_idx", type=int, default=0, help="Batch index within file")
+    parser.add_argument("--start_time", type=int, default=0, help="Window start timestep")
     parser.add_argument("--visualize", action="store_true")
     parser.add_argument("--device", type=str, default="cuda", help="Device for inference (cuda or cpu)")
+    parser.add_argument("--cfg_w", type=float, default=1.0, help="Classifier-free guidance weight")
     args = parser.parse_args()
 
     # 1. Load Config
@@ -189,6 +193,17 @@ def main():
         diffuser.loadWeights(int(args.epoch))
 
     # 4. Prepare Initial Condition
+    if args.traj_idx is not None:
+        target = (args.traj_idx, args.batch_idx, args.start_time)
+        try:
+            args.sample_idx = dataset.indices.index(target)
+            print(f"Mapped {target} -> Sample {args.sample_idx}")
+        except ValueError:
+            print(f"Error: Target {target} not found in dataset indices.")
+            # Optional: Find closest or just fail. 
+            # For now, let's fail to avoid confusion
+            raise ValueError(f"Target indices {target} (Trajectory {args.traj_idx}, Batch {args.batch_idx}, Start {args.start_time}) not present in valid window list.")
+
     print(f"Loading initial condition (Sample {args.sample_idx})...")
 
     _, curr_state, task_params, anchor = dataset[args.sample_idx]
@@ -213,7 +228,8 @@ def main():
             num_trajectories=args.num_samples,
             state_cond=curr_state_tens,
             goal_cond=task_tens,
-            deterministic=True
+            deterministic=True,
+            cfg_w=args.cfg_w,
         )
         
         # B. Denormalize

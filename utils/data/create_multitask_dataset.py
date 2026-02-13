@@ -187,19 +187,16 @@ def create_windows(base, joints, obj, base_vel=None, joint_vel=None, obj_vel=Non
     }
 
 
-def compute_features(windowed_data, history_size=4, save_velocities=False):
-    # Determine reference index (current state is at history_size - 1)
-    ref_idx = history_size-1
-    
+def compute_features(windowed_data, history_size=4, save_velocities=False, goal_in_curr_state=True):
     return compute_sbto_features(
         windowed_data["base"], windowed_data["joints"], windowed_data["obj"],
-        ref_idx,
+        history_size,
         base_vel=windowed_data.get("base_vel"),
         joints_vel=windowed_data.get("joint_vel"),
         obj_vel=windowed_data.get("obj_vel"),
         additional_goals=windowed_data.get("additional_goals"),
         save_velocities=save_velocities,
-        goal_in_curr_state=False,
+        goal_in_curr_state=goal_in_curr_state,
     )
 
 
@@ -232,6 +229,7 @@ def process_multi_task_dataset(
     shuffle=False,
     save_velocities=False,
     multiple_goals=False,
+    goal_in_curr_state=False,
 ):
     # Flexible file gathering logic
     files = []
@@ -248,7 +246,7 @@ def process_multi_task_dataset(
             
             for t in tasks_list:
                 # Try constructed path
-                p = os.path.join(dataset_root, t, "best_trajectory.npz")
+                p = os.path.join(dataset_root, t, "top_trajectories.npz")
                 if os.path.exists(p):
                     files.append(p)
                 else:
@@ -291,8 +289,8 @@ def process_multi_task_dataset(
             if windows is None:
                 continue
 
-            obs_hist, obs_future, guidance, current_state, base_pose_world, extra_goals, _ = compute_features(
-                windows, history_size, save_velocities
+            obs_hist, obs_future, guidance, current_state, base_pose_world, extra_goals = compute_features(
+                windows, history_size, save_velocities, goal_in_curr_state=goal_in_curr_state
             )
 
             save_chunk(temp_dir, file_idx, obs_hist, obs_future, guidance, current_state, base_pose_world, extra_goals)
@@ -309,7 +307,7 @@ def process_multi_task_dataset(
             shutil.rmtree(temp_dir)
         return
 
-    merge_chunks(temp_dir, output_path, shuffle, multiple_goals)
+    merge_chunks(temp_dir, output_path, shuffle, args.multiple_goals)
     print("Done.")
 
 
@@ -390,6 +388,7 @@ if __name__ == "__main__":
     parser.add_argument("--shuffle", action="store_true")
     parser.add_argument("--save_velocities", action="store_true", help="Save velocities in the dataset")
     parser.add_argument("--multiple_goals", action="store_true", help="Use multiple goals for SBTO features")
+    parser.add_argument("--goal_in_curr_state", action="store_true", help="Include goal in current state for SBTO features")
 
     args = parser.parse_args()
     
@@ -404,6 +403,7 @@ if __name__ == "__main__":
         shuffle=args.shuffle,
         save_velocities=args.save_velocities,
         multiple_goals=args.multiple_goals,
+        goal_in_curr_state=args.goal_in_curr_state, 
     )
 
 # python -m utils.create_multitask_dataset \

@@ -361,7 +361,7 @@ class DiscreteDiffusion(nn.Module):
         external_cond_mask: Optional[torch.Tensor] = None,
         guidance_fn: Optional[Callable] = None,
         guidance_wt: float = 1.0,
-        cfg_w: float = 0.0,
+        cfg_w: float = 1.0,
     ):
         if self.is_ddim_sampling:
             return self.ddim_sample_step(
@@ -400,38 +400,29 @@ class DiscreteDiffusion(nn.Module):
         external_cond: Optional[torch.Tensor],
         external_cond_mask: Optional[torch.Tensor] = None,
         guidance_fn: Optional[Callable] = None,
-        cfg_w: float = 0.0,
+        cfg_w: float = 1.0,
     ):
         if guidance_fn is not None:
             raise NotImplementedError("guidance_fn is not yet implmented for ddpm.")
     
         clipped_curr_noise_level = torch.clamp(curr_noise_level, min=0)
 
-        if cfg_w > 0:
-            model_mean_cond, _, model_log_variance = self.p_mean_variance(
-                x=x,
-                k=clipped_curr_noise_level,
-                external_cond=external_cond,
-                external_cond_mask=external_cond_mask,
-            )
-            cond_mask = torch.zeros_like(external_cond)
-            cond_mask[..., -3:] = 1.0
-            model_mean_uncond, _, _ = self.p_mean_variance(
-                x=x,
-                k=clipped_curr_noise_level,
-                external_cond=external_cond,
-                external_cond_mask=cond_mask,
-            )
-            model_mean = model_mean_uncond + (1 + cfg_w) * (
-                model_mean_cond - model_mean_uncond
-            )
-        else:
-            model_mean, _, model_log_variance = self.p_mean_variance(
-                x=x,
-                k=clipped_curr_noise_level,
-                external_cond=external_cond,
-                external_cond_mask=external_cond_mask,
-            )
+        model_mean_cond, _, model_log_variance = self.p_mean_variance(
+            x=x,
+            k=clipped_curr_noise_level,
+            external_cond=external_cond,
+            external_cond_mask=None,
+        )
+        
+        model_mean_uncond, _, _ = self.p_mean_variance(
+            x=x,
+            k=clipped_curr_noise_level,
+            external_cond=external_cond,
+            external_cond_mask=external_cond_mask, 
+        )
+        model_mean = model_mean_uncond + cfg_w * (
+            model_mean_cond - model_mean_uncond
+        )
 
         noise = torch.where(
             self.add_shape_channels(clipped_curr_noise_level > 0),
@@ -453,7 +444,7 @@ class DiscreteDiffusion(nn.Module):
         external_cond_mask: Optional[torch.Tensor] = None,
         guidance_fn: Optional[Callable] = None,
         guidance_wt: float = 1.0,
-        cfg_w: float = 0.0,
+        cfg_w: float = 1.0,
     ):
         clipped_curr_noise_level = torch.clamp(curr_noise_level, min=0)
 
@@ -484,7 +475,7 @@ class DiscreteDiffusion(nn.Module):
                     x=x,
                     k=clipped_curr_noise_level,
                     external_cond=external_cond,
-                    external_cond_mask=external_cond_mask,
+                    external_cond_mask=None,
                 )
 
                 guidance_loss = guidance_fn(
@@ -507,34 +498,26 @@ class DiscreteDiffusion(nn.Module):
                 )
 
         else:
-            if cfg_w > 0:
-                model_pred_cond = self.model_predictions(
-                    x=x,
-                    k=clipped_curr_noise_level,
-                    external_cond=external_cond,
-                    external_cond_mask=external_cond_mask,
-                )
-                model_pred_uncond = self.model_predictions(
-                    x=x,
-                    k=clipped_curr_noise_level,
-                    external_cond=None,
-                    external_cond_mask=None,
-                )
-                x_start = model_pred_cond.pred_x_start + cfg_w * (
-                    model_pred_cond.pred_x_start - model_pred_uncond.pred_x_start
-                )
-                pred_noise = model_pred_cond.pred_noise + cfg_w * (
-                    model_pred_cond.pred_noise - model_pred_uncond.pred_noise
-                )
-            else:
-                model_pred = self.model_predictions(
-                    x=x,
-                    k=clipped_curr_noise_level,
-                    external_cond=external_cond,
-                    external_cond_mask=external_cond_mask,
-                )
-                x_start = model_pred.pred_x_start
-                pred_noise = model_pred.pred_noise
+            model_pred_cond = self.model_predictions(
+                x=x,
+                k=clipped_curr_noise_level,
+                external_cond=external_cond,
+                external_cond_mask=None,
+            )
+
+            masked_external_cond = external_cond_mask * external_cond if external_cond is not None else None
+            model_pred_uncond = self.model_predictions(
+                x=x,
+                k=clipped_curr_noise_level,
+                external_cond=masked_external_cond,
+                external_cond_mask=None,
+            )
+            x_start = model_pred_uncond.pred_x_start + cfg_w * (
+                model_pred_cond.pred_x_start - model_pred_uncond.pred_x_start
+            )
+            pred_noise = model_pred_uncond.pred_noise + cfg_w * (
+                model_pred_cond.pred_noise - model_pred_uncond.pred_noise
+            )
 
         noise = torch.randn_like(x)
         noise = torch.clamp(noise, -self.clip_noise, self.clip_noise)

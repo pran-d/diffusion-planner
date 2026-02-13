@@ -9,13 +9,16 @@ from datasets.flexible_dataset import FlexibleWindowDataset
 
 class BufferDataset(FlexibleWindowDataset):
     """
-    Dataset that loads trajectories from an in-memory buffer (dictionary of batched arrays).
+    Dataset that loads trajectories from an in-memory buffer.
+    Buffer can be:
+    1. A dictionary of batched arrays {key: (B, T, ...)}
+    2. A list of dictionaries [{key: (T, ...)}, ...]
     """
     def __init__(self, 
-        data_buffer, # {key: (B, T, ...)}
+        data_buffer, 
         config, 
         feature_order=None, 
-        norm_path=None, # Optional path to SAVE stats, or just use in memory
+        norm_path=None, 
         calculate_stats=True, 
         noise_cfg=None, 
         add_noise=False,
@@ -42,7 +45,23 @@ class BufferDataset(FlexibleWindowDataset):
             "joints", "body_z", "body_rot6d",
             "obj_rel_pos", "obj_rel_rot6d"
         ]
+
+        # Standardize data_buffer to dict of iterables (batched arrays or lists)
+        if isinstance(self.data_buffer, list):
+            if len(self.data_buffer) > 0:
+                keys = self.data_buffer[0].keys()
+                # Transpose list of dicts to dict of lists
+                new_buffer = {k: [item.get(k) for item in self.data_buffer] for k in keys}
+                self.data_buffer = new_buffer
+            else:
+                self.data_buffer = {}
         
+        # Ensure we have a valid dictionary in the end
+        if not isinstance(self.data_buffer, dict):
+            raise ValueError("BufferDataset expects a list of dicts or a dict of batches.")
+
+        self.file_paths = []
+             
         # Index
         self.indices = []
         self._index_dataset()
@@ -52,193 +71,122 @@ class BufferDataset(FlexibleWindowDataset):
         self.stats = {}
         if calculate_stats:
             self._calculate_stats()
-            
-    def _index_dataset(self):
-        print("Indexing buffer dataset...")
-        
-        # Handle List Input by batching it immediately (User requested simplification)
-        if isinstance(self.data_buffer, list):
-            print(f"Batching {len(self.data_buffer)} trajectories from list...")
-            batched = {}
-            if len(self.data_buffer) > 0:
-                keys = self.data_buffer[0].keys()
-                for k in keys:
-                    try:
-                        # Stack to (B, T, ...)
-                        batched[k] = np.stack([item[k] for item in self.data_buffer], axis=0)
-                    except ValueError as e:
-                        print(f"Warning: Could not stack key {k}: {e}")
-            self.data_buffer = batched
-            
-        data = self.data_buffer
-        B, T = 1, 0
-        
-        if 'body_pos_w' in data:
-            arr = data['body_pos_w']
-            if arr.ndim == 4: # (B, T, K, 3)
-                B, T = arr.shape[0], arr.shape[1]
-            else:
-                 # If passed non-batched (T, ...), assume 1 batch
-                 T = arr.shape[0]
-                 B = 1
-        elif 'base_xyz_quat' in data:
-             arr = data['base_xyz_quat']
-             if arr.ndim == 3: # (B, T, D)
-                 B, T = arr.shape[0], arr.shape[1]
-             else:
-                 T = arr.shape[0]
-                 B = 1
-        else:
-            raise ValueError("Data buffer missing recognized keys (body_pos_w or base_xyz_quat)")
-            
-        T_down = T // self.downsample
-        min_start = self.start_timestep // self.downsample
-        w_size = self.window_size + self.history_size
-        max_start = max(min_start, T_down - w_size)
-        
-        if max_start >= min_start:
-             starts = np.arange(min_start, max_start + 1, self.stride)
-             for b in range(B):
-                 for s in starts:
-                     # (dummy_file_idx=0, batch_idx=b, t_start=s)
-                     self.indices.append((0, b, s))
-                     
-        print(f"Indexed {len(self.indices)} windows from buffer.")
+        elif norm_path and os.path.exists(norm_path):
+            self._load_stats()
 
-    def _load_raw_trajectory(self, dummy_fpath, batch_idx):
+    def _index_dataset(self):
+        self.indices = []
+        
+        keys = list(self.data_buffer.keys())
+        if not keys: return
+        
+        # Find a representative key to determine batch size / lengths
+        # Prefer known temporal keys to be safe
+        rep_key = keys[0]
+        for k in ['body_pos_w', 'base_xyz_quat', 'joint_pos', 'actuator_pos']:
+            if k in self.data_buffer:
+                rep_key = k
+                break
+        
+        data_coll = self.data_buffer[rep_key]
+        num_trajs = len(data_coll)
+
+        trajs = []
+        for i in range(num_trajs):
+            traj_data = data_coll[i]
+            # Handle both numpy/torch tensors (shape[0]) and lists (len)
+            T = traj_data.shape[0] if hasattr(traj_data, 'shape') else len(traj_data)
+            trajs.append((i, T))
+                
+        # 2. Build Sliding Windows
+        # Windows are defined in downsampled steps
+        req_len_down = self.history_size + self.window_size
+        
+        for batch_idx, raw_T in trajs:
+            down_T = raw_T // self.downsample
+            
+            if down_T < req_len_down:
+                continue
+            
+            # Valid start indices (in downsampled space)
+            last_start = down_T - req_len_down
+            
+            for t in range(0, last_start + 1, self.stride):
+                # (file_idx=0 is dummy, batch_idx, t_start=t)
+                self.indices.append((0, batch_idx, t))
+            
+    def _get_single_traj(self, file_idx, batch_idx):
         """
-        Load trajectory from buffer at batch_idx.
-        Ignores dummy_fpath.
+        Get processed (T, D) dict from buffer.
         """
         raw = {}
-        data = self.data_buffer
         
-        if 'body_pos_w' in data:
-            # Check if batched (4D)
-            is_batched = data['body_pos_w'].ndim == 4
+        # Helper to extract and downsample
+        def extract_k(key):
+            if key not in self.data_buffer: return None
+            # Retrieve trajectory
+            val = self.data_buffer[key][batch_idx]
+            # Downsample along time dimension
+            return val[::self.downsample]
+        
+        # Check standard keys
+        keys = self.data_buffer.keys()
+        
+        # Case 1: Standard 'body_pos_w' format
+        if 'body_pos_w' in keys:
+            body_pos = extract_k('body_pos_w')     # (T, 3) or (T, 1, 3)
+            body_quat = extract_k('body_quat_w')
             
-            def extract(key):
-                arr = data[key]
-                if is_batched:
-                    arr = arr[batch_idx]
-                return arr[::self.downsample]
-                
-            body_pos = extract('body_pos_w')
-            body_quat = extract('body_quat_w')
-            raw['base'] = np.concatenate([body_pos[:, 0, :], body_quat[:, 0, :]], axis=-1)
-            
-            raw['joints'] = extract('joint_pos')
-            
-            obj_pos = extract('object_pos_w')
-            obj_quat = extract('object_quat_w')
-            raw['obj'] = np.concatenate([obj_pos, obj_quat], axis=-1)
-            
-        elif 'base_xyz_quat' in data:
-             is_batched = data['base_xyz_quat'].ndim == 3
-             def extract(key):
-                arr = data[key]
-                if is_batched:
-                    arr = arr[batch_idx]
-                return arr[::self.downsample]
+            if body_pos is not None and body_pos.ndim == 3:
+                # If shape is (T, 1, 3), squeeze.
+                if body_pos.shape[1] == 1:
+                    body_pos = body_pos[:, 0, :]
+                else:
+                    # Likely (T, NumBodies, 3).Let's take index 0 for base.
+                    body_pos = body_pos[:, 0, :]
 
-             raw['base'] = extract('base_xyz_quat')
-             raw['joints'] = extract('actuator_pos')
-             raw['obj'] = extract('obj_0_xyz_quat')
-             
-        # Add task params if present in buffer
-        if 'task_params' in data:
-             tp = data['task_params']
-             if tp.ndim == 2: # (B, D)
-                 raw['task_params'] = tp[batch_idx]
-             else:
-                 raw['task_params'] = tp
+            if body_quat is not None and body_quat.ndim == 3:
+                if body_quat.shape[1] == 1:
+                     body_quat = body_quat[:, 0, :]
+                else:
+                     body_quat = body_quat[:, 0, :]
+                
+            raw['base'] = np.concatenate([body_pos, body_quat], axis=-1)
+            raw['joints'] = extract_k('joint_pos')
+            
+            op = extract_k('object_pos_w')
+            oq = extract_k('object_quat_w')
+            raw['obj'] = np.concatenate([op, oq], axis=-1)
+            
+        # Case 2: 'base_xyz_quat' format (e.g. from simpler loggers)
+        elif 'base_xyz_quat' in keys:
+             raw['base'] = extract_k('base_xyz_quat')
+             raw['joints'] = extract_k('actuator_pos')
+             if 'obj_0_xyz_quat' in keys:
+                 raw['obj'] = extract_k('obj_0_xyz_quat')
+                 
+        # Optional Task Params (can be passed in buffer)
+        if 'task_params' in keys:
+             # Typically (Batch, D) - no time dim, so no downsample needed
+             # or (Batch, Time, D) - if time-varying
+             tp = self.data_buffer['task_params'][batch_idx]
+             raw['task_params'] = tp
                  
         return raw
 
+
     def _compute_transform(self, raw_data, t_start, task_params=None):
         """
-        Override to allow injecting external task parameters (e.g. goal condition).
+        Override to inject task params from buffer if they exist
         """
         feats, anchor = super()._compute_transform(raw_data, t_start)
         
         if task_params is not None:
              feats['task_params'] = task_params
              anchor['task_params'] = task_params
+        elif 'task_params' in raw_data:
+             tp = raw_data['task_params']
+             feats['task_params'] = tp
+             anchor['task_params'] = tp
              
         return feats, anchor
-
-    def __getitem__(self, idx):
-        # Override to ignore file path lookups
-        _, batch_idx, t_start = self.indices[idx]
-        
-        # No fpath needed
-        raw_traj = self._load_raw_trajectory(None, batch_idx)
-        features, anchor = self._compute_transform(raw_traj, t_start)
-        
-        window_parts = []
-        for key in self.feature_order:
-            if key in features:                
-                part = torch.from_numpy(features[key]).float() 
-                if self.add_noise:
-                    history_slice = part[:self.history_size] 
-                    part[:self.history_size] = self._add_obs_noise(history_slice, key)
-                part = self._normalize(key, part)
-                window_parts.append(part)
-            else:
-                raise ValueError(f"Feature {key} needed but not computed.")
-                
-        window_tensor = torch.cat(window_parts, dim=-1)
-        
-        current_state = window_tensor[:self.history_size, (self.num_features-self.num_observations):].clone()
-        future_states = window_tensor[self.history_size:, :].clone()
-
-        task_params = torch.from_numpy(features["task_params"]).float()
-        if self.add_goal_noise:
-            task_params = self._add_obs_noise(task_params, "task_params")
-        task_params = self._normalize("task_params", task_params)
-
-        return future_states, current_state, task_params, anchor
-
-    def _calculate_stats(self):
-        print("Calculating normalization stats from buffer (min/max)...")
-        mins = {}
-        maxs = {}
-        
-        # Iterate all indices
-        for idx in tqdm(range(len(self.indices))):
-            _, batch_idx, t_start = self.indices[idx]
-            raw_traj = self._load_raw_trajectory(None, batch_idx)
-            feats, _ = self._compute_transform(raw_traj, t_start)
-            
-            for k, v in feats.items():
-                v = v.astype(np.float64)
-                v_min = np.min(v, axis=0)
-                v_max = np.max(v, axis=0)
-                
-                if k not in mins:
-                    mins[k] = v_min
-                    maxs[k] = v_max
-                else:
-                    mins[k] = np.minimum(mins[k], v_min)
-                    maxs[k] = np.maximum(maxs[k], v_max)
-        
-        self.stats = {}
-        for k in mins:
-            self.stats[f"min_{k}"] = torch.as_tensor(mins[k]).float()
-            self.stats[f"max_{k}"] = torch.as_tensor(maxs[k]).float()
-            
-        # Also compute global stats for denormalize_global
-        self._compute_global_stats()
-        
-    def _compute_global_stats(self):
-        mins = []
-        maxs = []
-        for key in self.feature_order:
-             mk, MK = f"min_{key}", f"max_{key}"
-             if mk in self.stats and MK in self.stats:
-                 mins.append(self.stats[mk])
-                 maxs.append(self.stats[MK])
-        
-        if mins:
-            self.global_min = torch.cat(mins, dim=-1)
-            self.global_max = torch.cat(maxs, dim=-1)

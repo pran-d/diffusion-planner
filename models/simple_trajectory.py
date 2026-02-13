@@ -264,7 +264,7 @@ class SimpleTrajectoryDiffuser(nn.Module):
             "xs": x
         }
 
-    def sample(self, num_trajectories, model_cond=None, mask_goal=False, cfg_w=0.0, scheduler=None):
+    def sample(self, num_trajectories, model_cond=None, mask_goal=False, cfg_w=1.0, scheduler=None):
         """
         Inference Sampling (DDPM/DDIM).
         Returns: (B, T, C)
@@ -288,7 +288,7 @@ class SimpleTrajectoryDiffuser(nn.Module):
         latents = torch.randn(shape, device=device)
         
         # 4. CFG Condition Prep
-        if cfg_w > 0.0:
+        if cfg_w != 1.0:
             # We will perform guidance during the loop
             pass # Logic is inside loop
             
@@ -309,7 +309,7 @@ class SimpleTrajectoryDiffuser(nn.Module):
                  t_input = t_batch
                  
              # CFG Logic
-             if cfg_w > 0.0:
+             if cfg_w != 1.0:
                  # Standard CFG: eps = eps_uncond + w * (eps_cond - eps_uncond)
                  # eps_mod = eps_uncond + (1+w)(eps_cond - eps_uncond) if we reformulate?
                  # Standard: pred = uncond + w * (cond - uncond).

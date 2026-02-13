@@ -19,9 +19,9 @@ from .math_tools import (
 # ============================================================
 
 FEATURE_LAYOUT_WITH_VEL = {
-    "joints": 29,
     "delta_xy": 2,
     "delta_yaw": 1,
+    "joints": 29,
     "body_z": 1,
     "body_rot6d": 6,
     "obj_rel_pos": 3,
@@ -34,9 +34,10 @@ FEATURE_LAYOUT_WITH_VEL = {
 }
 
 FEATURE_LAYOUT_NO_VEL = {
-    "joints": 29,
     "delta_xy": 2,
     "delta_yaw": 1,
+    "joints": 29,
+    "joints_vel": 29,
     "body_z": 1,
     "body_rot6d": 6,
     "obj_rel_pos": 3,
@@ -117,14 +118,17 @@ def compute_sbto_components(
     """
     B, T, _ = base.shape
 
+    # --------------------------------------------------------
     # Reference frame (current step)
+    # --------------------------------------------------------
     ref_pos = base[:, [ref_idx], :3]
     ref_quat = base[:, [ref_idx], 3:]
-    
     ref_yaw = yaw_from_quat(ref_quat)
     R_ref_inv = yaw_to_rot_matrix(-ref_yaw)
 
+    # --------------------------------------------------------
     # Robot pose deltas
+    # --------------------------------------------------------
     delta_pos_world = base[..., :3] - ref_pos
     delta_pos_local = batch_rotation(R_ref_inv, delta_pos_world)
 
@@ -156,7 +160,7 @@ def compute_sbto_components(
         base[..., :3], base[..., 3:],
         obj[..., :3], obj[..., 3:]
     )
-    obj_rel_rot6d = rot_to_6d(obj_rel_rot) # (B, T, 6)
+    obj_rel_rot6d = rot_to_6d(obj_rel_rot)
 
     comps = {
         "joints": joints,
@@ -211,12 +215,10 @@ def compute_sbto_features(
         base_pose_world : (B, T, 7)
     """
 
-    B, T, _ = base.shape
-
     # 1. Compute components
     comps, anchors = compute_sbto_components(
-        base, joints, obj, ref_idx, 
-        base_vel, joints_vel, obj_vel, 
+        base, joints, obj, ref_idx,
+        base_vel, joints_vel, obj_vel,
         save_velocities
     )
     
@@ -295,9 +297,9 @@ def compute_sbto_features(
     # --------------------------------------------------------
     if save_velocities:
         features = np.concatenate([
-            joints,
             delta_xy,
             delta_yaw,
+            joints,
             body_z,
             body_rot6d,
             obj_rel_pos,
@@ -310,9 +312,9 @@ def compute_sbto_features(
         ], axis=-1)
     else:
         features = np.concatenate([
-            joints,
             delta_xy,
             delta_yaw,
+            joints,
             body_z,
             body_rot6d,
             obj_rel_pos,
@@ -522,17 +524,9 @@ def extract_current_object_world_pose(current_state, base_pose_world):
     
     # Indices (authoritative)
     idx = 0
-    if D > 60: # Has velocities (86 dims)
-        idx += 29      # joint_pos
-        idx += 29      # joint_vel
-        idx += 1       # body_z
-        idx += 6       # body_rot6d
-        idx += 3       # body_lin_vel
-        idx += 3       # body_ang_vel
-    else: # Legacy / No velocities (48 dims)
-        idx += 29      # joint_pos
-        idx += 1       # body_z
-        idx += 6       # body_rot6d
+    idx += 29      # joint_pos
+    idx += 1       # body_z
+    idx += 6       # body_rot6d
 
     obj_rel_pos = current_state[..., idx:idx+3]; idx += 3
     obj_rel_rot6d = current_state[..., idx:idx+6]

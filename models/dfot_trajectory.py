@@ -16,6 +16,31 @@ from utils.configcls import Config
 # =========================
 # Conditioning Embeddings
 # =========================
+def apply_condition_dropout(
+    cond,
+    dropout_prob: float,
+):
+    """
+    Apply per-sample dropout for classifier-free guidance.
+
+    Args:
+        cond: torch.Tensor or None, shape (B, ...)
+        dropout_prob: Probability of dropping condition
+
+    Returns:
+        dropped_cond or (dropped_cond, keep_mask)
+    """
+    if cond is None or dropout_prob <= 0.0:
+        return cond
+
+    if not torch.is_tensor(cond):
+        cond = torch.as_tensor(cond)
+
+    if torch.rand(1).item() < dropout_prob:
+        return torch.zeros_like(cond)
+    
+    return cond
+
 class MLP(nn.Module):
     def __init__(self, in_dim, out_dim):
         super().__init__()
@@ -49,21 +74,22 @@ class HistoryAttention(nn.Module):
         
 
 class DFoTTrajectory(nn.Module):
-    def __init__(self, model_config, data_config, noise_scheduler_config=None, noise_scheduler=None):
+    def __init__(self, model_config, data_config, noise_scheduler_config=None, training_config=None, noise_scheduler=None):
         super().__init__()
         self.model_config = model_config
         self.data_config = data_config
         self.noise_scheduler_config = noise_scheduler_config 
+        self.training_config = training_config
         self.noise_scheduler = noise_scheduler
         
         self.x_shape = torch.Size([data_config['num_features']])
         self.state_condition = model_config.get("state_condition", False)
         self.task_condition = model_config.get("task_condition", False)
         
-        state_dim = model_config['hidden_size'] if self.state_condition else 0
-        task_dim = model_config.get("hidden_size", 64) if self.task_condition else 0
+        self.state_dim = model_config['hidden_size'] if self.state_condition else 0
+        self.task_dim = model_config.get("hidden_size", 64) if self.task_condition else 0
 
-        self.external_cond_dim = state_dim + task_dim
+        self.external_cond_dim = self.state_dim + self.task_dim
             
         if self.state_condition:
             self.state_embedding = MLP(
@@ -254,13 +280,20 @@ class DFoTTrajectory(nn.Module):
         if self.state_condition and state_cond is not None:
             s_cond = self.state_embedding(state_cond) 
             if s_cond.ndim == 2:
-                # (B, 1, D)
                 s_cond = s_cond.unsqueeze(1)
+            s_cond = apply_condition_dropout(
+                s_cond, 
+                self.training_config.get("condition_dropout_prob", {}).get("state", 0.0),
+            )
             cond_list.append(s_cond)
         if self.task_condition and task_cond is not None:
             t_cond = self.task_embedding(task_cond)
             if t_cond.ndim == 2:
                 t_cond = t_cond.unsqueeze(1)
+            t_cond = apply_condition_dropout(
+                t_cond, 
+                self.training_config.get("condition_dropout_prob", {}).get("task", 0.0),
+            )
             cond_list.append(t_cond)
 
         ext_cond = None
@@ -276,7 +309,6 @@ class DFoTTrajectory(nn.Module):
 
             # Concatenate along feature dimension
             ext_cond = torch.cat(cond_list_broadcast, dim=-1)
-
 
         # Generate noise levels if not provided
         if timesteps is None:
@@ -424,7 +456,7 @@ class DFoTTrajectory(nn.Module):
         history_guidance: Optional[HistoryGuidance] = None,
         return_all: bool = False,
         pbar: Optional[tqdm] = None,
-        cfg_w: float = 0.0,
+        cfg_w: float = 1.0,
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
         
         x_shape = self.x_shape
@@ -492,11 +524,15 @@ class DFoTTrajectory(nn.Module):
             if return_all:
                 record.append(xs_pred.clone())
 
-            conditions_mask = None
+            external_conditions_mask = torch.zeros(
+                (batch_size, 1, self.external_cond_dim), dtype=torch.bool, device=xs_pred.device
+            )
+            external_conditions_mask[..., self.task_dim:] = 1.0 
+            
             with history_guidance(context_mask) as history_guidance_manager:
                 nfe = history_guidance_manager.nfe
                 pbar.set_postfix(NFE=nfe)
-                xs_pred, from_noise_levels, to_noise_levels, conditions_mask = (
+                xs_pred, from_noise_levels, to_noise_levels, _ = (
                     history_guidance_manager.prepare(
                         xs_pred,
                         from_noise_levels,
@@ -520,7 +556,7 @@ class DFoTTrajectory(nn.Module):
                         if conditions is not None
                         else None
                     ),
-                    conditions_mask,
+                    external_conditions_mask,
                     guidance_fn=guidance_fn,
                     guidance_wt=guidance_wt,
                     cfg_w=cfg_w,

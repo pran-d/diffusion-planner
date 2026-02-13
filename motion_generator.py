@@ -75,25 +75,12 @@ class MotionGenerator:
                 noise_cfg={}
             )
 
-    def load_weights(self, path_or_epoch: Union[str, int]):
-        """Load weights from path or epoch number."""
-        if isinstance(path_or_epoch, int):
-            self.diffuser.loadWeights(path_or_epoch)
-        else:
-            if os.path.exists(path_or_epoch):
-                self.diffuser.load_weights_from_file(path_or_epoch)
-            else:
-                # Try as epoch number
-                try:
-                    self.diffuser.loadWeights(int(path_or_epoch))
-                except:
-                    raise ValueError(f"Could not load weights from {path_or_epoch}")
-
     def fit(self, 
             data_source: Union[str, List[Dict]], 
             task_params: Optional[List[Dict]] = None,
             epochs: int = None, 
-            save_path: str = None):
+            save_path: str = None,
+            checkpoint: Optional[str] = None):
         """
         Train the model.
         
@@ -102,6 +89,7 @@ class MotionGenerator:
             task_params: Optional list of task parameters (e.g. goals) aligned with data_source.
             epochs: Number of epochs to train. Overrides config if provided.
             save_path: Path to save model checkpoints. Overrides config if provided.
+            checkpoint: Optional path to a checkpoint to resume from.
         """
         
         if epochs is None:
@@ -112,12 +100,6 @@ class MotionGenerator:
 
         if isinstance(data_source, str):
             raise ValueError("MotionGenerator.fit no longer supports file paths. Please load data into a buffer first.")
-        
-        # Assume data_source is the batched buffer (dict)
-        # If task_params passed separately, verify it matches
-        if task_params is not None:
-            if isinstance(data_source, dict):
-                data_source['task_params'] = np.array(task_params)  
         
         self.dataset = BufferDataset(
             data_buffer=data_source,
@@ -147,6 +129,20 @@ class MotionGenerator:
             optimizer, T_max=epochs, eta_min=1e-6
         )
         scaler = GradScaler()
+
+        if checkpoint:
+            if os.path.exists(checkpoint):
+                print(f"Loading diffusion weights from {checkpoint}...")
+                ckpt = torch.load(checkpoint, map_location=self.device)
+                self.diffuser.model.load_state_dict(ckpt["model"])
+                if "optimizer" in ckpt:
+                    optimizer.load_state_dict(ckpt["optimizer"])
+                if "scheduler" in ckpt:
+                    scheduler.load_state_dict(ckpt["scheduler"])
+                if "scaler" in ckpt:
+                    scaler.load_state_dict(ckpt["scaler"])
+            else:
+                print(f"Checkpoint {checkpoint} not found. Starting from scratch.")
         
         self.diffuser.model.train()
         
@@ -232,7 +228,7 @@ class MotionGenerator:
             print(f"Epoch {epoch+1} Mean Loss: {mean_loss:.5f}")
             
             # Save Checkpoint
-            if (epoch + 1) % self.training_cfg.get("save_every", 50) == 0:
+            if (epoch + 1) % self.training_cfg.get("save_every", 50) == 0 or epoch == epochs - 1:
                 if save_path:
                     # Check if save_path serves as a directory or a specific file prefix
                     is_dir_like = not (save_path.endswith('.pt') or save_path.endswith('.pth'))
@@ -271,7 +267,7 @@ class MotionGenerator:
         if k <= 1:
             return trajectory
 
-        print(f"Interpolating trajectory with downsample factor {k}...")
+        # print(f"Interpolating trajectory with downsample factor {k}...")
         B, T, D = trajectory.shape
         # Original knots at 0, k, 2k, ...
         # If we have T knots, the duration is roughly (T-1)*k. 

@@ -16,31 +16,6 @@ from datasets import FlexibleWindowDataset, ConditionalStateDataset
 from models.model import RobotDiffuser
 from config.configure import load_config, get_data_path, get_save_path, get_log_path, get_norm_path
 
-def apply_condition_dropout(
-    cond,
-    dropout_prob: float,
-):
-    """
-    Apply per-sample dropout for classifier-free guidance.
-
-    Args:
-        cond: torch.Tensor or None, shape (B, ...)
-        dropout_prob: Probability of dropping condition
-
-    Returns:
-        dropped_cond or (dropped_cond, keep_mask)
-    """
-    if cond is None or dropout_prob <= 0.0:
-        return cond
-
-    if not torch.is_tensor(cond):
-        cond = torch.as_tensor(cond)
-
-    if torch.rand(1).item() < dropout_prob:
-        return torch.zeros_like(cond)
-    
-    return cond
-
 # ===============================
 # Setup
 # ===============================
@@ -167,7 +142,6 @@ writer = SummaryWriter(log_dir=log_dir)
 diffuser.model.train()
 
 num_epochs = training_cfg["num_epochs"] + 1
-dropout_probs = training_cfg.get("condition_dropout_prob", {})
 
 for epoch in range(starting_epoch, num_epochs):
     epoch_losses = []
@@ -203,20 +177,10 @@ for epoch in range(starting_epoch, num_epochs):
         idx = 1
         if state_condition:
             state_cond = batch_data[idx].to(device)
-
-            state_cond = apply_condition_dropout(
-                state_cond, 
-                dropout_probs.get("state", 0.0),
-            )
             idx += 1
         
         if task_condition:
             task_cond = batch_data[idx].to(device)
-            
-            task_cond = apply_condition_dropout(
-                task_cond, 
-                dropout_probs.get("task", 0.0),
-            )
             idx += 1
             
         # Construct cond for model

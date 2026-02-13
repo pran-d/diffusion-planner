@@ -1,212 +1,130 @@
 import numpy as np
 import torch
-import os
+import unittest
 import sys
-import glob
-import yaml
-from tqdm import tqdm
-from motion_generator import MotionGenerator
-from utils.visualize.visualize import MjVisualizer
+import os
 
-def load_data_to_buffer(data_root):
-    file_paths = sorted(glob.glob(os.path.join(data_root, "**/*.npz"), recursive=True))
-    if not file_paths:
-        print(f"No files found in {data_root}")
-        return {}
-    
-    buffer_lists = {}
-    print(f"Loading {len(file_paths)} files from {data_root}...")
-    
-    # We will assume uniform structure for now
-    for fpath in tqdm(file_paths):
-        try:
-            with np.load(fpath, allow_pickle=True) as data:
-                # RL Schema keys
-                rl_keys = ['body_pos_w', 'body_quat_w', 'joint_pos', 'object_pos_w', 'object_quat_w', 'task_params']
-                # SBTO Schema keys
-                sbto_keys = ['base_xyz_quat', 'actuator_pos', 'obj_0_xyz_quat']
-                
-                keys_found = [k for k in rl_keys if k in data]
-                if not keys_found:
-                    keys_found = [k for k in sbto_keys if k in data]
-                
-                if not keys_found:
-                    continue
-                    
-                # Determining if batched
-                is_batched = False
-                if 'body_pos_w' in data:
-                    if data['body_pos_w'].ndim == 4: is_batched = True
-                elif 'base_xyz_quat' in data:
-                    if data['base_xyz_quat'].ndim == 3: is_batched = True
-                
-                for k in keys_found:
-                    arr = data[k]
-                    if not is_batched:
-                        arr = arr[None, ...] # Add batch dim
-                    
-                    if k not in buffer_lists:
-                        buffer_lists[k] = []
-                    buffer_lists[k].append(arr)
-                    
-        except Exception as e:
-            print(f"Error loading {fpath}: {e}")
+# Ensure we can import from local
+sys.path.append(os.getcwd())
 
-    final_buffer = {}
-    for k, v in buffer_lists.items():
-        try:
-            final_buffer[k] = np.concatenate(v, axis=0) # Concat along batch dim
-        except Exception as e:
-            print(f"Error concatenating key {k}: {e}")
-            
-    print("Buffer loaded. Shapes:")
-    for k in final_buffer:
-        print(f"  {k}: {final_buffer[k].shape}")
+from datasets.buffer_dataset import BufferDataset
+
+class TestBufferDataset(unittest.TestCase):
+    def setUp(self):
+        # Create Dummy Data
+        self.B = 2
+        self.T = 100
+        self.D_base = 7 # Pos(3) + Quat(4)
+        self.D_joint = 7
+        self.D_obj = 7 
         
-    return final_buffer
-
-def test_real_pipeline():
-    print("========================================")
-    print("Testing Real Data Pipeline")
-    print("========================================")
-
-    config_path = "config/config.yaml"
-    
-    # Force CPU to avoid OOM
-    device = "cuda"
-    print(f"Using device: {device}")
-
-    # Initialize
-    generator = MotionGenerator(config_path=config_path, device=device)
-
-    # Load weights from config if resume_checkpoint is present
-    with open(config_path, 'r') as f:
-        raw_cfg = yaml.safe_load(f)
-    if raw_cfg["resume"] and 'resume_checkpoint' in raw_cfg and raw_cfg['resume_checkpoint'] is not None:
-        ckpt = raw_cfg['resume_checkpoint']
-        print(f"Loading weights from config checkpoint: {ckpt}")
-        generator.load_weights(ckpt)
-    
-    # Modify data config to limit load if possible? 
-    # The dataset loader loads everything in the path.
-    # Hopefully it's not too big.
-    
-    print("Calling fit()...")
-    # Save to temp dir
-    results_dir = "results/test_real"
-    os.makedirs(results_dir, exist_ok=True)
-    
-    # Construct data path from config
-    data_cfg = generator.data_cfg
-    full_path = os.path.join(data_cfg['dir_path'], data_cfg['train_path'])
-    print(f"Data path: {full_path}")
-
-    # Load data into buffer
-    data_buffer = load_data_to_buffer(full_path)
-    if not data_buffer:
-        print("Data load failed.")
-        return
-
-    generator.fit(data_source=data_buffer, epochs=300, save_path=results_dir)
-    print("Fit completed.")
-    
-    # Test Generation
-    print("Testing Generation...")
-    
-    # Grab a sample from the loaded dataset to use as initial condition
-    if not generator.dataset or not generator.dataset.data_buffer:
-        print("Error: Dataset empty after fit.")
-        return
-
-    sample_idx = 0
-    sample_data = {}
-    for k,v in generator.dataset.data_buffer.items():
-        sample_data[k] = v[sample_idx] # Extract single sample
-    
-    # We need history. 
-    # history_size is in config, usually 1?
-    H = generator.data_cfg.get('state_history', 1)
-    
-    # Extract raw data.
-    
-    body_pos = sample_data['body_pos_w'] # (T, 1, 3) probably
-    body_quat = sample_data['body_quat_w'] # (T, 1, 4)
-    obj_pos = sample_data['object_pos_w']
-    obj_quat = sample_data['object_quat_w']
-    
-    # Flatten/Concatenate to match what 'inference' expects
-    # Inference expects dictionary:
-    # 'robot': (H, 36) -> 7 (base) + 29 (joints)
-    # 'obj': (H, 7)
-    
-    # We need joints too
-    joint_pos = sample_data['joint_pos']
-    
-    # Slice first H
-    def get_slice(arr):
-        return arr[:H]
-
-    # Robot: base (7) + joints (29) = 36
-    # base = pos(3) + quat(4)
-    # raw data body_pos is (T, K, 3). K=1 usually.
-    b_pos = body_pos[:H, 0, :]
-    b_quat = body_quat[:H, 0, :]
-    j_pos = joint_pos[:H]
-    
-    robot_hist = np.concatenate([b_pos, b_quat, j_pos], axis=-1) # (H, 36)
-    
-    o_pos = obj_pos[:H]
-    o_quat = obj_quat[:H]
-    obj_hist = np.concatenate([o_pos, o_quat], axis=-1) # (H, 7)
-    
-    init_cond = {
-        'robot': robot_hist,
-        'obj': obj_hist
-    }
-    
-    # Goal condition
-    # For now, let's take the LAST frame object pose as goal
-    goal_pos = obj_pos[-1]
-    goal_quat = obj_quat[-1]
-    goal_cond = np.concatenate([goal_pos, goal_quat], axis=-1)
-    
-    print("Generating trajectory...")
-    traj = generator.generate_trajectory(
-        initial_condition=init_cond,
-        goal_condition=goal_cond,
-        num_samples=1
-    )
-    
-    print(f"Generated trajectory shape: {traj.shape}")
-    print("Test passed successfully.")
-
-    # Visualization
-    print("Visualizing trajectory... (Press ENTER to close window, SPACE to pause)")
-    try:
-        xml_path = "mj_model.xml"
-        if not os.path.exists(xml_path):
-             print(f"Warning: {xml_path} not found. Skipping visualization.")
-             return
-
-        vis = MjVisualizer(xml_path)
+        # Create valid quaternions
+        quats = np.zeros((self.B, self.T, 4))
+        quats[:, :, 3] = 1.0 # w=1
         
-        # traj is (1, T, 43). Take first sample.
-        traj_sample = traj[0] # (T, 43)
+        # Batched Dictionary
+        # Note: FlexibleDataset usually expects (T, 3) for body_pos in raw, or (T, 1, 3)
+        # BufferDataset handles (T, 1, 3) -> (T, 3) standard.
+        self.dict_buffer = {
+            'body_pos_w': np.random.randn(self.B, self.T, 1, 3).astype(np.float32), 
+            'body_quat_w': np.random.randn(self.B, self.T, 1, 4).astype(np.float32), # w last
+            'joint_pos': np.random.randn(self.B, self.T, self.D_joint).astype(np.float32),
+            'object_pos_w': np.random.randn(self.B, self.T, 3).astype(np.float32),
+            'object_quat_w': quats.astype(np.float32),
+            'task_params': np.random.randn(self.B, 5).astype(np.float32) # (B, D)
+        }
         
-        # Create time array (assuming 0.01 dt or similar, but generic is fine)
-        T_steps = traj_sample.shape[0]
-        t = np.arange(T_steps) * 0.01 # dummy time
+        # Ensure Quats are normalized roughly (not strictly needed for just running code)
         
-        vis.visualize_trajectory(
-            t=t,
-            x_traj=traj_sample,
-            repeat=True,
-            goal_pos=goal_pos,
-            goal_quat=goal_quat
-        )
-        vis.close()
-    except Exception as e:
-        print(f"Visualization failed: {e}")
+        # List of Dictionaries
+        self.list_buffer = []
+        for i in range(self.B):
+            d = {
+                'body_pos_w': self.dict_buffer['body_pos_w'][i],
+                'body_quat_w': self.dict_buffer['body_quat_w'][i],
+                'joint_pos': self.dict_buffer['joint_pos'][i],
+                'object_pos_w': self.dict_buffer['object_pos_w'][i],
+                'object_quat_w': self.dict_buffer['object_quat_w'][i],
+                'task_params': self.dict_buffer['task_params'][i]
+            }
+            self.list_buffer.append(d)
+        
+        # Minimal configuration matching default feature_order
+        self.config = {
+            "num_observations": 10, # Doesn't matter much for functionality check
+            "num_features": 48, # Needs to match what features produce? 
+                                # FlexibleDataset calculates total dim based on features. 
+                                # This config value is used for splitting cond/target.
+            "state_history": 2,
+            "num_timesteps": 10,
+            "downsample": 1,
+            "stride": 1,
+            "start_timestep": 0
+            # "feature_order" uses default if not specified
+        }
 
-if __name__ == "__main__":
-    test_real_pipeline()
+    def test_list_input(self):
+        print("\n=== Testing List Input ===")
+        print("Initializing BufferDataset with LIST of dicts...")
+        ds = BufferDataset(self.list_buffer, self.config, calculate_stats=True)
+        print(f"Dataset length: {len(ds)}")
+        self.assertTrue(len(ds) > 0, "Dataset should not be empty")
+        
+        # Verify internal conversion
+        self.assertIsInstance(ds.data_buffer, dict, "Internal buffer should be converted to dict")
+        self.assertEqual(len(ds.data_buffer['body_pos_w']), self.B, "Should have B entries in converted list")
+        
+        # Access item
+        print("Accessing Item 0...")
+        item = ds[0]
+        future, current, task, anchor = item
+        print(f"Task Shape: {task.shape}")
+        
+        self.assertIsInstance(future, torch.Tensor)
+        self.assertIsInstance(task, torch.Tensor)
+        self.assertEqual(task.shape[0], 5, "Task params dimension mismatch")
+
+    def test_dict_input(self):
+        print("\n=== Testing Batched Dict Input ===")
+        print("Initializing BufferDataset with BATCHED dict...")
+        ds = BufferDataset(self.dict_buffer, self.config, calculate_stats=True)
+        self.assertTrue(len(ds) > 0)
+        
+        # Access item to ensure indexing works
+        item = ds[0]
+        self.assertIsNotNone(item)
+        print("Batch Dict access successful.")
+
+    def test_external_task_params(self):
+         print("\n=== Testing External Task Params ===")
+         # Disable stats to check raw values
+         ds = BufferDataset(self.dict_buffer, self.config, calculate_stats=False)
+         
+         # Get item 0, which corresponds to batch 0
+         # Check indices to be sure
+         idx_info = ds.indices[0] # (file_idx, batch_idx, t)
+         batch_idx = idx_info[1]
+         
+         _, _, task_t, _ = ds[0]
+         
+         expected = self.dict_buffer['task_params'][batch_idx]
+         
+         # Note: BufferDataset._normalize is called even if calculate_stats=False, 
+         # but if stats are empty, _normalize returns value as is.
+         
+         print(f"Expected: {expected}")
+         print(f"Got: {task_t.numpy()}")
+         
+         self.assertTrue(np.allclose(task_t.numpy(), expected, atol=1e-5), "Task params values do not match external input")
+         print("Task params match confirmed.")
+
+    def test_speed_initialization(self):
+        print("\n=== Testing Initialization Speed ===")
+        import time
+        start = time.time()
+        ds = BufferDataset(self.dict_buffer, self.config, calculate_stats=True)
+        end = time.time()
+        print(f"Init time (B={self.B}, T={self.T}): {end-start:.4f}s")
+
+if __name__ == '__main__':
+    unittest.main()
