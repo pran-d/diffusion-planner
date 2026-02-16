@@ -48,6 +48,7 @@ training:
   suffix: "_generator"
   num_epochs: 10000
   batches_per_epoch: 256
+  balance_task_density: True
   learning_rate: 0.0005
   save_every: 250
   condition_dropout_prob: 
