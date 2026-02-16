@@ -28,7 +28,7 @@ def apply_condition_dropout(
         dropout_prob: Probability of dropping condition
 
     Returns:
-        dropped_cond or (dropped_cond, keep_mask)
+        dropped_cond
     """
     if cond is None or dropout_prob <= 0.0:
         return cond
@@ -36,10 +36,17 @@ def apply_condition_dropout(
     if not torch.is_tensor(cond):
         cond = torch.as_tensor(cond)
 
-    if torch.rand(1).item() < dropout_prob:
-        return torch.zeros_like(cond)
+    batch_size = cond.shape[0]
+
+    # Generate mask: 1 keep, 0 drop
+    keep_prob = 1.0 - dropout_prob
     
-    return cond
+    # Mask shape (B, 1, ...) to broadcast
+    mask_shape = (batch_size,) + (1,) * (cond.ndim - 1)
+    
+    mask = torch.bernoulli(torch.full(mask_shape, keep_prob, device=cond.device))
+    
+    return cond * mask
 
 class MLP(nn.Module):
     def __init__(self, in_dim, out_dim):
@@ -531,7 +538,8 @@ class DFoTTrajectory(nn.Module):
             external_conditions_mask = torch.zeros(
                 (batch_size, 1, self.external_cond_dim), dtype=torch.bool, device=xs_pred.device
             )
-            external_conditions_mask[..., self.task_dim:] = 1.0 
+
+            external_conditions_mask[..., -self.task_dim:] = 1.0
             
             with history_guidance(context_mask) as history_guidance_manager:
                 nfe = history_guidance_manager.nfe
