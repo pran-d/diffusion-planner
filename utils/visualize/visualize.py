@@ -62,6 +62,7 @@ class MjVisualizer():
         guidance_vec: np.ndarray = None,
         goal_pos: np.ndarray = None, 
         goal_quat: np.ndarray = None,
+        overlay_paths: list = None,
     ) -> None:
         """
         Visualizes the trajectory in a Mujoco viewer with pause and step-by-step control.
@@ -147,6 +148,35 @@ class MjVisualizer():
                         
                     self.mj_data.mocap_pos[arrow_mocap_id] = obj_pos
                     self.mj_data.mocap_quat[arrow_mocap_id] = quat
+
+            # Overlay paths
+            if overlay_paths:
+                for path in overlay_paths:
+                    if len(path) < 2: continue
+                    # Subsample for performance
+                    step_size = 5
+                    for j in range(0, len(path)-1, step_size):
+                        if self.viewer.user_scn.ngeom >= self.viewer.user_scn.maxgeom: break
+                        
+                        p1 = path[j]
+                        p2 = path[min(j+step_size, len(path)-1)]
+                        
+                        mujoco.mjv_initGeom(
+                            self.viewer.user_scn.geoms[self.viewer.user_scn.ngeom],
+                            type=mujoco.mjtGeom.mjGEOM_CAPSULE,
+                            size=[0.005, 0, 0],
+                            pos=(p1+p2)/2,
+                            mat=np.eye(3).flatten(),
+                            rgba=[0, 1, 0, 0.15]
+                        )
+                        mujoco.mjv_connector(
+                            self.viewer.user_scn.geoms[self.viewer.user_scn.ngeom],
+                            mujoco.mjtGeom.mjGEOM_CAPSULE,
+                            0.005,
+                            p1,
+                            p2
+                        )
+                        self.viewer.user_scn.ngeom += 1
 
             mujoco.mj_forward(self.mj_model, self.mj_data)
             # print(self.bodies_in_contact("left_wrist_pitch_link", "largebox"))
@@ -291,7 +321,7 @@ class DiffusionOverlayVisualizer:
     def visualize_overlay(
         self,
         x_trajs: np.ndarray,
-        repeated_xml_path: str = "test_datasets/mj_model_repeated.xml",
+        repeated_xml_path: str = "./mj_model_repeated.xml",
         timestep_delay: float = 0.05,
         loop: bool = True,
         guidance_vec: np.ndarray = None,

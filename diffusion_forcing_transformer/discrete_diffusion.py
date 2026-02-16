@@ -360,6 +360,7 @@ class DiscreteDiffusion(nn.Module):
         external_cond: Optional[torch.Tensor],
         external_cond_mask: Optional[torch.Tensor] = None,
         guidance_fn: Optional[Callable] = None,
+        guidance_goal: Optional[torch.Tensor] = None,
         guidance_wt: float = 1.0,
         cfg_w: float = 1.0,
     ):
@@ -371,6 +372,7 @@ class DiscreteDiffusion(nn.Module):
                 external_cond=external_cond,
                 external_cond_mask=external_cond_mask,
                 guidance_fn=guidance_fn,
+                guidance_goal=guidance_goal,
                 guidance_wt=guidance_wt,
                 cfg_w=cfg_w,
             )
@@ -443,6 +445,7 @@ class DiscreteDiffusion(nn.Module):
         external_cond: Optional[torch.Tensor],
         external_cond_mask: Optional[torch.Tensor] = None,
         guidance_fn: Optional[Callable] = None,
+        guidance_goal: Optional[torch.Tensor] = None,
         guidance_wt: float = 1.0,
         cfg_w: float = 1.0,
     ):
@@ -468,34 +471,72 @@ class DiscreteDiffusion(nn.Module):
         sigma = self.add_shape_channels(sigma)
 
         if guidance_fn is not None:
+            # 1. Enable grad on x (x_t)
             with torch.enable_grad():
-                x = x.detach().requires_grad_()
+                x_in_grad = x.detach().requires_grad_()
 
+                # 2. Predict x0 from xt
                 model_pred = self.model_predictions(
-                    x=x,
+                    x=x_in_grad,
                     k=clipped_curr_noise_level,
                     external_cond=external_cond,
-                    external_cond_mask=None,
+                    external_cond_mask=None, # For guidance, we usually assume full conditioning or as required
                 )
-
+                
+                # 3. Calculate Loss
+                # guidance_fn should take in (xk, pred_x0, etc) and return a scalar loss
                 guidance_loss = guidance_fn(
-                    xk=x, pred_x0=model_pred.pred_x_start, alpha_cumprod=alpha
+                    xk=x_in_grad, 
+                    pred_x0=model_pred.pred_x_start, 
+                    alpha_cumprod=alpha,
+                    goal=guidance_goal,
                 )
 
-                grad = -torch.autograd.grad(
-                    guidance_loss,
-                    x,
-                )[0]
+                # 4. Calculate Gradient g = grad(L, xt)
+                grad = torch.autograd.grad(guidance_loss, x_in_grad)[0]
                 grad = torch.nan_to_num(grad, nan=0.0)
 
-                pred_noise = model_pred.pred_noise + (1 - alpha).sqrt() * grad
-                x_start = torch.where(
-                    alpha > 0,  # to avoid NaN from zero terminal SNR
-                    self.predict_start_from_noise(
-                        x, clipped_curr_noise_level, pred_noise
-                    ),
-                    model_pred.pred_x_start,
+            # 5. Modify xt: xt' = xt - lambda * g
+            # Note: We subtract because we want to minimize loss
+            x = x - guidance_wt * grad.detach()
+
+            # 6. Proceed with denoising using new xt
+            # Re-predict with modified x is technically more correct for the step, 
+            # Given we shifted x, let's re-predict to be safe and accurate to the new 'location'.
+            model_pred_cond = self.model_predictions(
+                x=x,
+                k=clipped_curr_noise_level,
+                external_cond=external_cond,
+                external_cond_mask=None,
+            )
+            
+            masked_external_cond = external_cond_mask * external_cond if external_cond is not None else None
+            model_pred_uncond = self.model_predictions(
+                x=x,
+                k=clipped_curr_noise_level,
+                external_cond=masked_external_cond,
+                external_cond_mask=None,
+            )
+
+            # Classifier-Free Guidance on the *new* prediction
+            x_start = model_pred_uncond.pred_x_start + cfg_w * (
+                model_pred_cond.pred_x_start - model_pred_uncond.pred_x_start
+            )
+            pred_noise = model_pred_uncond.pred_noise + cfg_w * (
+                model_pred_cond.pred_noise - model_pred_uncond.pred_noise
+            )
+
+            # Dynamic Thresholding (Clamp gen values to [-1, 1] then scale)
+            if cfg_w > 1.0:
+                s = torch.quantile(
+                    torch.abs(x_start).flatten(1), 
+                    0.995, 
+                    dim=1
                 )
+                s = torch.maximum(s, torch.ones_like(s))
+                # Broadcast s: (B,) -> (B, 1, 1)
+                s = s.view(-1, 1, 1)
+                x_start = torch.clamp(x_start, -s, s) / s
 
         else:
             model_pred_cond = self.model_predictions(
@@ -512,12 +553,28 @@ class DiscreteDiffusion(nn.Module):
                 external_cond=masked_external_cond,
                 external_cond_mask=None,
             )
+            
+            # Classifier-Free Guidance
             x_start = model_pred_uncond.pred_x_start + cfg_w * (
                 model_pred_cond.pred_x_start - model_pred_uncond.pred_x_start
             )
             pred_noise = model_pred_uncond.pred_noise + cfg_w * (
                 model_pred_cond.pred_noise - model_pred_uncond.pred_noise
             )
+            
+            # Dynamic Thresholding (Clamp gen values to [-1, 1] then scale)
+            
+            # Since our data is B, T, D, we compute quantile over T, D dims.
+            if cfg_w > 1.0:
+                s = torch.quantile(
+                    torch.abs(x_start).flatten(1), 
+                    0.995, 
+                    dim=1
+                )
+                s = torch.maximum(s, torch.ones_like(s))
+                # Broadcast s: (B,) -> (B, 1, 1)
+                s = s.view(-1, 1, 1)
+                x_start = torch.clamp(x_start, -s, s) / s
 
         noise = torch.randn_like(x)
         noise = torch.clamp(noise, -self.clip_noise, self.clip_noise)

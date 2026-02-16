@@ -29,6 +29,7 @@ def load_env_and_data():
 def main():
     parser = argparse.ArgumentParser("Visualize Dataset Trajectories")
     parser.add_argument("--start_idx", type=int, default=0, help="Index of unique trajectory to start from")
+    parser.add_argument("--overlay", action="store_true", help="Overlay all object paths and hide robot")
     args = parser.parse_args()
 
     data_cfg, dataset = load_env_and_data()
@@ -39,7 +40,43 @@ def main():
     unique_trajs = sorted(list(set((f, b) for f, b, t in dataset.indices)))
     
     print(f"Found {len(unique_trajs)} unique trajectories in dataset.")
+
+    # Pre-load all trajectories for overlay
+    all_trajs_data = []
+    all_obj_paths = []
     
+    if args.overlay:
+        print("Pre-loading ALL trajectories for overlay...")
+        from tqdm import tqdm
+        for f_idx, b_idx in tqdm(unique_trajs):
+            try:
+                raw = dataset._get_single_traj(f_idx, b_idx)
+                all_trajs_data.append(raw)
+                if 'obj' in raw:
+                    # Ensure numpy array
+                    path = raw['obj'][:, :3] if isinstance(raw['obj'], np.ndarray) else np.array(raw['obj'])[:, :3]
+                    all_obj_paths.append(path)
+                else:
+                    all_obj_paths.append(np.zeros((1, 3)))
+            except Exception as e:
+                print(f"Error loading {f_idx}, {b_idx}: {e}")
+                all_trajs_data.append(None)
+                all_obj_paths.append(np.zeros((1, 3)))
+    else:
+        # Just lazy load in loop (or just load standard way - but we already refactored loop to use all_trajs_data, so we should populate it or reverting logic)
+        # To minimize code change, let's just populate all_trajs_data but maybe skip obj paths if not needed? 
+        # Actually loading 1000 files is fast. Let's just do it consistently but only compute paths if needed.
+        # Wait, if !args.overlay, we don't need all_obj_paths.
+        print("Pre-loading trajectories...")
+        from tqdm import tqdm
+        for f_idx, b_idx in tqdm(unique_trajs):
+             # We need to load data anyway for the loop structure we committed
+             try:
+                raw = dataset._get_single_traj(f_idx, b_idx)
+                all_trajs_data.append(raw)
+             except:
+                all_trajs_data.append(None)
+
     # Initialize Visualizer
     xml_path = "./mj_model.xml"
     if not os.path.exists(xml_path):
@@ -53,8 +90,8 @@ def main():
         print(f"\n[{i}/{len(unique_trajs)}] Visualizing File {file_idx}, Batch {batch_idx}")
         
         # Get Full Raw Trajectory
-        # _get_single_traj returns dict with keys like 'base', 'joints', 'obj'
-        raw_traj = dataset._get_single_traj(file_idx, batch_idx)
+        raw_traj = all_trajs_data[i]
+        if raw_traj is None: continue
         
         # Extract components
         # Expected shapes: (T, 7), (T, 29), (T, 7)
@@ -71,6 +108,14 @@ def main():
         # Concatenate for visualization: [Base(7) | Joints(29) | Object(7)]
         # Total 43 dims
         full_state = np.concatenate([base, joints, obj], axis=-1)
+        
+        # Handle Overlay / Hide Robot
+        current_overlay = None
+        if args.overlay:
+            # Hide robot by moving it far away
+            # Base position is first 3 indices. Set Z to -100
+            full_state[:, 2] = -100.0
+            current_overlay = all_obj_paths
         
         print(f"  Trajectory length: {T}, Shape: {full_state.shape}")
         if 'fps' in raw_traj:
@@ -98,7 +143,7 @@ def main():
         # If it IS blocking, we wait for window close.
         # Let's try running it.
         
-        visualizer.visualize_trajectory(t, full_state, repeat=True)
+        visualizer.visualize_trajectory(t, full_state, repeat=True, overlay_paths=current_overlay)
         
         # If non-blocking, we wait here.
         user_in = input(">> Next? (Enter/q): ")

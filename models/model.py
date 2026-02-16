@@ -87,7 +87,7 @@ class RobotDiffuser():
         else:
             self.model.load_state_dict(weights)
 
-    def getSample(self, num_trajectories=1, state_cond=None, goal_cond=None, deterministic=False, cfg_w=1.0):
+    def getSample(self, num_trajectories=1, state_cond=None, goal_cond=None, deterministic=False, cfg_w=1.0, guidance_wt=1.0, guidance_goal=None,):
         """
         Run reverse diffusion to generate trajectories.
         """
@@ -116,7 +116,7 @@ class RobotDiffuser():
         model_cond = tuple(cond_list) if len(cond_list) > 0 else None
         if len(cond_list) == 1: model_cond = cond_list[0]
 
-        sample_kwargs = {}
+        sample_kwargs = {'guidance_goal': guidance_goal if guidance_goal is not None else goal_cond, 'guidance_wt': guidance_wt}
         if self.model_cfg['type'] == "dit1d_wrapper":
             sample_kwargs['scheduler'] = inference_noise_scheduler
 

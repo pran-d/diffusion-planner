@@ -1,7 +1,7 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from diffusion_forcing_transformer.guidance_functions import guidance_smoothness
+from diffusion_forcing_transformer.guidance_functions import guidance_goal_mse, guidance_smoothness
 from diffusion_forcing_transformer.discrete_diffusion import DiscreteDiffusion
 from diffusion_forcing_transformer.history_guidance import HistoryGuidance
 from diffusion_forcing_transformer.torch_utils import bernoulli_tensor
@@ -330,7 +330,7 @@ class DFoTTrajectory(nn.Module):
         }
         return output_dict
 
-    def sample(self, num_trajectories, model_cond=None, cfg_w=0.0):
+    def sample(self, num_trajectories, model_cond=None, cfg_w=0.0, guidance_wt=1.0, guidance_goal=None):
         """
         Sampling method.
         """
@@ -388,6 +388,9 @@ class DFoTTrajectory(nn.Module):
         xs_pred, _ = self._sample_sequence(
             batch_size=num_trajectories,
             conditions=conditions, # External conditions
+            guidance_wt=guidance_wt,
+            guidance_goal=guidance_goal,
+            guidance_fn=guidance_goal_mse if guidance_wt>0 else None,
             cfg_w=cfg_w,
         )
         
@@ -452,6 +455,7 @@ class DFoTTrajectory(nn.Module):
         length: Optional[int] = None,
         conditions: Optional[torch.Tensor] = None,
         guidance_fn: Optional[Callable] = None,
+        guidance_goal: Optional[torch.Tensor] = None,
         guidance_wt: float = 1.0,
         history_guidance: Optional[HistoryGuidance] = None,
         return_all: bool = False,
@@ -558,6 +562,7 @@ class DFoTTrajectory(nn.Module):
                     ),
                     external_conditions_mask,
                     guidance_fn=guidance_fn,
+                    guidance_goal=guidance_goal,
                     guidance_wt=guidance_wt,
                     cfg_w=cfg_w,
                 )

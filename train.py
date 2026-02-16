@@ -3,10 +3,11 @@ import torch
 import numpy as np
 from torch import cond, nn, optim
 from torch.nn import functional as F
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, WeightedRandomSampler
 from torch.utils.tensorboard import SummaryWriter
 from torch.amp import GradScaler
 from matplotlib import pyplot as plt
+from tqdm import tqdm
 import os
 import yaml
 import mujoco
@@ -15,6 +16,92 @@ from diffusers import EMAModel
 from datasets import FlexibleWindowDataset, ConditionalStateDataset
 from models.model import RobotDiffuser
 from config.configure import load_config, get_data_path, get_save_path, get_log_path, get_norm_path
+
+# ===============================
+# Helper Functions
+# ===============================
+def compute_dataset_weights(dataset, sigma=0.2):
+    """
+    Computes weights for each sample in the dataset based on the inverse density 
+    of its task parameters.
+    """
+    if not hasattr(dataset, 'indices') or not hasattr(dataset, '_get_single_traj'):
+        print("Dataset does not support task density balancing (missing indices).")
+        return None
+
+    print("Computing task parameter density weights...")
+    
+    # 1. Collect Task Params
+    # We ideally want unique task params based on trajectory to speed up
+    # mapping: (file_idx, batch_idx) -> task_param
+    
+    unique_traj_keys = set((f, b) for f, b, t in dataset.indices)
+    print(f"Found {len(unique_traj_keys)} unique trajectories in {len(dataset)} windows.")
+    
+    min_tp = dataset.stats.get('min_task_params')
+    max_tp = dataset.stats.get('max_task_params')
+    
+    if min_tp is None:
+        print("Warning: Task params stats not found. Density balancing might be inaccurate.")
+    
+    tp_list = []
+    key_list = []
+    
+    # Pre-fetch if possible to avoid redundant file reads
+    # But _get_single_traj uses ram_cache so it's fast
+    
+    for f, b in tqdm(unique_traj_keys, desc="Extracting Task Params"):
+        raw = dataset._get_single_traj(f, b)
+        tp_raw = dataset._compute_task_params(raw['obj'])
+        
+        # Normalize manually
+        if min_tp is not None:
+             # Manually normalize: (x - min) / (max - min) * 2 - 1
+             # Ensure tensors
+             if not torch.is_tensor(tp_raw):
+                 tp_raw = torch.tensor(tp_raw, dtype=torch.float32)
+             
+             mn = min_tp.to(tp_raw.device)
+             mx = max_tp.to(tp_raw.device)
+             tp_norm = (tp_raw - mn) / (mx - mn + 1e-6) * 2 - 1
+        else:
+             tp_norm = torch.tensor(tp_raw, dtype=torch.float32)
+            
+        tp_list.append(tp_norm)
+        key_list.append((f, b))
+        
+    if not tp_list: 
+         return None
+         
+    # Stack (N_traj, D)
+    tp_tensor = torch.stack(tp_list).float()
+    
+    # 2. Compute Density (Simple KDE on CPU)
+    # Using Gaussian Kernel: sum(exp(-dist^2 / sigma^2))
+    print(f"Computing density (Sigma={sigma})...")
+    
+    # Pairwise distance matrix (N, N)
+    dists = torch.cdist(tp_tensor, tp_tensor) 
+    
+    # Density ~ sum(kernel)
+    # Adding epsilon to avoid division by zero
+    density = torch.sum(torch.exp(-(dists ** 2) / (sigma ** 2)), dim=1) + 1e-6
+    
+    # Weight = 1 / density
+    weights_traj = 1.0 / density
+    
+    # Normalize weights so sum matches length or similar (optional, mainly relative matters)
+    # Let's normalize so mean is 1
+    weights_traj = weights_traj / weights_traj.mean()
+    
+    # Map back to dataset indices
+    key_to_weight = {k: w.item() for k, w in zip(key_list, weights_traj)}
+    
+    sample_weights = []
+    for f, b, t in dataset.indices:
+        sample_weights.append(key_to_weight[(f, b)])
+        
+    return torch.tensor(sample_weights).double()
 
 # ===============================
 # Setup
@@ -110,11 +197,23 @@ else:
         add_noise=training_cfg.get("add_obs_noise", False), add_goal_noise=training_cfg.get("add_goal_noise", False)
     )
 
+sampler = None
+shuffle = True
+
+# Task Density Balancing
+if training_cfg.get("balance_task_density", True): # Default to True as requested
+    weights = compute_dataset_weights(dataset, sigma=training_cfg.get("density_sigma", 0.2))
+    if weights is not None:
+        sampler = WeightedRandomSampler(weights, len(weights))
+        shuffle = False
+        print("WeightedRandomSampler activated (Balance Task Density).")
+
 train_dataloader = DataLoader(
     dataset, 
     batch_size=data_cfg["batch_size"], 
     num_workers=4,
-    shuffle=True,
+    shuffle=shuffle, # False if sampler provided
+    sampler=sampler,
     pin_memory=True,
     persistent_workers=True,
     prefetch_factor=2,

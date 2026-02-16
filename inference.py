@@ -157,6 +157,13 @@ def main():
     parser.add_argument("--visualize", action="store_true")
     parser.add_argument("--device", type=str, default="cuda", help="Device for inference (cuda or cpu)")
     parser.add_argument("--cfg_w", type=float, default=1.0, help="Classifier-free guidance weight")
+    parser.add_argument("--task_params", nargs="+", type=float, default=None, help="Custom task parameters (e.g., --task_params 0.5 -0.2)")
+    
+    # Guidance arguments
+    parser.add_argument("--guidance_wt", type=float, default=0.0, help="Test-time gradient guidance strength")
+    parser.add_argument("--guidance_goal", nargs="+", type=float, default=None, help="Target values for guidance (normalized)")
+    parser.add_argument("--guidance_indices", nargs="+", type=int, default=None, help="Indices of the state vector to apply guidance on")
+    
     args = parser.parse_args()
 
     # 1. Load Config
@@ -208,6 +215,15 @@ def main():
 
     _, curr_state, task_params, anchor = dataset[args.sample_idx]
     
+    # Override task params if provided
+    if args.task_params is not None:
+        print(f"Overriding task params with: {args.task_params}")
+        custom_tp = torch.tensor(args.task_params, dtype=torch.float32)
+        
+        # Normalize
+        norm_tp = dataset._normalize("task_params", custom_tp)
+        print(f"Normalized task params: {norm_tp}")
+
     curr_state_tens = curr_state.unsqueeze(0).repeat(args.num_samples, 1, 1).to(device)
     task_tens = task_params.unsqueeze(0).repeat(args.num_samples, 1).to(device)
     
@@ -230,6 +246,8 @@ def main():
             goal_cond=task_tens,
             deterministic=True,
             cfg_w=args.cfg_w,
+            guidance_wt=args.guidance_wt,
+            guidance_goal=args.guidance_goal,
         )
         
         # B. Denormalize
@@ -255,10 +273,24 @@ def main():
             curr_state_tens = curr_state_tens.to(device)
 
     # 6. Finalize
-    full_trajectory = np.concatenate(stitched_segments, axis=1)
+    full_trajectory = np.concatenate(stitched_segments, axis=1) # (B, T, D)
     os.makedirs(os.path.dirname(args.save_path), exist_ok=True)
     np.save(args.save_path, full_trajectory)
     print(f"Stitched trajectory saved to {args.save_path} (Shape: {full_trajectory.shape})")
+    
+    # Object indices: 36:39 (pos), 39:43 (quat)
+    if full_trajectory.shape[-1] >= 39:
+        start_obj = full_trajectory[0, 0, 36:39]
+        end_obj = full_trajectory[0, -1, 36:39]
+        achieved_displacement = (end_obj - start_obj)[:2]
+        desired = dataset._denormalize("task_params", task_params)
+            
+        print("-" * 30)
+        print(f"Desired Task Params (Delta XY): {desired}")
+        print(f"Achieved Displacement (Delta XY): {achieved_displacement}")
+        err = np.linalg.norm(desired - achieved_displacement)
+        print(f"L2 Error: {err:.4f}")
+        print("-" * 30)
 
     if dataset.downsample > 1:
          full_trajectory = interpolate_trajectory(full_trajectory, dataset.downsample)

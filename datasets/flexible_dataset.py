@@ -219,7 +219,7 @@ class FlexibleWindowDataset(Dataset):
                     # Apply downsampling effectively reduces T
                     T_down = T // self.downsample
 
-                    T_padded = T_down + 2    
+                    T_padded = T_down + 1
                     w_size = self.window_size + self.history_size
                     num_windows = T_padded - w_size + 1
                     
@@ -339,6 +339,20 @@ class FlexibleWindowDataset(Dataset):
         norm = (val - min_v) / diff
         norm = norm * 2 - 1
         return norm
+    
+    def _denormalize(self, key, val):
+        min_k = self.stats.get(f"min_{key}")
+        max_k = self.stats.get(f"max_{key}")
+        
+        if min_k is None or max_k is None:
+            return val
+            
+        dev = val.device
+        min_v = min_k.to(dev)
+        max_v = max_k.to(dev)
+
+        denorm = (val + 1) / 2 * (max_v - min_v) + min_v
+        return denorm
 
     def _add_rotation_noise(self, tensor, noise_level):
         """Add noise to rotation features (e.g., 6D)."""

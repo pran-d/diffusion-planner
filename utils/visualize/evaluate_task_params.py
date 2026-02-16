@@ -18,6 +18,14 @@ def parse_args():
     parser.add_argument("--stitch_steps", type=int, default=20)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--cfg_w", type=float, default=1.0, help="Classifier-Free Guidance weight")
+    parser.add_argument("--device", type=str, default="cuda", help="Device to run evaluation on")
+    parser.add_argument("--save_path", type=str, default="task_params_comparison.png", help="Path to save the comparison plot")
+    
+    # Guidance arguments
+    parser.add_argument("--guidance_wt", type=float, default=0.0, help="Test-time gradient guidance strength")
+    parser.add_argument("--guidance_goal", nargs="+", type=float, default=None, help="Target values for guidance (normalized)")
+    parser.add_argument("--guidance_indices", nargs="+", type=int, default=None, help="Indices of the state vector to apply guidance on")
+    
     return parser.parse_args()
 
 def denormalize_task_params(dataset, norm_val):
@@ -95,7 +103,7 @@ def main():
     
     # Device
     # device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    device = "cuda" if torch.cuda.is_available() else "cpu"
+    device = args.device if torch.cuda.is_available() else "cpu"
     print(f"Using device: {device}")
     
     if args.seed is not None:
@@ -172,6 +180,7 @@ def main():
                 goal_cond=gt_task_tens,
                 deterministic=True,
                 cfg_w=args.cfg_w,
+                guidance_wt=args.guidance_wt,
             )
             
             # Denormalize
@@ -252,7 +261,15 @@ def main():
         plt.grid(True)
         plt.axis('equal')
         
-        save_path = "task_params_comparison.png"
+        # Center plot around 0,0 and fix axes
+        all_vals = np.concatenate([gt_params, gen_params], axis=0)
+        max_val = np.max(np.abs(all_vals)) * 1.1 # 10% padding
+        plt.xlim(-max_val, max_val)
+        plt.ylim(-max_val, max_val)
+        plt.axhline(0, color='k', linewidth=0.5)
+        plt.axvline(0, color='k', linewidth=0.5)
+        
+        save_path = args.save_path
         plt.savefig(save_path)
         print(f"Plot saved to {save_path}")
     except Exception as e:
