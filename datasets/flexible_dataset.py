@@ -8,7 +8,7 @@ import collections
 from torch.utils.data import Dataset
 from tqdm import tqdm
 
-from utils.math.sbto_utils import compute_sbto_components
+from utils.math.sbto_utils import compute_sbto_components, yaw_to_rot_matrix, yaw_from_quat
 from utils.math.rotation_conversions import (
     rotation_6d_to_matrix, 
     matrix_to_rotation_6d, 
@@ -31,7 +31,6 @@ class FlexibleWindowDataset(Dataset):
         noise_cfg=None, 
         add_noise=False,
         add_goal_noise=False,
-        cache_size=None # Deprecated
     ):
         
         self.data_root = data_root
@@ -49,9 +48,9 @@ class FlexibleWindowDataset(Dataset):
         
         # Default feature order if not provided
         self.feature_order = feature_order or [
-            "delta_xy", "delta_yaw", 
+            "delta_xy", "delta_yaw", "obj_delta_xy",
             "joints", "body_z", "body_rot6d",
-            "obj_rel_pos", "obj_rel_rot6d"
+            "obj_rel_pos", "obj_rel_rot6d",
         ]
         
         # Load file list
@@ -276,7 +275,7 @@ class FlexibleWindowDataset(Dataset):
             
         # Reference frame for SBTO
         # "Current state" is usually history_size.
-        ref_idx = min(self.history_size, w_size - 1)
+        ref_idx = min(self.history_size - 1, w_size - 1)
         
         # Batched SBTO call (Expects B, T, D)
         b_in = b_slice[np.newaxis, ...]
@@ -303,7 +302,7 @@ class FlexibleWindowDataset(Dataset):
         anchor = {k: _sq(v[0]) for k, v in anchor_b.items()}
         
         # Add task params
-        features["task_params"] = self._compute_task_params(raw_traj['obj'])
+        features["task_params"] = self._compute_task_params(raw_traj['base'], raw_traj['obj'])
         
         # Add metadata to anchor
         if 'fps' in raw_traj:
@@ -311,10 +310,11 @@ class FlexibleWindowDataset(Dataset):
 
         return features, anchor
 
-    def _compute_task_params(self, obj_traj):
+    def _compute_task_params(self, base_traj, obj_traj):
         # Default: Object X, Y displacement from start to end of trajectory
+        R_base0_inv = yaw_to_rot_matrix(-yaw_from_quat(base_traj[0, 3:]))
         if obj_traj.shape[0] > 0:
-            return (obj_traj[-1, :2] - obj_traj[0, :2]) # (2,)
+            return (R_base0_inv @ (obj_traj[-1, :3] - obj_traj[0, :3]))[:2] # (2,)
         return np.zeros(2)
 
     def _normalize(self, key, val):
@@ -395,17 +395,16 @@ class FlexibleWindowDataset(Dataset):
         
         # Compute features
         features, anchor = self._compute_transform(raw_traj, t_start)
-        
+
         # Assemble Windowed Feature Vector
         window_parts = []
         for key in self.feature_order:
             if key in features:                
-                part = torch.from_numpy(features[key]).float() 
+                part = torch.from_numpy(features[key]).float()
                 if self.add_noise:
                     history_slice = part[:self.history_size] 
                     part[:self.history_size] = self._add_obs_noise(history_slice, key)
                 part = self._normalize(key, part)
-                part = part 
                 window_parts.append(part)
             else:
                 raise ValueError(f"Feature {key} needed but not computed.")
@@ -419,6 +418,7 @@ class FlexibleWindowDataset(Dataset):
         future_states = window_tensor[self.history_size:, :].clone()
 
         task_params = torch.from_numpy(features["task_params"]).float()
+
         if self.add_goal_noise:
             task_params = self._add_obs_noise(task_params, "task_params")
         task_params = self._normalize("task_params", task_params)
@@ -452,7 +452,7 @@ class FlexibleWindowDataset(Dataset):
             if 'task_params' in raw_traj:
                 task_params = raw_traj['task_params']
             else:
-                task_params = self._compute_task_params(raw_traj['obj']) # (D_task,)
+                task_params = self._compute_task_params(raw_traj['base'], raw_traj['obj']) # (D_task,)
             
             tp_min = task_params
             tp_max = task_params
@@ -528,10 +528,44 @@ class FlexibleWindowDataset(Dataset):
 
         # Store to stats dict
         self.stats = {}
+        
         for k in mins:
             self.stats[f"min_{k}"] = torch.as_tensor(mins[k]).float()
             self.stats[f"max_{k}"] = torch.as_tensor(maxs[k]).float()
+
+        # Shared Normalization Logic
+        shared_keys = ["delta_xy", "obj_delta_xy", "task_params"]
+        present_shared = [k for k in shared_keys if f"min_{k}" in self.stats]
+        
+        if len(present_shared) > 1:
+            # Collect XY mins/maxs
+            xy_mins = []
+            xy_maxs = []
             
+            for k in present_shared:
+                v_min = self.stats[f"min_{k}"]
+                v_max = self.stats[f"max_{k}"]
+                
+                # Take first 2 dims (assuming X, Y are 0, 1)
+                xy_mins.append(v_min[:2])
+                xy_maxs.append(v_max[:2])
+            
+            # Compute global min/max for XY
+            global_min_xy = torch.min(torch.stack(xy_mins), dim=0)[0]
+            global_max_xy = torch.max(torch.stack(xy_maxs), dim=0)[0]
+                        
+            # Update stats in place
+            for k in present_shared:
+                # Update Min
+                curr_min = self.stats[f"min_{k}"].clone()
+                curr_min[:2] = global_min_xy
+                self.stats[f"min_{k}"] = curr_min
+                
+                # Update Max
+                curr_max = self.stats[f"max_{k}"].clone()
+                curr_max[:2] = global_max_xy
+                self.stats[f"max_{k}"] = curr_max
+                
         # Save
         if self.norm_path:
             os.makedirs(os.path.dirname(self.norm_path), exist_ok=True)

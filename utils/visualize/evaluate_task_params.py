@@ -166,7 +166,8 @@ def main():
         # Prepare Anchors
         current_anchors = {
             'ref_pos': anchor['ref_pos'][None, ...],   # (1, 3)
-            'ref_quat': anchor['ref_quat'][None, ...]  # (1, 4)
+            'ref_quat': anchor['ref_quat'][None, ...],  # (1, 4)
+            'ref_obj_pos': anchor['ref_obj_pos'][None, ...] # (1, 3)
         }
         
         generated_segments = []
@@ -188,10 +189,11 @@ def main():
             future_traj = denorm.cpu().numpy()
             
             # Reconstruct (Local -> World)
-            anchor_arr = np.concatenate([current_anchors['ref_pos'], current_anchors['ref_quat']], axis=-1)
+            anchor_arr = np.concatenate([current_anchors['ref_pos'], current_anchors['ref_quat'], current_anchors['ref_obj_pos']], axis=-1)
             robot_world, obj_world, _, _ = reconstruct_sbto_trajectory(
                 base_pose_world=anchor_arr,
-                future_traj=future_traj
+                future_traj=future_traj,
+                inpaint=diffuser.model_cfg.get("inpaint", False)
             )
             
             # Store Segment

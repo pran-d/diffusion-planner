@@ -229,7 +229,8 @@ def main():
     
     current_anchors = {
         'ref_pos': np.tile(anchor['ref_pos'][None], (args.num_samples, 1)),
-        'ref_quat': np.tile(anchor['ref_quat'][None], (args.num_samples, 1))
+        'ref_quat': np.tile(anchor['ref_quat'][None], (args.num_samples, 1)),
+        'ref_obj_pos': np.tile(anchor['ref_obj_pos'][None], (args.num_samples, 1))
     }
     
     history_size = dataset.history_size
@@ -255,9 +256,9 @@ def main():
         future_traj_np = denorm_btc.cpu().numpy()
         
         # C. Reconstruct World Frame
-        anchor_arr = np.concatenate([current_anchors['ref_pos'], current_anchors['ref_quat']], axis=-1)
+        anchor_arr = np.concatenate([current_anchors['ref_pos'], current_anchors['ref_quat'], current_anchors['ref_obj_pos']], axis=-1)
         # Assuming reconstruct_sbto_trajectory returns (robot, object, ...)
-        res = reconstruct_sbto_trajectory(anchor_arr, future_traj_np)
+        res = reconstruct_sbto_trajectory(anchor_arr, future_traj_np, inpaint=diffuser.model_cfg.get("inpaint", False))
         r_world, o_world = res[0], res[1] 
         
         # Store Segment

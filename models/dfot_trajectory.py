@@ -337,7 +337,7 @@ class DFoTTrajectory(nn.Module):
         }
         return output_dict
 
-    def sample(self, num_trajectories, model_cond=None, cfg_w=0.0, guidance_wt=1.0, guidance_goal=None):
+    def sample(self, num_trajectories, model_cond=None, cfg_w=0.0, guidance_wt=1.0, guidance_goal=None, inpaint=False):
         """
         Sampling method.
         """
@@ -395,9 +395,11 @@ class DFoTTrajectory(nn.Module):
         xs_pred, _ = self._sample_sequence(
             batch_size=num_trajectories,
             conditions=conditions, # External conditions
+            task_cond=task_cond,
             guidance_wt=guidance_wt,
             guidance_goal=guidance_goal,
             guidance_fn=guidance_goal_mse if guidance_wt>0 else None,
+            inpaint=inpaint,
             cfg_w=cfg_w,
         )
         
@@ -461,12 +463,14 @@ class DFoTTrajectory(nn.Module):
         batch_size: int,
         length: Optional[int] = None,
         conditions: Optional[torch.Tensor] = None,
+        task_cond: Optional[torch.Tensor] = None,
         guidance_fn: Optional[Callable] = None,
         guidance_goal: Optional[torch.Tensor] = None,
         guidance_wt: float = 1.0,
         history_guidance: Optional[HistoryGuidance] = None,
         return_all: bool = False,
         pbar: Optional[tqdm] = None,
+        inpaint: bool = False,
         cfg_w: float = 1.0,
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
         
@@ -574,6 +578,18 @@ class DFoTTrajectory(nn.Module):
                     guidance_wt=guidance_wt,
                     cfg_w=cfg_w,
                 )
+
+                if task_cond is not None:
+                    if task_cond.ndim == 1:
+                        # (D) -> (1, D)
+                        tc = task_cond.unsqueeze(0)
+                    else:
+                        tc = task_cond
+
+                    tc = tc.to(xs_pred.device, dtype=xs_pred.dtype)
+                    
+                    if inpaint:
+                        xs_pred[..., -1, 3:5] = tc
 
                 xs_pred = history_guidance_manager.compose(xs_pred)
             

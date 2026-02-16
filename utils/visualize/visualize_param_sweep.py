@@ -45,7 +45,7 @@ def update_condition(dataset, robot_world_history, obj_world_history):
     """
     B, H, _ = robot_world_history.shape
     next_states = []
-    next_anchors = {'ref_pos': [], 'ref_quat': []}
+    next_anchors = {'ref_pos': [], 'ref_quat': [], 'ref_obj_pos': []}
     
     for b in range(B):
         r_slice = robot_world_history[b] # (H, 36)
@@ -85,10 +85,12 @@ def update_condition(dataset, robot_world_history, obj_world_history):
         
         next_anchors['ref_pos'].append(new_anch['ref_pos'])
         next_anchors['ref_quat'].append(new_anch['ref_quat'])
+        next_anchors['ref_obj_pos'].append(new_anch['ref_obj_pos'])
 
     return torch.stack(next_states), {
         'ref_pos': np.stack(next_anchors['ref_pos']), 
-        'ref_quat': np.stack(next_anchors['ref_quat'])
+        'ref_quat': np.stack(next_anchors['ref_quat']),
+        'ref_obj_pos': np.stack(next_anchors['ref_obj_pos'])
     }
 
 def main():
@@ -133,7 +135,7 @@ def main():
         initial_states_list = []
         anchors_ref_pos_list = []
         anchors_ref_quat_list = []
-        
+        anchors_ref_obj_pos_list = []
         # Need to iterate to extract
         for idx in tqdm(selected_indices, desc="Extracting Tasks"):
             # dataset[idx] -> _, _, task (norm), _
@@ -143,7 +145,7 @@ def main():
             initial_states_list.append(curr_state)
             anchors_ref_pos_list.append(anchor['ref_pos'])
             anchors_ref_quat_list.append(anchor['ref_quat'])
-            
+            anchors_ref_obj_pos_list.append(anchor['ref_obj_pos'])
             # Let's try to access stats directly
             if "min_task_params" in dataset.stats:
                 min_v = dataset.stats["min_task_params"]
@@ -162,7 +164,8 @@ def main():
         all_initial_states = torch.stack(initial_states_list) # (N, H, F)
         all_anchors = {
              'ref_pos': np.stack(anchors_ref_pos_list),
-             'ref_quat': np.stack(anchors_ref_quat_list)
+             'ref_quat': np.stack(anchors_ref_quat_list),
+             'ref_obj_pos': np.stack(anchors_ref_obj_pos_list)
         }
 
     else:
@@ -191,7 +194,8 @@ def main():
         all_initial_states = curr_state.unsqueeze(0).repeat(num_samples, 1, 1)
         all_anchors = {
             'ref_pos': np.tile(anchor['ref_pos'][None], (num_samples, 1)),
-            'ref_quat': np.tile(anchor['ref_quat'][None], (num_samples, 1))
+            'ref_quat': np.tile(anchor['ref_quat'][None], (num_samples, 1)),
+            'ref_obj_pos': np.tile(anchor['ref_obj_pos'][None], (num_samples, 1))
         }
     
     # 3. Batch Inference Loop
@@ -212,7 +216,8 @@ def main():
         
         current_anchors = {
             'ref_pos': all_anchors['ref_pos'][b_start:b_end],
-            'ref_quat': all_anchors['ref_quat'][b_start:b_end]
+            'ref_quat': all_anchors['ref_quat'][b_start:b_end],
+            'ref_obj_pos': all_anchors['ref_obj_pos'][b_start:b_end]
         }
         
         generated_segments = []
@@ -233,10 +238,11 @@ def main():
             future_traj = denorm.cpu().numpy()
             
             # Reconstruct
-            anchor_arr = np.concatenate([current_anchors['ref_pos'], current_anchors['ref_quat']], axis=-1)
+            anchor_arr = np.concatenate([current_anchors['ref_pos'], current_anchors['ref_quat'], current_anchors['ref_obj_pos']], axis=-1)
             robot_world, obj_world, _, _ = reconstruct_sbto_trajectory(
                 base_pose_world=anchor_arr,
-                future_traj=future_traj
+                future_traj=future_traj,
+                inpaint=model_cfg["inpaint"],
             )
             
             # Store
@@ -291,9 +297,21 @@ def main():
     plt.title(f"Task Param Sweep\n(Mode: {'Dataset' if args.use_dataset_tasks else 'Grid'})")
     plt.xlabel("X (m)")
     plt.ylabel("Y (m)")
-    plt.axis('equal')
+    
+    # Adaptive Limits Centered at 0,0
+    all_trajs = obj_traj_w[:, :, :2].reshape(-1, 2)
+    # Re-calculate targets for limit calculation
+    starts = obj_traj_w[:, 0, :2]
+    targets = starts + task_params_raw
+    
+    all_points = np.concatenate([all_trajs, targets], axis=0)
+    max_val = np.max(np.abs(all_points)) * 1.1 # 10% buffer
+    
+    plt.xlim(-max_val, max_val)
+    plt.ylim(-max_val, max_val)
+    
     plt.grid(True)
-    plt.legend()
+    # plt.legend()
     
     plt.savefig(args.save_path)
     print(f"Saved plot to {args.save_path}")
