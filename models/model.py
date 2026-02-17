@@ -116,7 +116,7 @@ class RobotDiffuser():
         model_cond = tuple(cond_list) if len(cond_list) > 0 else None
         if len(cond_list) == 1: model_cond = cond_list[0]
 
-        sample_kwargs = {'guidance_goal': guidance_goal if guidance_goal is not None else goal_cond, 'guidance_wt': guidance_wt}
+        sample_kwargs = {'guidance_goal': guidance_goal if guidance_goal is not None else goal_cond, 'guidance_wt': guidance_wt, 'inpaint': self.model_cfg.get("inpaint", False)}
         if self.model_cfg['type'] == "dit1d_wrapper":
             sample_kwargs['scheduler'] = inference_noise_scheduler
 

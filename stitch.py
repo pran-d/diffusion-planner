@@ -139,6 +139,7 @@ def autoregressive_rollout(args, diffuser, dataset, model_cfg, data_cfg, noise_c
         batched_anchor = {
             'ref_pos': np.stack([a['ref_pos'] for a in anchors_list]),
             'ref_quat': np.stack([a['ref_quat'] for a in anchors_list]),
+            'ref_obj_pos': np.stack([a['ref_obj_pos'] for a in anchors_list])
         }
     
         # Determine if we are generating or using GT
@@ -148,6 +149,7 @@ def autoregressive_rollout(args, diffuser, dataset, model_cfg, data_cfg, noise_c
             gt_futures = []
             gt_anchors_pos = []
             gt_anchors_quat = []
+            gt_anchors_obj_pos = []
             
             for b_idx, d_idx in enumerate(indices):
                 # dataset[d_idx] -> (future, current, task, anchor)
@@ -155,6 +157,7 @@ def autoregressive_rollout(args, diffuser, dataset, model_cfg, data_cfg, noise_c
                 gt_futures.append(future_tens)
                 gt_anchors_pos.append(anchor['ref_pos'])
                 gt_anchors_quat.append(anchor['ref_quat'])
+                gt_anchors_obj_pos.append(anchor['ref_obj_pos'])
                                 
             # Stack (B, T, C)
             future_tensor = torch.stack(gt_futures).to(diffuser.device) 
@@ -166,7 +169,8 @@ def autoregressive_rollout(args, diffuser, dataset, model_cfg, data_cfg, noise_c
             # Anchor Array
             anchor_pos = np.stack(gt_anchors_pos)
             anchor_quat = np.stack(gt_anchors_quat)
-            anchor_array = np.concatenate([anchor_pos, anchor_quat], axis=-1)
+            anchor_obj_pos = np.stack(gt_anchors_obj_pos)
+            anchor_array = np.concatenate([anchor_pos, anchor_quat, anchor_obj_pos], axis=-1)
             
             # Reconstruct
             robot_world, obj_world, _, _ = reconstruct_sbto_trajectory(

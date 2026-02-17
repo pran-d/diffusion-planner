@@ -11,7 +11,6 @@ from .math_tools import (
     rot_to_quat,
     batch_rotation,
     transpose,
-    quat_multiply
 )
 
 # ============================================================
@@ -21,6 +20,7 @@ from .math_tools import (
 FEATURE_LAYOUT_WITH_VEL = {
     "delta_xy": 2,
     "delta_yaw": 1,
+    "obj_delta_xy": 2,
     "joints": 29,
     "body_z": 1,
     "body_rot6d": 6,
@@ -36,6 +36,7 @@ FEATURE_LAYOUT_WITH_VEL = {
 FEATURE_LAYOUT_NO_VEL = {
     "delta_xy": 2,
     "delta_yaw": 1,
+    "obj_delta_xy": 2,
     "joints": 29,
     "joints_vel": 29,
     "body_z": 1,
@@ -103,9 +104,9 @@ def build_robot_frame_current_state(
 # ============================================================
 
 def compute_sbto_components(
-    base,          # (B, T, 7)
+    base_w,          # (B, T, 7)
     joints,        # (B, T, 29)
-    obj,           # (B, T, 7)
+    obj_w,           # (B, T, 7)
     ref_idx,
     base_vel=None,
     joints_vel=None,
@@ -116,29 +117,29 @@ def compute_sbto_components(
     Core SBTO transformation logic returning a dictionary of components.
     Useful for flexible dataset loaders.
     """
-    B, T, _ = base.shape
+    B, T, _ = base_w.shape
 
     # --------------------------------------------------------
     # Reference frame (current step)
     # --------------------------------------------------------
-    ref_pos = base[:, [ref_idx], :3]
-    ref_quat = base[:, [ref_idx], 3:]
+    ref_pos = base_w[:, [ref_idx], :3]
+    ref_quat = base_w[:, [ref_idx], 3:]
     ref_yaw = yaw_from_quat(ref_quat)
     R_ref_inv = yaw_to_rot_matrix(-ref_yaw)
 
     # --------------------------------------------------------
     # Robot pose deltas
     # --------------------------------------------------------
-    delta_pos_world = base[..., :3] - ref_pos
+    delta_pos_world = base_w[..., :3] - ref_pos
     delta_pos_local = batch_rotation(R_ref_inv, delta_pos_world)
 
     delta_xy = delta_pos_local[..., :2]
-    body_z = base[..., 2:3]
+    body_z = base_w[..., 2:3]
 
-    yaw = yaw_from_quat(base[..., 3:])
+    yaw = yaw_from_quat(base_w[..., 3:])
     delta_yaw = normalize_angle(yaw - ref_yaw)[..., None]
 
-    R_body = quat_to_rot(base[..., 3:])
+    R_body = quat_to_rot(base_w[..., 3:])
     R_body_no_yaw = remove_yaw_from_rot(R_body)
     body_rot6d = rot_to_6d(R_body_no_yaw)
 
@@ -157,10 +158,15 @@ def compute_sbto_components(
     
     # Object relative
     obj_rel_pos, obj_rel_rot = compute_relative_se3(
-        base[..., :3], base[..., 3:],
-        obj[..., :3], obj[..., 3:]
+        base_w[..., :3], base_w[..., 3:],
+        obj_w[..., :3], obj_w[..., 3:]
     )
     obj_rel_rot6d = rot_to_6d(obj_rel_rot)
+
+    # Object global
+    obj_delta_pos_world = obj_w[..., :3] - obj_w[..., [ref_idx], :3]
+    obj_delta_pos_local = batch_rotation(R_ref_inv, obj_delta_pos_world)
+    obj_delta_xy = obj_delta_pos_local[..., :2]
 
     comps = {
         "joints": joints,
@@ -169,7 +175,8 @@ def compute_sbto_components(
         "body_z": body_z,
         "body_rot6d": body_rot6d,
         "obj_rel_pos": obj_rel_pos,
-        "obj_rel_rot6d": obj_rel_rot6d
+        "obj_rel_rot6d": obj_rel_rot6d,
+        "obj_delta_xy": obj_delta_xy,
     }
     
     if save_velocities:
@@ -185,7 +192,8 @@ def compute_sbto_components(
         "ref_pos": ref_pos,
         "ref_quat": ref_quat,
         "R_ref_inv": R_ref_inv,
-        "R_body": R_body
+        "R_body": R_body,
+        "ref_obj_pos": obj_w[:, [ref_idx], :3],
     }
 
     return comps, anchors
@@ -351,6 +359,7 @@ def compute_sbto_features(
 def reconstruct_sbto_trajectory(
     base_pose_world,
     future_traj,
+    inpaint=False,
 ):
     """
     Reconstruct world-frame robot + object trajectory from robot-frame SBTO features.
@@ -381,6 +390,7 @@ def reconstruct_sbto_trajectory(
     # Layout: [joints(29), j_vel(29), d_xy(2), d_yaw(1), z(1), rot(6), ...]
     IDX_DELTA_XY = slice(idx, idx+FEATURE_MAP["delta_xy"]); idx += FEATURE_MAP["delta_xy"]
     IDX_DELTA_YAW = slice(idx, idx+FEATURE_MAP["delta_yaw"]); idx += FEATURE_MAP["delta_yaw"]
+    IDX_OBJ_DELTA_XY = slice(idx, idx+FEATURE_MAP["obj_delta_xy"]); idx += FEATURE_MAP["obj_delta_xy"]
     IDX_JOINTS = slice(idx, idx+FEATURE_MAP["joints"]); idx += FEATURE_MAP["joints"]
     IDX_Z = idx; idx += FEATURE_MAP["body_z"]
     IDX_ROT = slice(idx, idx+FEATURE_MAP["body_rot6d"]); idx += FEATURE_MAP["body_rot6d"]
@@ -392,6 +402,7 @@ def reconstruct_sbto_trajectory(
     # --------------------------------------------------
     base_pos_world_anchor = base_pose_world[:, :3]
     ref_yaw = yaw_from_quat(base_pose_world[:, 3:7])
+    obj_global_anchor = base_pose_world[:, 7:10]
     R_ref_yaw = yaw_to_rot_matrix(ref_yaw)
 
     # --------------------------------------------------
@@ -400,9 +411,11 @@ def reconstruct_sbto_trajectory(
     traj_joints = future_traj[:, :, IDX_JOINTS]
     traj_body_z = future_traj[:, :, IDX_Z]
     traj_body_rot6d = future_traj[:, :, IDX_ROT]
-    
+
     traj_delta_xy = future_traj[:, :, IDX_DELTA_XY] # (T, 2)
     traj_delta_yaw = future_traj[:, :, IDX_DELTA_YAW] # (T, 1)
+
+    traj_delta_obj_xy = future_traj[:, :, IDX_OBJ_DELTA_XY] # (T, 2)
     # --------------------------------------------------
     # Robot pose (world)
     # --------------------------------------------------
@@ -419,7 +432,7 @@ def reconstruct_sbto_trajectory(
     delta_pos_world = (R_ref_yaw[:, None, :, :] @ delta_pos_local[..., None]).squeeze(-1)
     
     pos_world = np.zeros((_, T, 3))
-    pos_world[:, :, :2] = base_pos_world_anchor[:, None, :2] + delta_pos_world[:, :, :2]
+    pos_world[:, :, :2] = base_pos_world_anchor[:, None, :2] + delta_pos_world[..., :2]
 
     pos_world[:, :, 2] = traj_body_z
 
@@ -440,14 +453,17 @@ def reconstruct_sbto_trajectory(
     # --------------------------------------------------
     traj_obj_pos_local = future_traj[:, :, IDX_OBJ_POS]
     traj_obj_rot_local = rot6d_to_rot(future_traj[:, :, IDX_OBJ_ROT])
-
-    # Object is relative to ROBOT BASE (current step base), not ref frame?
-    # compute_relative_se3(base, obj) -> obj relative to base.
-    # So obj_world = base_world * obj_local
     
     obj_pos_world = pos_world + (R_world @ traj_obj_pos_local[..., None]).squeeze(-1)
     obj_rot_world = R_world @ traj_obj_rot_local
     obj_quat_world = rot_to_quat(obj_rot_world)
+
+    if inpaint:
+        print("Inpainting object position with obj_delta_xy...")
+        delta_obj_local = np.zeros((_, T, 3))
+        delta_obj_local[..., :2] = traj_delta_obj_xy
+        delta_obj_global = (R_ref_yaw[:, None, :, :] @ delta_obj_local[..., None]).squeeze(-1)
+        obj_pos_world[..., :2] = obj_global_anchor[:, None, :2] + delta_obj_global[..., :2]
 
     # --------------------------------------------------
     # Velocities (optional)

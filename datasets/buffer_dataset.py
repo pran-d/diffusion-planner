@@ -41,7 +41,7 @@ class BufferDataset(FlexibleWindowDataset):
         self.add_goal_noise = add_goal_noise
         
         self.feature_order = feature_order or [
-            "delta_xy", "delta_yaw", 
+            "delta_xy", "delta_yaw", "obj_delta_xy",
             "joints", "body_z", "body_rot6d",
             "obj_rel_pos", "obj_rel_rot6d"
         ]
@@ -99,8 +99,7 @@ class BufferDataset(FlexibleWindowDataset):
             trajs.append((i, T))
                 
         # 2. Build Sliding Windows
-        # Windows are defined in downsampled steps
-        req_len_down = self.history_size + self.window_size
+        req_len_down = self.window_size // self.downsample
         
         for batch_idx, raw_T in trajs:
             down_T = raw_T // self.downsample

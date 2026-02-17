@@ -552,6 +552,7 @@ class MotionGenerator:
         # Update anchors for reconstruction
         current_anchors['ref_pos'] = np.repeat(current_anchors['ref_pos'], num_samples, axis=0)
         current_anchors['ref_quat'] = np.repeat(current_anchors['ref_quat'], num_samples, axis=0)
+        current_anchors['ref_obj_pos'] = np.repeat(current_anchors['ref_obj_pos'], num_samples, axis=0)
         
         history_size = self.dataset.history_size
         stitched_segments = []
@@ -563,7 +564,7 @@ class MotionGenerator:
                 num_trajectories=num_samples,
                 state_cond=curr_state_tens,
                 goal_cond=task_tens,
-                deterministic=True
+                deterministic=self.noise_cfg["deterministic_inference"],
             ) # (B, T, D_out)
             
             # B. Denormalize
@@ -571,7 +572,7 @@ class MotionGenerator:
             future_traj_np = denorm_btc.detach().cpu().numpy()
             
             # C. Reconstruct World Frame
-            anchor_arr = np.concatenate([current_anchors['ref_pos'], current_anchors['ref_quat']], axis=-1)
+            anchor_arr = np.concatenate([current_anchors['ref_pos'], current_anchors['ref_quat'], current_anchors['ref_obj_pos']], axis=-1)
             
             res = reconstruct_sbto_trajectory(anchor_arr, future_traj_np)
             r_world, o_world = res[0], res[1]

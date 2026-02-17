@@ -52,7 +52,7 @@ def compute_dataset_weights(dataset, sigma=0.2):
     
     for f, b in tqdm(unique_traj_keys, desc="Extracting Task Params"):
         raw = dataset._get_single_traj(f, b)
-        tp_raw = dataset._compute_task_params(raw['obj'])
+        tp_raw = dataset._compute_task_params(raw['base'], raw['obj'])
         
         # Normalize manually
         if min_tp is not None:
