@@ -48,7 +48,7 @@ class FlexibleWindowDataset(Dataset):
         
         # Default feature order if not provided
         self.feature_order = feature_order or [
-            "delta_xy", "delta_yaw", "obj_delta_xy",
+            "delta_xy", "delta_yaw",
             "joints", "body_z", "body_rot6d",
             "obj_rel_pos", "obj_rel_rot6d",
         ]
@@ -82,10 +82,12 @@ class FlexibleWindowDataset(Dataset):
                  
              self.file_paths = []
              for t in tasks:
-                 p = os.path.join(data_root, t, "top_trajectories.npz")
-                 if os.path.exists(p):
-                     self.file_paths.append(p)
-                 else:
+                 file_names = ["top_trajectories.npz", "best_trajectory_rand.npz"]
+                 for file_name in file_names:
+                     p = os.path.join(data_root, t, file_name)
+                     if os.path.exists(p):
+                         self.file_paths.append(p)
+                         break
                      print(f"Warning: {p} not found.")
         else:
             if task_list_path:
@@ -250,7 +252,7 @@ class FlexibleWindowDataset(Dataset):
         j_slice = raw_traj['joints'][read_start:read_end]
         o_slice = raw_traj['obj'][read_start:read_end]
         
-        # Pad
+        # # Pad
         pad_front = max(0, -raw_start)
         pad_back = max(0, raw_end - T_traj)
         
@@ -292,30 +294,33 @@ class FlexibleWindowDataset(Dataset):
         )
         
         # Unwrap batch dim
-        features = {k: v[0] for k, v in features_b.items() if v is not None}
+        features = {k: np.array(v[0]) for k, v in features_b.items() if v is not None}
         
         # Helper to squeeze anchor dims
         def _sq(x):
             if x.shape[0] == 1: return x.squeeze(0)
             return x
 
-        anchor = {k: _sq(v[0]) for k, v in anchor_b.items()}
-        
+        anchor = {k: np.array(_sq(v[0])) for k, v in anchor_b.items()}
+        anchor["final_obj_pos"] = raw_traj['obj'][-1, :3]
+
         # Add task params
-        features["task_params"] = self._compute_task_params(raw_traj['base'], raw_traj['obj'])
+        features["task_params"] = self._compute_task_params(raw_traj['base'], raw_traj['obj'], start_idx=read_start)
         
         # Add metadata to anchor
         if 'fps' in raw_traj:
-            anchor['fps'] = raw_traj['fps']
+            anchor['fps'] = np.array(raw_traj['fps'])
 
         return features, anchor
 
-    def _compute_task_params(self, base_traj, obj_traj):
+    def _compute_task_params(self, base_traj, obj_traj, start_idx=0):
         # Default: Object X, Y displacement from start to end of trajectory
-        R_base0_inv = yaw_to_rot_matrix(-yaw_from_quat(base_traj[0, 3:]))
         if obj_traj.shape[0] > 0:
-            return (R_base0_inv @ (obj_traj[-1, :3] - obj_traj[0, :3]))[:2] # (2,)
-        return np.zeros(2)
+            disp_vector_global = (obj_traj[-1, :3] - obj_traj[start_idx, :3])
+            R_ref_inv = yaw_to_rot_matrix(-yaw_from_quat(base_traj[start_idx, 3:]))
+            disp_vector = (R_ref_inv @ disp_vector_global)[:3] # (2,)
+            return disp_vector
+        return np.zeros(3)
 
     def _normalize(self, key, val):
         min_k = self.stats.get(f"min_{key}")
@@ -323,6 +328,9 @@ class FlexibleWindowDataset(Dataset):
         
         if min_k is None or max_k is None:
             return val
+        
+        if isinstance(val, np.ndarray):
+            val = torch.from_numpy(val).float()
             
         dev = val.device
         min_v = min_k.to(dev)
@@ -425,6 +433,7 @@ class FlexibleWindowDataset(Dataset):
 
         return future_states, current_state, task_params, anchor
 
+
     def _calculate_stats(self):
         """
         Optimized stats calculation:
@@ -447,23 +456,7 @@ class FlexibleWindowDataset(Dataset):
         # Process each file once
         for (file_idx, batch_idx), starts in tqdm(file_map.items(), desc="Computing stats"):
             raw_traj = self._get_single_traj(file_idx, batch_idx)
-            
-            # 1. Update Task Params stats (constant per trajectory)
-            if 'task_params' in raw_traj:
-                task_params = raw_traj['task_params']
-            else:
-                task_params = self._compute_task_params(raw_traj['base'], raw_traj['obj']) # (D_task,)
-            
-            tp_min = task_params
-            tp_max = task_params
-            
-            if "task_params" not in mins:
-                mins["task_params"] = tp_min
-                maxs["task_params"] = tp_max
-            else:
-                mins["task_params"] = np.minimum(mins["task_params"], tp_min)
-                maxs["task_params"] = np.maximum(maxs["task_params"], tp_max)
-            
+                        
             # 2. Process Windows in Batches
             BATCH_SIZE = 256 # Process windows in chunks to manage memory
             
@@ -476,6 +469,7 @@ class FlexibleWindowDataset(Dataset):
                 "base": [], "joints": [], "obj": [],
                 "base_vel": [], "joints_vel": [], "obj_vel": []
             }
+            batch_task_params = []
             
             has_vel = 'base_vel' in raw_traj
             
@@ -491,6 +485,13 @@ class FlexibleWindowDataset(Dataset):
                 b_slice = raw_traj['base'][read_start:read_end]
                 j_slice = raw_traj['joints'][read_start:read_end]
                 o_slice = raw_traj['obj'][read_start:read_end]
+
+                # Task Params
+                if 'task_params' in raw_traj:
+                    tp = raw_traj['task_params']
+                else:
+                    tp = self._compute_task_params(raw_traj['base'], raw_traj['obj'], start_idx=read_start)
+                batch_task_params.append(tp)
                 
                 pad_front = max(0, -raw_start)
                 pad_back = max(0, raw_end - raw_len)
@@ -520,11 +521,13 @@ class FlexibleWindowDataset(Dataset):
                      batch_data["obj_vel"].append(ov)
 
                 if len(batch_data["base"]) >= BATCH_SIZE:
-                    self._update_batch_stats(mins, maxs, batch_data, ref_idx, has_vel)
+                    self._update_batch_stats(mins, maxs, batch_data, ref_idx, has_vel, task_params=batch_task_params)
                     batch_data = {k: [] for k in batch_data}
+                    batch_task_params = []
             
             if len(batch_data["base"]) > 0:
-                 self._update_batch_stats(mins, maxs, batch_data, ref_idx, has_vel)
+                 self._update_batch_stats(mins, maxs, batch_data, ref_idx, has_vel, task_params=batch_task_params)
+                 batch_task_params = []
 
         # Store to stats dict
         self.stats = {}
@@ -576,7 +579,7 @@ class FlexibleWindowDataset(Dataset):
             
         self._update_global_stats()
 
-    def _update_batch_stats(self, mins, maxs, batch_data, ref_idx, has_vel):
+    def _update_batch_stats(self, mins, maxs, batch_data, ref_idx, has_vel, task_params=None):
         base = np.stack(batch_data["base"]) # (B, W, 7)
         joints = np.stack(batch_data["joints"])
         obj = np.stack(batch_data["obj"])
@@ -589,6 +592,13 @@ class FlexibleWindowDataset(Dataset):
             base, joints, obj, ref_idx,
             base_vel=base_vel, joints_vel=joints_vel, obj_vel=obj_vel
         )
+
+        if task_params:
+            # list of (D,) -> (B, D) -> (B, 1, D) so it matches (B, W, D) logic
+            tp_stack = np.stack(task_params) # (B, D)
+            if tp_stack.ndim == 2:
+                tp_stack = tp_stack[:, np.newaxis, :]
+            comps['task_params'] = tp_stack
         
         for k, v in comps.items():
             if v is None: continue

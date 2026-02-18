@@ -390,7 +390,7 @@ def reconstruct_sbto_trajectory(
     # Layout: [joints(29), j_vel(29), d_xy(2), d_yaw(1), z(1), rot(6), ...]
     IDX_DELTA_XY = slice(idx, idx+FEATURE_MAP["delta_xy"]); idx += FEATURE_MAP["delta_xy"]
     IDX_DELTA_YAW = slice(idx, idx+FEATURE_MAP["delta_yaw"]); idx += FEATURE_MAP["delta_yaw"]
-    IDX_OBJ_DELTA_XY = slice(idx, idx+FEATURE_MAP["obj_delta_xy"]); idx += FEATURE_MAP["obj_delta_xy"]
+    # IDX_OBJ_DELTA_XY = slice(idx, idx+FEATURE_MAP["obj_delta_xy"]); idx += FEATURE_MAP["obj_delta_xy"]
     IDX_JOINTS = slice(idx, idx+FEATURE_MAP["joints"]); idx += FEATURE_MAP["joints"]
     IDX_Z = idx; idx += FEATURE_MAP["body_z"]
     IDX_ROT = slice(idx, idx+FEATURE_MAP["body_rot6d"]); idx += FEATURE_MAP["body_rot6d"]
@@ -415,7 +415,7 @@ def reconstruct_sbto_trajectory(
     traj_delta_xy = future_traj[:, :, IDX_DELTA_XY] # (T, 2)
     traj_delta_yaw = future_traj[:, :, IDX_DELTA_YAW] # (T, 1)
 
-    traj_delta_obj_xy = future_traj[:, :, IDX_OBJ_DELTA_XY] # (T, 2)
+    # traj_delta_obj_xy = future_traj[:, :, IDX_OBJ_DELTA_XY] # (T, 2)
     # --------------------------------------------------
     # Robot pose (world)
     # --------------------------------------------------
@@ -458,12 +458,12 @@ def reconstruct_sbto_trajectory(
     obj_rot_world = R_world @ traj_obj_rot_local
     obj_quat_world = rot_to_quat(obj_rot_world)
 
-    if inpaint:
-        print("Inpainting object position with obj_delta_xy...")
-        delta_obj_local = np.zeros((_, T, 3))
-        delta_obj_local[..., :2] = traj_delta_obj_xy
-        delta_obj_global = (R_ref_yaw[:, None, :, :] @ delta_obj_local[..., None]).squeeze(-1)
-        obj_pos_world[..., :2] = obj_global_anchor[:, None, :2] + delta_obj_global[..., :2]
+    # if inpaint:
+    #     print("Inpainting object position with obj_delta_xy...")
+    #     delta_obj_local = np.zeros((_, T, 3))
+    #     delta_obj_local[..., :2] = traj_delta_obj_xy
+    #     delta_obj_global = (R_ref_yaw[:, None, :, :] @ delta_obj_local[..., None]).squeeze(-1)
+    #     obj_pos_world[..., :2] = obj_global_anchor[:, None, :2] + delta_obj_global[..., :2]
 
     # --------------------------------------------------
     # Velocities (optional)

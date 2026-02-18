@@ -90,6 +90,8 @@ class MjVisualizer():
         # Get guidance arrow mocap id
         arrow_mocap_id = -1
         if guidance_vec is not None:
+            if guidance_vec.shape[-1] == 2:
+                guidance_vec = np.pad(guidance_vec, [(0,0), (0,1)], mode='constant')  # add z=0 for 2D guidance
             try:
                 arrow_body_id = mujoco.mj_name2id(self.mj_model, mujoco.mjtObj.mjOBJ_BODY, "guidance_arrow")
                 if arrow_body_id >= 0:
