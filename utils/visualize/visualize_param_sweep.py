@@ -51,6 +51,11 @@ def compute_task_params(current_robot_state, current_obj_state, desired_obj_pos)
     # 4. Rotate into Robot Frame (Global -> Local)
     # R_ref_inv is 3x3. world_delta is 3.
     local_delta = R_ref_inv @ world_delta[..., None]
+
+    local_delta_norm = np.linalg.norm(local_delta)
+    
+    if local_delta_norm > 1e-6:
+        local_delta = local_delta / local_delta_norm
     
     return local_delta[..., :3, 0] 
 
