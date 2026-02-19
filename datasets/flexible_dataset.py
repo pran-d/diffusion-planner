@@ -49,6 +49,7 @@ class FlexibleWindowDataset(Dataset):
         # Default feature order if not provided
         self.feature_order = feature_order or [
             "delta_xy", "delta_yaw",
+            "obj_delta_xy",
             "joints", "body_z", "body_rot6d",
             "obj_rel_pos", "obj_rel_rot6d",
         ]
@@ -99,6 +100,7 @@ class FlexibleWindowDataset(Dataset):
         
         # 1. Index dataset (determine B, T for all files)
         self.indices = []
+        self.traj_lengths = []
         self._index_dataset()
         
         # 2. Preload processed data to RAM (Speed Optimization for small-medium datasets)
@@ -219,8 +221,9 @@ class FlexibleWindowDataset(Dataset):
                     
                     # Apply downsampling effectively reduces T
                     T_down = T // self.downsample
-
                     T_padded = T_down + 1
+                    self.traj_lengths.append(T_down)
+                    
                     w_size = self.window_size + self.history_size
                     num_windows = T_padded - w_size + 1
                     
@@ -229,7 +232,7 @@ class FlexibleWindowDataset(Dataset):
                         for b in range(B):
                             for s in starts:
                                 self.indices.append((i, b, s))
-                            
+
             except Exception as e:
                 print(f"Error indexing {fpath}: {e}")
         print(f"Indexed {len(self.indices)} windows.")

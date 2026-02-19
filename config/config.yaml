@@ -1,6 +1,6 @@
 auto_conf: False
-resume: True
-resume_checkpoint: 10
+resume: False
+resume_checkpoint: 60
 
 model:
   type: "dfot"
@@ -9,7 +9,7 @@ model:
   state_condition: True
   task_condition: True
   external_cond_dropout: 0.05
-  hidden_size: 128
+  hidden_size: 256
   depth: 6
   num_heads: 4
   mlp_ratio: 2.0
@@ -32,18 +32,18 @@ data:
   # train_path: "datasets/xml_29dof/rl_test"
   # task_list_path: "test_datasets/chosen_tasks_test.yml"
   dataset_class: "flexible"
-  batch_size: 4096
-  num_features: 48
+  batch_size: 512
+  num_features: 50
   num_task_params: 3
   num_observations: 45
   start_timestep: 0
-  num_timesteps: 1
+  num_timesteps: 25
   state_history: 1
 
 training:
   save_dir: "./runs/"
   log_dir: "./logs/"
-  suffix: "_all_motions"
+  suffix: "_redundant_no_obs_noise"
   num_epochs: 10000
   batches_per_epoch: 256
   balance_task_density: False
@@ -53,7 +53,7 @@ training:
     state: 0.1
     task: 0.2
   add_obs_noise: False
-  add_goal_noise: False
+  add_goal_noise: True
   state_conditioning_noise_level:
     joints: 0.005
     body_z: 0.005

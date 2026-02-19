@@ -139,7 +139,7 @@ def main():
     parser = argparse.ArgumentParser(description="Clean Inference & Stitching Pipeline")
     parser.add_argument("--epoch", type=str, required=True, help="Checkpoint epoch or path")
     parser.add_argument("--num_samples", type=int, default=1)
-    parser.add_argument("--stitch_steps", type=int, default=1)
+    parser.add_argument("--stitch_steps", type=int, default=None, help="Number of autoregressive segments to generate")
     parser.add_argument("--save_path", type=str, default="results/inference.npy")
     parser.add_argument("--sample_idx", type=int, default=0, help="Initial condition index (Overridden if traj_idx is set)")
     parser.add_argument("--traj_idx", type=int, default=None, help="Trajectory (file) index")
@@ -150,6 +150,8 @@ def main():
     parser.add_argument("--task_params", nargs="+", type=float, default=None, help="Custom task parameters (e.g., --task_params 0.5 -0.2)")
     parser.add_argument("--visualize_dataset", action="store_true", help="Whether to visualize the original dataset trajectory instead of the generated one")
     parser.add_argument("--action_horizon", type=int, default=None, help="Number of future steps to visualize/control (for dataset visualization)")
+    parser.add_argument("--end_error_threshold", type=float, default=0.1, help="End error threshold for stitching")
+    
     # Guidance arguments
     parser.add_argument("--guidance_wt", type=float, default=0.0, help="Test-time gradient guidance strength")
     parser.add_argument("--guidance_goal", nargs="+", type=float, default=None, help="Target values for guidance (normalized)")
@@ -228,6 +230,10 @@ def main():
 
     curr_state_tens = curr_state.unsqueeze(0).repeat(args.num_samples, 1, 1)
 
+    if args.stitch_steps is None:
+        args.stitch_steps = dataset.traj_lengths[args.traj_idx] // data_cfg["num_timesteps"] 
+        print(f"Auto-setting stitch_steps to {args.stitch_steps} based on dataset length.")
+
     # 5. Autoregressive Loop
     for step in range(args.stitch_steps):
         print(f"Generating segment {step+1}/{args.stitch_steps}...")
@@ -288,7 +294,7 @@ def main():
 
         # Desired Displacement (From Ground Truth Full Trajectory)                    
         err = np.linalg.norm(current_anchors["final_obj_pos"] - segment_world[:, -1, 36:39])
-        if err < 0.25:
+        if err < args.end_error_threshold and not args.visualize_dataset:
             print(f"Segment {step+1} successfully reached the goal (Error: {err:.4f}).")
             break
 
@@ -325,7 +331,7 @@ def main():
         start_obj = full_trajectory[0, 0, 36:39]
         end_obj = full_trajectory[0, -1, 36:39]
         achieved_displacement = (end_obj - start_obj)
-        desired_displacement = current_anchors["final_obj_pos"] - current_anchors["ref_obj_pos"]
+        desired_displacement = current_anchors["final_obj_pos"] - anchor["ref_obj_pos"]
         try:            
             print("-" * 30)
             print(f"Goal: Full Trajectory Displacement")
