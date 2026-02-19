@@ -234,6 +234,10 @@ def main():
         args.stitch_steps = dataset.traj_lengths[args.traj_idx] // data_cfg["num_timesteps"] 
         print(f"Auto-setting stitch_steps to {args.stitch_steps} based on dataset length.")
 
+    if args.action_horizon is not None:
+        args.stitch_steps *= (data_cfg["num_timesteps"] // args.action_horizon)
+        print(f"Adjusting stitch_steps to {args.stitch_steps} based on action horizon")
+
     # 5. Autoregressive Loop
     for step in range(args.stitch_steps):
         print(f"Generating segment {step+1}/{args.stitch_steps}...")
@@ -277,8 +281,8 @@ def main():
         r_world, o_world = res[0], res[1]
 
         if args.action_horizon is not None:
-            r_world = r_world[:, :args.action_horizon, :]
-            o_world = o_world[:, :args.action_horizon, :]
+            r_world = r_world[:, 1:args.action_horizon+1, :]
+            o_world = o_world[:, 1:args.action_horizon+1, :]
         
         # Store Segment
         # Robot(36) + Object(7)

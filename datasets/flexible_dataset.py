@@ -415,10 +415,10 @@ class FlexibleWindowDataset(Dataset):
         for key in self.feature_order:
             if key in features:                
                 part = torch.from_numpy(features[key]).float()
+                part = self._normalize(key, part)
                 if self.add_noise:
                     history_slice = part[:self.history_size] 
                     part[:self.history_size] = self._add_obs_noise(history_slice, key)
-                part = self._normalize(key, part)
                 window_parts.append(part)
             else:
                 raise ValueError(f"Feature {key} needed but not computed.")

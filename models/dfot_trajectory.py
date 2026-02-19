@@ -3,7 +3,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from diffusion_forcing_transformer.guidance_functions import guidance_goal_mse, guidance_smoothness
 from diffusion_forcing_transformer.discrete_diffusion import DiscreteDiffusion
-from diffusion_forcing_transformer.history_guidance import HistoryGuidance
+
 from diffusion_forcing_transformer.torch_utils import bernoulli_tensor
 from typing import Optional, Callable, Tuple, Dict
 from functools import partial
@@ -337,7 +337,7 @@ class DFoTTrajectory(nn.Module):
         }
         return output_dict
 
-    def sample(self, num_trajectories, model_cond=None, cfg_w=0.0, guidance_wt=1.0, guidance_goal=None, inpaint=False):
+    def sample(self, num_trajectories, model_cond=None, cfg_w=0.0, guidance_wt=1.0, guidance_goal=None, inpaint=False, no_state_cond=False):
         """
         Sampling method.
         """
@@ -369,6 +369,11 @@ class DFoTTrajectory(nn.Module):
         cond_list = []
         if self.state_condition and state_cond_input is not None:
             s_cond = self.state_embedding(state_cond_input) # (B, C)
+            if no_state_cond:
+                s_cond = apply_condition_dropout(
+                    s_cond, 
+                    1.0
+                )
             cond_list.append(s_cond)
         if self.task_condition and task_cond is not None:
             t_cond = self.task_embedding(task_cond) # (B, D)
@@ -467,7 +472,6 @@ class DFoTTrajectory(nn.Module):
         guidance_fn: Optional[Callable] = None,
         guidance_goal: Optional[torch.Tensor] = None,
         guidance_wt: float = 1.0,
-        history_guidance: Optional[HistoryGuidance] = None,
         return_all: bool = False,
         pbar: Optional[tqdm] = None,
         inpaint: bool = False,
@@ -494,13 +498,6 @@ class DFoTTrajectory(nn.Module):
         context_mask = torch.zeros(
             (batch_size, horizon), dtype=torch.long, device=xs_pred.device
         )
-
-        if history_guidance is None:
-            # by default, use conditional sampling
-            history_guidance = HistoryGuidance.conditional(
-                timesteps=self.timesteps,
-                visualize=False
-            )
 
         # generate scheduling matrix
         scheduling_matrix = self._generate_scheduling_matrix(
@@ -544,54 +541,30 @@ class DFoTTrajectory(nn.Module):
             )
 
             external_conditions_mask[..., -self.task_dim:] = 1.0
-            
-            with history_guidance(context_mask) as history_guidance_manager:
-                nfe = history_guidance_manager.nfe
-                pbar.set_postfix(NFE=nfe)
-                xs_pred, from_noise_levels, to_noise_levels, _ = (
-                    history_guidance_manager.prepare(
-                        xs_pred,
-                        from_noise_levels,
-                        to_noise_levels,
-                        replacement_fn=self.diffusion_model.q_sample,
-                        replacement_only=self.is_full_sequence,
-                    )
-                )
 
-                # update xs_pred by DDIM or DDPM sampling
-                xs_pred = self.diffusion_model.sample_step(
-                    xs_pred,
-                    from_noise_levels,
-                    to_noise_levels,
-                    (
-                        repeat(
-                            conditions,
-                            "b ... -> (b nfe) ...",
-                            nfe=nfe,
-                        ).clone()
-                        if conditions is not None
-                        else None
-                    ),
-                    external_conditions_mask,
-                    guidance_fn=guidance_fn,
-                    guidance_goal=guidance_goal,
-                    guidance_wt=guidance_wt,
-                    cfg_w=cfg_w,
-                )
+            xs_pred = self.diffusion_model.sample_step(
+                xs_pred,
+                from_noise_levels,
+                to_noise_levels,
+                conditions,
+                external_conditions_mask,
+                guidance_fn=guidance_fn,
+                guidance_goal=guidance_goal,
+                guidance_wt=guidance_wt,
+                cfg_w=cfg_w,
+            )
 
-                if task_cond is not None:
-                    if task_cond.ndim == 1:
-                        # (D) -> (1, D)
-                        tc = task_cond.unsqueeze(0)
-                    else:
-                        tc = task_cond
+            if task_cond is not None:
+                if task_cond.ndim == 1:
+                    # (D) -> (1, D)
+                    tc = task_cond.unsqueeze(0)
+                else:
+                    tc = task_cond
 
-                    tc = tc.to(xs_pred.device, dtype=xs_pred.dtype)
-                    
-                    if inpaint:
-                        xs_pred[..., -1, 3:5] = tc
-
-                xs_pred = history_guidance_manager.compose(xs_pred)
+                tc = tc.to(xs_pred.device, dtype=xs_pred.dtype)
+                
+                if inpaint:
+                    xs_pred[..., -1, 3:6] = tc
             
             pbar.update(1)
 
