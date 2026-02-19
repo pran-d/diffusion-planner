@@ -10,46 +10,7 @@ from scipy.spatial.transform import Slerp
 from config.configure import load_config, get_data_path, get_norm_path
 from models.model import RobotDiffuser
 from datasets.flexible_dataset import FlexibleWindowDataset, yaw_to_rot_matrix, yaw_from_quat
-from utils.math.sbto_utils import reconstruct_sbto_trajectory
-
-def compute_task_params(current_robot_state, current_obj_state, desired_obj_pos):
-    """
-    Computes the task parameters (local object displacement) for the diffusion model.
-
-    Args:
-        current_robot_state (np.ndarray): Shape (7,) or (3,) [x, y, z, qx, qy, qz, qw]
-                                          representing the robot base pose.
-        current_obj_state (np.ndarray): Shape (3,) or (7,) [x, y, z, ...]
-                                        representing the current object position.
-        desired_obj_pos (np.ndarray): Shape (3,) [x, y, z] 
-                                      representing the GOAL object position in world frame.
-
-    Returns:
-        np.ndarray: Shape (2,) [delta_x_local, delta_y_local] normalized if needed.
-    """
-    # 1. Extract Positions
-    curr_obj_pos = current_obj_state[:3]  # We only care about X, Y for displacement
-    goal_obj_pos = desired_obj_pos[:3]
-    
-    # 2. Calculate World Displacement
-    world_delta = goal_obj_pos - curr_obj_pos
-    
-    # 3. Extract Robot Yaw
-    if len(current_robot_state) >= 7:
-        quat = current_robot_state[3:7]
-    else:
-        quat = current_robot_state
-    R_ref_inv = yaw_to_rot_matrix(-yaw_from_quat(quat))
-
-    # 4. Rotate into Robot Frame (Global -> Local)
-    local_delta = (R_ref_inv @ world_delta[..., None])[..., 0]
-
-    # local_delta_norm = np.linalg.norm(local_delta)
-    
-    # if local_delta_norm > 1e-6:
-    #     local_delta = local_delta / local_delta_norm
-    
-    return local_delta
+from utils.math.sbto_utils import reconstruct_sbto_trajectory, compute_task_params
 
 def update_condition(dataset, robot_world_history, obj_world_history, final_obj_pos=None):
     """
@@ -218,7 +179,7 @@ def main():
 
     # Override task params if provided
     if args.task_params is not None:
-        print(f"Overriding task params with: {args.task_params}")
+        print(f"Overriding final box pos {anchor['final_obj_pos']} with: {args.task_params}")
         anchor["final_obj_pos"] = torch.tensor(args.task_params, dtype=torch.float32)
 
     current_anchors = {
@@ -245,7 +206,8 @@ def main():
         tp_init = compute_task_params(
             current_robot_state=current_anchors['ref_quat'], 
             current_obj_state=current_anchors['ref_obj_pos'], 
-            desired_obj_pos=current_anchors["final_obj_pos"]
+            desired_obj_pos=current_anchors["final_obj_pos"],
+            normalize_goal_vec=data_cfg.get("normalize_goal_vec", False),
         )[..., :data_cfg["num_task_params"]]
         task_params = dataset._normalize("task_params", tp_init)
         task_tens = task_params.repeat(args.num_samples, 1)
@@ -336,7 +298,7 @@ def main():
         start_obj = full_trajectory[0, 0, 36 : 36 + data_cfg["num_task_params"]]
         end_obj = full_trajectory[0, -1, 36 : 36 + data_cfg["num_task_params"]]
         achieved_displacement = (end_obj - start_obj)[..., :data_cfg['num_task_params']]
-        desired_displacement = (current_anchors["final_obj_pos"] - anchor["ref_obj_pos"])[..., :data_cfg['num_task_params']]
+        desired_displacement = (anchor["final_obj_pos"] - anchor["ref_obj_pos"])[..., :data_cfg['num_task_params']]
         try:            
             print("-" * 30)
             print(f"Goal: Full Trajectory Displacement")

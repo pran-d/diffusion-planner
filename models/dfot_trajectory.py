@@ -151,6 +151,10 @@ class DFoTTrajectory(nn.Module):
             "beta_schedule": beta_schedule,
             "schedule_fn_kwargs": {"shift": 1.0},
             "objective": objective,
+            # "loss_weighting": {
+            #     "strategy": "goal-weighted",
+            #     "final_frame_weight": 5.0,
+            # },
             "loss_weighting": {
                 "strategy": "fused_min_snr",
                 "snr_clip": 5.0,

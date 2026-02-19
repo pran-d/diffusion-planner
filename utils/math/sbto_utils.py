@@ -672,3 +672,42 @@ def compute_guidance_vec(current_pos, target_pos, R_robot_yaw_inv, current_rot=N
         return np.concatenate([guidance_dir, guidance_rot6d, dist], axis=-1).squeeze(1)
 
     return np.concatenate([guidance_dir, dist], axis=-1).squeeze(1)
+
+def compute_task_params(current_robot_state, current_obj_state, desired_obj_pos, normalize_goal_vec=True):
+    """
+    Computes the task parameters (local object displacement) for the diffusion model.
+
+    Args:
+        current_robot_state (np.ndarray): Shape (7,) or (3,) [x, y, z, qx, qy, qz, qw]
+                                          representing the robot base pose.
+        current_obj_state (np.ndarray): Shape (3,) or (7,) [x, y, z, ...]
+                                        representing the current object position.
+        desired_obj_pos (np.ndarray): Shape (3,) [x, y, z] 
+                                      representing the GOAL object position in world frame.
+
+    Returns:
+        np.ndarray: Shape (2,) [delta_x_local, delta_y_local] normalized if needed.
+    """
+    # 1. Extract Positions
+    curr_obj_pos = current_obj_state[:3]  # We only care about X, Y for displacement
+    goal_obj_pos = desired_obj_pos[:3]
+    
+    # 2. Calculate World Displacement
+    world_delta = goal_obj_pos - curr_obj_pos
+    
+    # 3. Extract Robot Yaw
+    if len(current_robot_state) >= 7:
+        quat = current_robot_state[3:7]
+    else:
+        quat = current_robot_state
+    R_ref_inv = yaw_to_rot_matrix(-yaw_from_quat(quat))
+
+    # 4. Rotate into Robot Frame (Global -> Local)
+    local_delta = (R_ref_inv @ world_delta[..., None])[..., 0]
+
+    if normalize_goal_vec:    
+        local_delta_norm = np.linalg.norm(local_delta)
+        if local_delta_norm > 1e-6:
+            local_delta = local_delta / local_delta_norm
+    
+    return local_delta

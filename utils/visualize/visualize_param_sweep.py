@@ -10,46 +10,7 @@ import matplotlib.cm as cm
 from config.configure import load_config, get_data_path, get_norm_path
 from models.model import RobotDiffuser
 from datasets.flexible_dataset import FlexibleWindowDataset, yaw_to_rot_matrix, yaw_from_quat
-from utils.math.sbto_utils import reconstruct_sbto_trajectory
-
-def compute_task_params(current_robot_state, current_obj_state, desired_obj_pos):
-    """
-    Computes the task parameters (local object displacement) for the diffusion model.
-
-    Args:
-        current_robot_state (np.ndarray): Shape (7,) or (3,) [x, y, z, qx, qy, qz, qw]
-                                          representing the robot base pose.
-        current_obj_state (np.ndarray): Shape (3,) or (7,) [x, y, z, ...]
-                                        representing the current object position.
-        desired_obj_pos (np.ndarray): Shape (3,) [x, y, z] 
-                                      representing the GOAL object position in world frame.
-
-    Returns:
-        np.ndarray: Shape (2,) [delta_x_local, delta_y_local] normalized if needed.
-    """
-    # 1. Extract Positions
-    curr_obj_pos = current_obj_state[:3]  # We only care about X, Y for displacement
-    goal_obj_pos = desired_obj_pos[:3]
-    
-    # 2. Calculate World Displacement
-    world_delta = goal_obj_pos - curr_obj_pos
-    
-    # 3. Extract Robot Yaw
-    if len(current_robot_state) >= 7:
-        quat = current_robot_state[3:7]
-    else:
-        quat = current_robot_state
-    R_ref_inv = yaw_to_rot_matrix(-yaw_from_quat(quat))
-
-    # 4. Rotate into Robot Frame (Global -> Local)
-    local_delta = (R_ref_inv @ world_delta[..., None])[..., 0]
-
-    # local_delta_norm = np.linalg.norm(local_delta)
-    
-    # if local_delta_norm > 1e-6:
-    #     local_delta = local_delta / local_delta_norm
-    
-    return local_delta
+from utils.math.sbto_utils import reconstruct_sbto_trajectory, compute_task_params
 
 def update_condition(dataset, robot_world_history, obj_world_history, final_obj_pos=None):
     """
@@ -136,7 +97,7 @@ def parse_args():
     # Dataset Task Params
     parser.add_argument("--num_dataset_tasks", type=int, default=0, help="Number of tasks to sample from dataset (In-Distribution)")
     parser.add_argument("--num_ood_tasks", type=int, default=0, help="Number of out-of-distribution tasks to generate (Random/Grid)")
-    parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--seed", type=int, default=None)
 
     # Guidance
     parser.add_argument("--guidance_wt", type=float, default=0.0)
@@ -180,7 +141,10 @@ def run_evaluation_batch(
             c_obj = current_anchors['ref_obj_pos'][bi]
             c_goal = current_anchors['final_obj_pos'][bi]
             
-            tp = compute_task_params(c_quat, c_obj, c_goal)[..., :diffuser.data_cfg["num_task_params"]] # (2,) or (3,) depending on impl
+            tp = compute_task_params(
+                c_quat, c_obj, c_goal,
+                normalize_goal_vec=dataset.data_cfg.get("normalize_goal_vec", False)
+            )[..., :diffuser.data_cfg["num_task_params"]] # (2,) or (3,) depending on impl
             new_task_list.append(tp)
         
         new_task_arr = np.stack(new_task_list)

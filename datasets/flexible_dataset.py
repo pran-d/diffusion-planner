@@ -4,7 +4,6 @@ import os
 import glob
 import re
 import yaml
-import collections
 from torch.utils.data import Dataset
 from tqdm import tqdm
 
@@ -42,6 +41,7 @@ class FlexibleWindowDataset(Dataset):
         self.stride = config.get("stride", 1)
         self.downsample = config.get("downsample", 1)
         self.start_timestep = config.get("start_timestep", 0)
+        self.normalize_goal_vec = config.get("normalize_goal_vec", True)
 
         self.add_noise = add_noise
         self.add_goal_noise = add_goal_noise
@@ -322,9 +322,10 @@ class FlexibleWindowDataset(Dataset):
             disp_vector_global = (obj_traj[-1, :3] - obj_traj[start_idx, :3])
             R_ref_inv = yaw_to_rot_matrix(-yaw_from_quat(base_traj[start_idx, 3:]))
             disp_vector = (R_ref_inv @ disp_vector_global)[:2] # (2,)
-            # disp_vector_norm = np.linalg.norm(disp_vector)
-            # if disp_vector_norm > 1e-6:
-            #     disp_vector = disp_vector / disp_vector_norm
+            if self.normalize_goal_vec:
+                disp_vector_norm = np.linalg.norm(disp_vector)
+                if disp_vector_norm > 1e-6:
+                    disp_vector = disp_vector / disp_vector_norm
             return disp_vector
         return np.zeros(2)
 
@@ -432,10 +433,9 @@ class FlexibleWindowDataset(Dataset):
         future_states = window_tensor[self.history_size:, :].clone()
 
         task_params = torch.from_numpy(features["task_params"]).float()
-
+        task_params = self._normalize("task_params", task_params)
         if self.add_goal_noise:
             task_params = self._add_obs_noise(task_params, "task_params")
-        task_params = self._normalize("task_params", task_params)
 
         return future_states, current_state, task_params, anchor
 

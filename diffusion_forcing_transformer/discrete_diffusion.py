@@ -241,6 +241,10 @@ class DiscreteDiffusion(nn.Module):
     ) -> torch.Tensor:
         if strategy == "uniform":
             return torch.ones_like(k)
+        if strategy == "goal-weighted":
+            weights = torch.ones_like(k)
+            weights[..., -1] = weights[..., -1] * self.loss_weighting.final_frame_weight
+            return weights
         snr = self.snr[k]
         epsilon_weighting = None
         match strategy:

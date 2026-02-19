@@ -4,3 +4,5 @@ logs/
 runs/
 results/
 *.npz
+*.png
+*.npy
