@@ -34,7 +34,7 @@ training:
   save_dir: "./runs/ablations/exp1/"
   log_dir: "./logs/ablations/exp1/"
   suffix: ""
-  num_epochs: 10000
+  num_epochs: 5000
   batches_per_epoch: 256
   balance_task_density: False
   learning_rate: 0.0005

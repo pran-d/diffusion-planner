@@ -12,20 +12,27 @@ import sys
 
 ABLATIONS = [
 
-    DiT Baseline (750 iterations/epochs)
     (
-        "config/ablations/auto_generated/config_dit.yaml",
-        "Baseline DiT Model"
+        "config/ablations/timesteps/config_1.yaml",
+        "1 time-step in future"
     ),
 
-    # UNet Ablation (750 iterations/epochs)
     (
-        "config/ablations/auto_generated/config_unet.yaml",
-        "UNet Model (Parameter matched)"
+        "config/ablations/timesteps/config_5.yaml",
+        "5 time-steps in future"
+    ),
+
+    (
+        "config/ablations/timesteps/config_10.yaml",
+        "10 time-steps in future"
+    ),
+
+    (
+        "config/ablations/timesteps/config_20.yaml",
+        "20 time-steps in future"
     ),
 
 ]
-
 # =============================================================================
 # SCRIPT LOGIC
 # =============================================================================

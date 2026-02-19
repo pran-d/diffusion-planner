@@ -340,7 +340,39 @@ for epoch in range(starting_epoch, num_epochs):
 
     window_mean = np.mean(epoch_losses_history[-window_size:])
     print(f"Epoch [{epoch}/{num_epochs-1}] - Mean Loss: {window_mean:.5f}")
-    if epoch % training_cfg.get("save_every", 50) == 0:
+
+    # ===============================
+    # Early Stopping Check
+    # ===============================
+    patience = 75
+    target_loss = 0.0025  # Threshold for "low loss" (tune based on your problem)
+    stagnation_std = 5e-4  # Threshold for "roughly stagnant" (tune if needed)
+
+    if len(epoch_losses_history) >= patience:
+        last_50_losses = epoch_losses_history[-patience:]
+        recent_mean = np.mean(last_50_losses)
+        recent_std = np.std(last_50_losses)
+        
+        # Check condition: Loss is low AND variance is practically flat
+        if recent_mean < target_loss and recent_std < stagnation_std:
+            print(f"\n--- Early Stopping Triggered at Epoch {epoch} ---")
+            print(f"Condition met: Loss is below {target_loss} (Recent Mean: {recent_mean:.5f})")
+            print(f"Condition met: Loss is stagnant over last {patience} epochs (Std: {recent_std:.6f})")
+            
+            # Save a final definitive checkpoint before breaking
+            checkpoint = {
+                "model": diffuser.model.state_dict(),
+                "optimizer": optimizer.state_dict(),
+                "scaler": scaler.state_dict(),
+                "scheduler": scheduler.state_dict()
+            }
+            torch.save(checkpoint, f"{save_dir}/model_{epoch}_early_stop.pth")
+            break
+    
+    # ===============================
+    # Regular Checkpoint Saving
+    # ===============================
+    if epoch % training_cfg.get("save_every", 50) == 0 or epoch == num_epochs - 1:
         checkpoint = {
             "model": diffuser.model.state_dict(),
             "optimizer": optimizer.state_dict(),
