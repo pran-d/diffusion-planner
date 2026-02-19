@@ -13,7 +13,7 @@ data:
   num_task_params: 2
   num_observations: 45
   start_timestep: 0
-  num_timesteps: 10
+  num_timesteps: 20
   state_history: 1
   normalize_goal_vec: True
 
@@ -31,10 +31,10 @@ model:
   pos_emb_type: "sinusoidal_1d"
 
 training:
-  save_dir: "./runs/"
-  log_dir: "./logs/"
-  suffix: "_redundant"
-  num_epochs: 5000
+  save_dir: "./runs/ablations/exp1/"
+  log_dir: "./logs/ablations/exp1/"
+  suffix: ""
+  num_epochs: 10000
   batches_per_epoch: 256
   balance_task_density: False
   learning_rate: 0.0005
