@@ -321,12 +321,12 @@ class FlexibleWindowDataset(Dataset):
         if obj_traj.shape[0] > 0:
             disp_vector_global = (obj_traj[-1, :3] - obj_traj[start_idx, :3])
             R_ref_inv = yaw_to_rot_matrix(-yaw_from_quat(base_traj[start_idx, 3:]))
-            disp_vector = (R_ref_inv @ disp_vector_global)[:3] # (2,)
-            disp_vector_norm = np.linalg.norm(disp_vector)
-            if disp_vector_norm > 1e-6:
-                disp_vector = disp_vector / disp_vector_norm
+            disp_vector = (R_ref_inv @ disp_vector_global)[:2] # (2,)
+            # disp_vector_norm = np.linalg.norm(disp_vector)
+            # if disp_vector_norm > 1e-6:
+            #     disp_vector = disp_vector / disp_vector_norm
             return disp_vector
-        return np.zeros(3)
+        return np.zeros(2)
 
     def _normalize(self, key, val):
         min_k = self.stats.get(f"min_{key}")

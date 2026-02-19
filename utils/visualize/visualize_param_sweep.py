@@ -44,12 +44,12 @@ def compute_task_params(current_robot_state, current_obj_state, desired_obj_pos)
     # 4. Rotate into Robot Frame (Global -> Local)
     local_delta = (R_ref_inv @ world_delta[..., None])[..., 0]
 
-    local_delta_norm = np.linalg.norm(local_delta)
+    # local_delta_norm = np.linalg.norm(local_delta)
     
-    if local_delta_norm > 1e-6:
-        local_delta = local_delta / local_delta_norm
+    # if local_delta_norm > 1e-6:
+    #     local_delta = local_delta / local_delta_norm
     
-    return local_delta[..., :3]
+    return local_delta
 
 def update_condition(dataset, robot_world_history, obj_world_history, final_obj_pos=None):
     """
@@ -180,7 +180,7 @@ def run_evaluation_batch(
             c_obj = current_anchors['ref_obj_pos'][bi]
             c_goal = current_anchors['final_obj_pos'][bi]
             
-            tp = compute_task_params(c_quat, c_obj, c_goal) # (2,) or (3,) depending on impl
+            tp = compute_task_params(c_quat, c_obj, c_goal)[..., :diffuser.data_cfg["num_task_params"]] # (2,) or (3,) depending on impl
             new_task_list.append(tp)
         
         new_task_arr = np.stack(new_task_list)
@@ -406,13 +406,13 @@ def main():
             anchors['ref_obj_pos'].append(anchor['ref_obj_pos'])
             anchors['final_obj_pos'].append(final_pos)
             
-            gt_deltas.append((final_pos - anchor['ref_obj_pos'][:3])[:2])
+            gt_deltas.append((final_pos - anchor['ref_obj_pos'])[:data_cfg["num_task_params"]])
 
         # Prepare Batch
         initial_states = torch.stack(initial_states) # (N, C)
         anchors_arr = {k: np.stack(v) for k, v in anchors.items()}
         # Initial dummy task
-        dummy_task = torch.zeros(args.num_dataset_tasks, 2)
+        dummy_task = torch.zeros(args.num_dataset_tasks, data_cfg["num_task_params"])
         
         # Run Eval
         traj_w, gen_displacements = run_evaluation_batch(
@@ -423,7 +423,7 @@ def main():
         
         # Stats
         gt_deltas = np.array(gt_deltas)
-        gen_deltas = gen_displacements[:, :2]
+        gen_deltas = gen_displacements[:, :data_cfg["num_task_params"]]
         errors = np.linalg.norm(gt_deltas - gen_deltas, axis=1)
         
         print(f"Dataset Tasks (State Cond ON): Mean Error: {np.mean(errors):.4f}, Std: {np.std(errors):.4f}")
@@ -438,6 +438,12 @@ def main():
         plt.axis('equal')
         plt.grid(True)
         plt.legend()
+
+        max_val = np.max(np.concatenate([np.abs(gt_deltas[:, 0]), np.abs(gt_deltas[:, 1])])) * 1.1 # 10% buffer
+
+        plt.xlim(-max_val, max_val)
+        plt.ylim(-max_val, max_val)
+        
         plt.savefig("eval_dataset_tasks.png")
 
         # Plot Trajectories
@@ -461,7 +467,7 @@ def main():
         
         # Generate Random Displacements (OOD)
         # Range: +/- 0.5 meters?
-        random_deltas = (np.random.rand(args.num_ood_tasks, 2) - 0.5) * 1.0 
+        random_deltas = (np.random.rand(args.num_ood_tasks, data_cfg["num_task_params"]) - 0.5) * 1.0 
         
         target_deltas = []
 
@@ -469,11 +475,11 @@ def main():
             _, curr_state, _, anchor = dataset[idx]
             
             # Construct Target
-            start_pos = anchor['ref_obj_pos'][:3]
+            start_pos = anchor['ref_obj_pos'][:data_cfg["num_task_params"]]
             # Convert random delta (generic XY) to target world pos
             # We treat random delta as WORLD frame delta for simplicity of target generation
             target_pos = start_pos.copy()
-            target_pos[:2] += random_deltas[i]
+            target_pos[:data_cfg["num_task_params"]] += random_deltas[i]
             
             initial_states.append(curr_state)
             anchors['ref_pos'].append(anchor['ref_pos'])
@@ -485,7 +491,7 @@ def main():
 
         initial_states = torch.stack(initial_states)
         anchors_arr = {k: np.stack(v) for k, v in anchors.items()}
-        dummy_task = torch.zeros(args.num_ood_tasks, 2)
+        dummy_task = torch.zeros(args.num_ood_tasks, data_cfg["num_task_params"])
         
         # Run Eval with use_state_cond=FALSE
         traj_w, gen_displacements = run_evaluation_batch(
@@ -495,7 +501,7 @@ def main():
         )
         
         target_deltas = np.array(target_deltas)
-        gen_deltas = gen_displacements[:, :2]
+        gen_deltas = gen_displacements[:, :data_cfg["num_task_params"]]
         errors = np.linalg.norm(target_deltas - gen_deltas, axis=1)
         
         print(f"OOD Tasks (State Cond OFF): Mean Error: {np.mean(errors):.4f}, Std: {np.std(errors):.4f}")

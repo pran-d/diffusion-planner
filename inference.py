@@ -44,12 +44,12 @@ def compute_task_params(current_robot_state, current_obj_state, desired_obj_pos)
     # 4. Rotate into Robot Frame (Global -> Local)
     local_delta = (R_ref_inv @ world_delta[..., None])[..., 0]
 
-    local_delta_norm = np.linalg.norm(local_delta)
+    # local_delta_norm = np.linalg.norm(local_delta)
     
-    if local_delta_norm > 1e-6:
-        local_delta = local_delta / local_delta_norm
+    # if local_delta_norm > 1e-6:
+    #     local_delta = local_delta / local_delta_norm
     
-    return local_delta[..., :3]
+    return local_delta
 
 def update_condition(dataset, robot_world_history, obj_world_history, final_obj_pos=None):
     """
@@ -246,7 +246,7 @@ def main():
             current_robot_state=current_anchors['ref_quat'], 
             current_obj_state=current_anchors['ref_obj_pos'], 
             desired_obj_pos=current_anchors["final_obj_pos"]
-        ) 
+        )[..., :data_cfg["num_task_params"]]
         task_params = dataset._normalize("task_params", tp_init)
         task_tens = task_params.repeat(args.num_samples, 1)
         
@@ -291,13 +291,14 @@ def main():
     
         # Denormalize task params before transforming to global frame
         task_denorm = dataset._denormalize("task_params", task_tens) # (B, 2)
-        # task_denorm_3d = torch.cat([task_denorm, torch.zeros_like(task_denorm[:, :1])], dim=1)[..., None] # (B, 3)
-        task_denorm_3d = task_denorm[..., None]
-        goal_vec_global = (yaw_to_rot_matrix(yaw_from_quat(current_anchors['ref_quat'])) @ task_denorm_3d.cpu().numpy())[..., :3, 0] # (B, 3)        
+        if task_denorm.shape[1] < 3:
+            task_denorm = torch.cat([task_denorm, torch.zeros_like(task_denorm[:, :1])], dim=1)
+        task_denorm_3d = task_denorm[..., None] # (B, 3)
+        goal_vec_global = (yaw_to_rot_matrix(yaw_from_quat(current_anchors['ref_quat'])) @ task_denorm_3d.cpu().numpy())[..., :data_cfg["num_task_params"], 0] # (B, 3)        
         goal_vectors.append(goal_vec_global.repeat(segment_world.shape[1], 0)) # (B, 3)
 
         # Desired Displacement (From Ground Truth Full Trajectory)                    
-        err = np.linalg.norm(current_anchors["final_obj_pos"] - segment_world[:, -1, 36:39])
+        err = np.linalg.norm(current_anchors["final_obj_pos"][..., :data_cfg["num_task_params"]] - segment_world[:, -1, 36 : 36 + data_cfg["num_task_params"]])
         if err < args.end_error_threshold and not args.visualize_dataset:
             print(f"Segment {step+1} successfully reached the goal (Error: {err:.4f}).")
             break
@@ -329,18 +330,18 @@ def main():
     np.save(args.save_path, full_trajectory)
     print(f"Stitched trajectory saved to {args.save_path} (Shape: {full_trajectory.shape})")
     
-    # Object indices: 36:39 (pos), 39:43 (quat)
-    if full_trajectory.shape[-1] >= 39:
+    # Object indices: 36:38 (pos), 38:42 (quat)
+    if full_trajectory.shape[-1] >= 38:
         # Achieved Displacement
-        start_obj = full_trajectory[0, 0, 36:39]
-        end_obj = full_trajectory[0, -1, 36:39]
-        achieved_displacement = (end_obj - start_obj)
-        desired_displacement = current_anchors["final_obj_pos"] - anchor["ref_obj_pos"]
+        start_obj = full_trajectory[0, 0, 36 : 36 + data_cfg["num_task_params"]]
+        end_obj = full_trajectory[0, -1, 36 : 36 + data_cfg["num_task_params"]]
+        achieved_displacement = (end_obj - start_obj)[..., :data_cfg['num_task_params']]
+        desired_displacement = (current_anchors["final_obj_pos"] - anchor["ref_obj_pos"])[..., :data_cfg['num_task_params']]
         try:            
             print("-" * 30)
             print(f"Goal: Full Trajectory Displacement")
-            print(f"Desired (GT) Delta XY: {desired_displacement[:2]}")
-            print(f"Achieved (Gen) Delta XY: {achieved_displacement[:2]}")
+            print(f"Desired (GT) Delta XY: {desired_displacement}")
+            print(f"Achieved (Gen) Delta XY: {achieved_displacement}")
             err = np.linalg.norm(desired_displacement - achieved_displacement)
             print(f"L2 Error: {err:.4f}")
             print("-" * 30)

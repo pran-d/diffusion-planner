@@ -564,7 +564,7 @@ class DFoTTrajectory(nn.Module):
                 tc = tc.to(xs_pred.device, dtype=xs_pred.dtype)
                 
                 if inpaint:
-                    xs_pred[..., -1, 3:6] = tc
+                    xs_pred[..., -1, 3:3 + tc.shape[-1]] = tc
             
             pbar.update(1)
 

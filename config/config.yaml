@@ -1,6 +1,6 @@
 auto_conf: False
-resume: False
-resume_checkpoint: 40
+resume: True
+resume_checkpoint: 640
 
 data:
   dir_path: "/home/pranish/pranav/diffusion-mp/simple_diffusion/"
@@ -10,10 +10,10 @@ data:
   dataset_class: "flexible"
   batch_size: 80
   num_features: 50
-  num_task_params: 3
+  num_task_params: 2
   num_observations: 45
   start_timestep: 0
-  num_timesteps: 486
+  num_timesteps: 487
   state_history: 1
 
 model:
@@ -33,10 +33,10 @@ training:
   save_dir: "./runs/"
   log_dir: "./logs/"
   suffix: "_redundant"
-  num_epochs: 10000
+  num_epochs: 11000
   batches_per_epoch: 256
   balance_task_density: False
-  learning_rate: 0.0004
+  learning_rate: 0.0005
   save_every: 10
   condition_dropout_prob: 
     state: 0.1
