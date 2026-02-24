@@ -1,34 +1,42 @@
 import numpy as np
 import torch
 import os
-import yaml
 from torch.utils.data import Dataset
 from tqdm import tqdm
 
 from datasets.flexible_dataset import FlexibleWindowDataset
 
+
 class BufferDataset(FlexibleWindowDataset):
     """
-    Dataset that loads trajectories from an in-memory buffer.
-    Buffer can be:
-    1. A dictionary of batched arrays {key: (B, T, ...)}
-    2. A list of dictionaries [{key: (T, ...)}, ...]
+    Dataset that loads trajectories from an in-memory buffer instead of files.
+    Inherits all feature computation, normalization, and windowing from FlexibleWindowDataset.
+
+    Buffer format:
+        - dict of arrays: {key: (B, T, D)} or {key: list of (T, D)}
+        - list of dicts:  [{key: (T, D)}, ...]
+
+    Supported schemas (same as FlexibleWindowDataset):
+        - RL Rollout: body_pos_w, body_quat_w, joint_pos, object_pos_w, object_quat_w
+        - SBTO:       base_xyz_quat, actuator_pos, obj_0_xyz_quat
     """
-    def __init__(self, 
-        data_buffer, 
-        config, 
-        feature_order=None, 
-        norm_path=None, 
-        calculate_stats=True, 
-        noise_cfg=None, 
-        add_noise=False,
-        add_goal_noise=False
-    ):
-        
-        self.data_buffer = data_buffer
+
+    def __init__(self,
+                 data_buffer,
+                 config,
+                 feature_order=None,
+                 norm_path=None,
+                 calculate_stats=True,
+                 noise_cfg=None,
+                 add_noise=False,
+                 add_goal_noise=False):
+
+        # Store raw buffer before any init
+        self._raw_buffer = data_buffer
+
+        # ---- Config (mirrors FlexibleWindowDataset.__init__) ----
+        self.data_root = None
         self.noise_cfg = noise_cfg or {}
-        
-        # Config Copy
         self.num_observations = config.get("num_observations", 45)
         self.num_features = config.get("num_features", 48)
         self.history_size = config.get("state_history", 4)
@@ -36,37 +44,32 @@ class BufferDataset(FlexibleWindowDataset):
         self.stride = config.get("stride", 1)
         self.downsample = config.get("downsample", 1)
         self.start_timestep = config.get("start_timestep", 0)
+        self.normalize_goal_vec = config.get("normalize_goal_vec", True)
+        self.num_task_params = config.get("num_task_params", 2)
+        self.normalization_type = config.get("normalization_type", "mean_std")
+        self.key_mapping = config.get("key_mapping", {})
 
         self.add_noise = add_noise
         self.add_goal_noise = add_goal_noise
-        
+
         self.feature_order = feature_order or [
             "delta_xy", "delta_yaw", "obj_delta_xy",
             "joints", "body_z", "body_rot6d",
-            "obj_rel_pos", "obj_rel_rot6d"
+            "obj_rel_pos", "obj_rel_rot6d",
         ]
 
-        # Standardize data_buffer to dict of iterables (batched arrays or lists)
-        if isinstance(self.data_buffer, list):
-            if len(self.data_buffer) > 0:
-                keys = self.data_buffer[0].keys()
-                # Transpose list of dicts to dict of lists
-                new_buffer = {k: [item.get(k) for item in self.data_buffer] for k in keys}
-                self.data_buffer = new_buffer
-            else:
-                self.data_buffer = {}
-        
-        # Ensure we have a valid dictionary in the end
-        if not isinstance(self.data_buffer, dict):
-            raise ValueError("BufferDataset expects a list of dicts or a dict of batches.")
-
+        # No file paths for buffer dataset
         self.file_paths = []
-             
-        # Index
+
+        # ---- Preload buffer into ram_cache ----
+        self.ram_cache = []
+        self.traj_lengths = []
         self.indices = []
+
+        self._preload_from_buffer()
         self._index_dataset()
-        
-        # Normalization
+
+        # ---- Normalization ----
         self.norm_path = norm_path
         self.stats = {}
         if calculate_stats:
@@ -74,118 +77,190 @@ class BufferDataset(FlexibleWindowDataset):
         elif norm_path and os.path.exists(norm_path):
             self._load_stats()
 
-    def _index_dataset(self):
-        self.indices = []
-        
-        keys = list(self.data_buffer.keys())
-        if not keys: return
-        
-        # Find a representative key to determine batch size / lengths
-        # Prefer known temporal keys to be safe
-        rep_key = keys[0]
-        for k in ['body_pos_w', 'base_xyz_quat', 'joint_pos', 'actuator_pos']:
-            if k in self.data_buffer:
-                rep_key = k
-                break
-        
-        data_coll = self.data_buffer[rep_key]
-        num_trajs = len(data_coll)
+    # ------------------------------------------------------------------
+    # Buffer helpers
+    # ------------------------------------------------------------------
+    def get_k(self, key):
+        return self.key_mapping.get(key, key)
 
-        trajs = []
+    def _standardize_buffer(self):
+        """Normalize buffer into {key: list_of_(T,D)_arrays}."""
+        buf = self._raw_buffer
+
+        if isinstance(buf, list):
+            if len(buf) == 0:
+                return {}
+            keys = buf[0].keys()
+            return {k: [item.get(k) for item in buf] for k in keys}
+
+        if isinstance(buf, dict):
+            standardized = {}
+            # Determine expected batch count from a temporal key
+            num_trajs = None
+            for k in ['body_pos_w', 'base_xyz_quat', 'joint_pos', 'actuator_pos']:
+                if k in buf:
+                    v = buf[k]
+                    if isinstance(v, (list, tuple)):
+                        num_trajs = len(v)
+                    elif isinstance(v, np.ndarray) and v.ndim >= 3:
+                        num_trajs = v.shape[0]
+                    break
+
+            for key, val in buf.items():
+                if isinstance(val, (list, tuple)):
+                    standardized[key] = list(val)
+                elif isinstance(val, np.ndarray):
+                    # Split along batch dim if first dim matches num_trajs
+                    if num_trajs is not None and val.shape[0] == num_trajs and val.ndim >= 2:
+                        standardized[key] = [val[i] for i in range(val.shape[0])]
+                    elif val.ndim >= 3:
+                        standardized[key] = [val[i] for i in range(val.shape[0])]
+                    else:
+                        standardized[key] = [val]
+                elif isinstance(val, torch.Tensor):
+                    val_np = val.cpu().numpy()
+                    if num_trajs is not None and val_np.shape[0] == num_trajs and val_np.ndim >= 2:
+                        standardized[key] = [val_np[i] for i in range(val_np.shape[0])]
+                    elif val_np.ndim >= 3:
+                        standardized[key] = [val_np[i] for i in range(val_np.shape[0])]
+                    else:
+                        standardized[key] = [val_np]
+                else:
+                    standardized[key] = [val]
+            return standardized
+
+        raise ValueError("BufferDataset expects a dict or list of dicts.")
+
+    def _preload_from_buffer(self):
+        """
+        Process data buffer into ram_cache format identical to FlexibleWindowDataset.
+        Each trajectory becomes a separate entry in ram_cache with shape (1, T, D).
+        """
+        std_buf = self._standardize_buffer()
+        if not std_buf:
+            return
+
+        rep_key = list(std_buf.keys())[0]
+        num_trajs = len(std_buf[rep_key])
+        keys = set(std_buf.keys())
+
         for i in range(num_trajs):
-            traj_data = data_coll[i]
-            # Handle both numpy/torch tensors (shape[0]) and lists (len)
-            T = traj_data.shape[0] if hasattr(traj_data, 'shape') else len(traj_data)
-            trajs.append((i, T))
-                
-        # 2. Build Sliding Windows
-        req_len_down = self.window_size // self.downsample
-        
-        for batch_idx, raw_T in trajs:
-            down_T = raw_T // self.downsample
-            
-            if down_T < req_len_down:
+            processed = {}
+
+            # ---- RL Rollout schema ----
+            if 'body_pos_w' in keys or self.get_k('body_pos_w') in keys:
+                pos_key = 'body_pos_w' if 'body_pos_w' in keys else self.get_k('body_pos_w')
+                quat_key = 'body_quat_w' if 'body_quat_w' in keys else self.get_k('body_quat_w')
+                joint_key = 'joint_pos' if 'joint_pos' in keys else self.get_k('joint_pos')
+                obj_pos_key = 'object_pos_w' if 'object_pos_w' in keys else self.get_k('object_pos_w')
+                obj_quat_key = 'object_quat_w' if 'object_quat_w' in keys else self.get_k('object_quat_w')
+
+                bp = np.asarray(std_buf[pos_key][i])[::self.downsample]
+                bq = np.asarray(std_buf[quat_key][i])[::self.downsample]
+                if bp.ndim == 3:
+                    bp = bp[:, 0, :]
+                if bq.ndim == 3:
+                    bq = bq[:, 0, :]
+
+                processed['base'] = np.concatenate([bp, bq], axis=-1)[np.newaxis]
+                processed['joints'] = np.asarray(std_buf[joint_key][i])[::self.downsample][np.newaxis]
+
+                op = np.asarray(std_buf[obj_pos_key][i])[::self.downsample]
+                oq = np.asarray(std_buf[obj_quat_key][i])[::self.downsample]
+                processed['obj'] = np.concatenate([op, oq], axis=-1)[np.newaxis]
+
+                if 'ee_rel_pos' in keys:
+                    processed['ee_rel_pos'] = np.asarray(std_buf['ee_rel_pos'][i])[::self.downsample][np.newaxis]
+
+            # ---- SBTO schema ----
+            elif 'base_xyz_quat' in keys:
+                processed['base'] = np.asarray(std_buf['base_xyz_quat'][i])[::self.downsample][np.newaxis]
+                processed['joints'] = np.asarray(std_buf['actuator_pos'][i])[::self.downsample][np.newaxis]
+                if 'obj_0_xyz_quat' in keys:
+                    processed['obj'] = np.asarray(std_buf['obj_0_xyz_quat'][i])[::self.downsample][np.newaxis]
+
+                if 'base_linvel_angvel' in keys:
+                    processed['base_vel'] = np.asarray(std_buf['base_linvel_angvel'][i])[::self.downsample][np.newaxis]
+                if 'actuator_vel' in keys:
+                    processed['joints_vel'] = np.asarray(std_buf['actuator_vel'][i])[::self.downsample][np.newaxis]
+                if 'obj_0_linvel_angvel' in keys:
+                    processed['obj_vel'] = np.asarray(std_buf['obj_0_linvel_angvel'][i])[::self.downsample][np.newaxis]
+
+                if 'ee_rel_pos' in keys:
+                    processed['ee_rel_pos'] = np.asarray(std_buf['ee_rel_pos'][i])[::self.downsample][np.newaxis]
+            else:
+                raise ValueError(f"Unrecognized buffer schema. Keys: {keys}")
+
+            # ---- External task_params (per-trajectory, no time dim) ----
+            if 'task_params' in keys:
+                tp = np.asarray(std_buf['task_params'][i])
+                processed['task_params'] = tp  # shape (D,) — not batched over time
+
+            self.ram_cache.append(processed)
+
+        print(f"Loaded {num_trajs} trajectories from buffer into RAM cache.")
+
+    # ------------------------------------------------------------------
+    # Indexing  (mirrors FlexibleWindowDataset._index_dataset)
+    # ------------------------------------------------------------------
+    def _index_dataset(self):
+        """Build sliding-window indices from ram_cache (same padding logic as parent)."""
+        print("Indexing buffer dataset...")
+        self.indices = []
+        self.traj_lengths = []
+
+        for file_idx, file_data in enumerate(self.ram_cache):
+            if 'base' not in file_data:
                 continue
-            
-            # Valid start indices (in downsampled space)
-            last_start = down_T - req_len_down
-            
-            for t in range(0, last_start + 1, self.stride):
-                # (file_idx=0 is dummy, batch_idx, t_start=t)
-                self.indices.append((0, batch_idx, t))
-            
+
+            # file_data['base'] shape is (1, T_down, D)
+            T_down = file_data['base'].shape[1]
+
+            pad_start = self.history_size
+            pad_end = self.window_size - (T_down + pad_start) % self.window_size + self.history_size
+            T_padded = T_down + pad_start + pad_end
+            self.traj_lengths.append(T_padded)
+
+            w_size = self.window_size + self.history_size
+            max_start = T_padded - w_size
+
+            if max_start >= 0:
+                starts = np.arange(0, max_start + 1, self.stride)
+                for s in starts:
+                    # batch_idx = 0 because each ram_cache entry has N=1
+                    self.indices.append((file_idx, 0, int(s)))
+
+        print(f"Indexed {len(self.indices)} windows from buffer.")
+
+    # ------------------------------------------------------------------
+    # Override _get_single_traj to pass through non-temporal keys
+    # ------------------------------------------------------------------
     def _get_single_traj(self, file_idx, batch_idx):
-        """
-        Get processed (T, D) dict from buffer.
-        """
-        raw = {}
-        
-        # Helper to extract and downsample
-        def extract_k(key):
-            if key not in self.data_buffer: return None
-            # Retrieve trajectory
-            val = self.data_buffer[key][batch_idx]
-            # Downsample along time dimension
-            return val[::self.downsample]
-        
-        # Check standard keys
-        keys = self.data_buffer.keys()
-        
-        # Case 1: Standard 'body_pos_w' format
-        if 'body_pos_w' in keys:
-            body_pos = extract_k('body_pos_w')     # (T, 3) or (T, 1, 3)
-            body_quat = extract_k('body_quat_w')
-            
-            if body_pos is not None and body_pos.ndim == 3:
-                # If shape is (T, 1, 3), squeeze.
-                if body_pos.shape[1] == 1:
-                    body_pos = body_pos[:, 0, :]
-                else:
-                    # Likely (T, NumBodies, 3).Let's take index 0 for base.
-                    body_pos = body_pos[:, 0, :]
+        """Get padded (T, D) dict. Passes through non-temporal keys like task_params."""
+        file_data = self.ram_cache[file_idx]
 
-            if body_quat is not None and body_quat.ndim == 3:
-                if body_quat.shape[1] == 1:
-                     body_quat = body_quat[:, 0, :]
-                else:
-                     body_quat = body_quat[:, 0, :]
-                
-            raw['base'] = np.concatenate([body_pos, body_quat], axis=-1)
-            raw['joints'] = extract_k('joint_pos')
-            
-            op = extract_k('object_pos_w')
-            oq = extract_k('object_quat_w')
-            raw['obj'] = np.concatenate([op, oq], axis=-1)
-            
-        # Case 2: 'base_xyz_quat' format (e.g. from simpler loggers)
-        elif 'base_xyz_quat' in keys:
-             raw['base'] = extract_k('base_xyz_quat')
-             raw['joints'] = extract_k('actuator_pos')
-             if 'obj_0_xyz_quat' in keys:
-                 raw['obj'] = extract_k('obj_0_xyz_quat')
-                 
-        # Optional Task Params (can be passed in buffer)
-        if 'task_params' in keys:
-             # Typically (Batch, D) - no time dim, so no downsample needed
-             # or (Batch, Time, D) - if time-varying
-             tp = self.data_buffer['task_params'][batch_idx]
-             raw['task_params'] = tp
-                 
-        return raw
+        pad_start = self.history_size
+        pad_end = self.traj_lengths[file_idx] - (file_data["base"][batch_idx].shape[0] + pad_start)
 
+        pad_kwargs = lambda arr: np.pad(arr, ((pad_start, pad_end), (0, 0)) if arr.ndim == 2 else ((0, 0),), mode='edge')
 
-    def _compute_transform(self, raw_data, t_start, task_params=None):
-        """
-        Override to inject task params from buffer if they exist
-        """
-        feats, anchor = super()._compute_transform(raw_data, t_start)
-        
-        if task_params is not None:
-             feats['task_params'] = task_params
-             anchor['task_params'] = task_params
-        elif 'task_params' in raw_data:
-             tp = raw_data['task_params']
-             feats['task_params'] = tp
-             anchor['task_params'] = tp
-             
+        result = {}
+        for k, v in file_data.items():
+            if k == 'task_params':
+                # Non-temporal — pass through as-is
+                result[k] = v
+            else:
+                result[k] = pad_kwargs(v[batch_idx])
+        return result
+
+    # ------------------------------------------------------------------
+    # Override _compute_transform to inject external task_params
+    # ------------------------------------------------------------------
+    def _compute_transform(self, raw_traj, t_start):
+        """Call parent transform, then override task_params if provided externally."""
+        feats, anchor = super()._compute_transform(raw_traj, t_start)
+
+        if 'task_params' in raw_traj:
+            feats['task_params'] = np.asarray(raw_traj['task_params'])
+
         return feats, anchor

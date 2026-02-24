@@ -15,9 +15,7 @@ from scipy.spatial.transform import Slerp
 from config.configure import load_config, get_data_path, get_save_path, get_norm_path
 from models.model import RobotDiffuser
 from datasets.buffer_dataset import BufferDataset
-from utils.math.sbto_utils import reconstruct_sbto_trajectory
-from utils.math.math_tools import yaw_from_quat, yaw_to_rot_matrix
-from utils.math.rotation_conversions import quaternion_to_matrix, matrix_to_quaternion
+from utils.math.sbto_utils import reconstruct_sbto_trajectory, compute_task_params
 
 
 def compute_dataset_weights(dataset, sigma=0.2):
@@ -155,19 +153,23 @@ class MotionGenerator:
 
 
     def _setup_dataset_structure(self, load_stats=True):
-        """Helper to init a dummy dataset just for stats/normalization logic."""
+        """Load normalization stats into a lightweight dataset for inference use."""
         norm_path = get_norm_path(self.model_cfg, self.training_cfg, self.data_cfg)
         
-        # If we have stats, we can init a dataset without data just for utils
         if load_stats and norm_path and os.path.exists(norm_path):
-             # We create a dummy dataset with empty buffer just to load stats
-             dummy_buffer = {'body_pos_w': np.zeros((1, 1, 1, 3))}
-             self.dataset = BufferDataset(
-                data_buffer=dummy_buffer, 
-                config=self.data_cfg, 
-                calculate_stats=False, 
+            # Create a tiny single-step buffer just to bootstrap the dataset object
+            # so we can use its normalize/denormalize/feature logic.
+            dummy_buffer = {
+                'base_xyz_quat': np.zeros((1, 2, 7)),
+                'actuator_pos': np.zeros((1, 2, 29)),
+                'obj_0_xyz_quat': np.zeros((1, 2, 7)),
+            }
+            self.dataset = BufferDataset(
+                data_buffer=dummy_buffer,
+                config=self.data_cfg,
+                calculate_stats=False,
                 norm_path=norm_path,
-                noise_cfg={}
+                noise_cfg={},
             )
 
     def fit(self, 
@@ -263,9 +265,11 @@ class MotionGenerator:
             pbar = tqdm(train_dataloader, desc=f"Epoch {epoch+1}/{epochs}")
             
             for step, batch in enumerate(pbar):
+
+                if self.training_cfg.get("batches_per_epoch") and step >= self.training_cfg["batches_per_epoch"]:
+                    break
                 
                 if batch[0].shape[0] < self.data_cfg["batch_size"]:
-                    # Pad the batch by repeating elements if it's smaller than batch_size
                     current_bs = batch[0].shape[0]
                     target_bs = self.data_cfg["batch_size"]
                     repeats = (target_bs + current_bs - 1) // current_bs
@@ -276,17 +280,17 @@ class MotionGenerator:
                             dims = [1] * item.dim()
                             dims[0] = repeats
                             new_batch.append(item.repeat(*dims)[:target_bs])
-                    else:
+                        else:
                             new_batch.append(item)
                     batch = new_batch
+
+                state_cond = None
+                task_cond = None
             
                 batch_data = list(batch)
                 prediction_target = batch_data[0].to(self.device)
                 
-                state_cond = None
-                task_cond = None
                 idx = 1
-                
                 if state_condition:
                     state_cond = batch_data[idx].to(self.device)
                     state_cond = apply_condition_dropout(state_cond, dropout_probs.get("state", 0.0))
@@ -297,7 +301,7 @@ class MotionGenerator:
                     task_cond = apply_condition_dropout(task_cond, dropout_probs.get("task", 0.0))
                     idx += 1
                 
-                # Construct cond
+                # Construct cond (matches train.py)
                 cond = []
                 if state_cond is not None: cond.append(state_cond)
                 if task_cond is not None: cond.append(task_cond)
@@ -306,11 +310,9 @@ class MotionGenerator:
                 if len(cond) == 1: model_cond = cond[0]
                 
                 bs, ts, _ = prediction_target.shape
-                timesteps = torch.randint(
-                    0, self.diffuser.noise_scheduler.config.num_train_timesteps, (bs, ts,), device=self.device
-                ).long()
+                timesteps = None  # Let the model handle timestep sampling
                 
-                with torch.autocast(device_type="cuda" if self.device.type=="cuda" else "cpu", dtype=torch.float32):
+                with torch.autocast(device_type="cuda" if self.device.type == "cuda" else "cpu", dtype=torch.float32):
                     diff_output = self.diffuser.model(
                         prediction_target, 
                         model_cond, 
@@ -416,20 +418,21 @@ class MotionGenerator:
         
         return interpolated
 
-    def _update_condition(self, robot_world_history, obj_world_history, goal_condition=None):
+    def _update_condition(self, robot_world_history, obj_world_history, final_obj_pos=None):
         """
         Update condition for next autoregressive step.
+        Mirrors inference.py's update_condition().
         """
         if self.dataset is None:
              raise RuntimeError("Dataset not initialized. Call fit() or manually init dataset.")
 
         B, H, _ = robot_world_history.shape
         next_states = []
-        next_anchors = {'ref_pos': [], 'ref_quat': []}
+        next_anchors = {'ref_pos': [], 'ref_quat': [], 'ref_obj_pos': [], 'final_obj_pos': []}
 
         for b in range(B):
-            r_slice = robot_world_history[b]
-            o_slice = obj_world_history[b]
+            r_slice = robot_world_history[b]  # (H, 36)
+            o_slice = obj_world_history[b]    # (H, 7)
             
             raw_chunk = {
                 'base': r_slice[:, :7],       
@@ -437,17 +440,12 @@ class MotionGenerator:
                 'obj': o_slice[:, :7]
             }
             
-            # Helper to extract batch goal
-            tp = None
-            if goal_condition is not None:
-                if isinstance(goal_condition, (np.ndarray, torch.Tensor)) and len(goal_condition) == B:
-                    tp = goal_condition[b]
-                else: 
-                     # Fallback/Broadcast or dict
-                     tp = goal_condition
-
-            feats, new_anch = self.dataset._compute_transform(raw_chunk, t_start=0, task_params=tp)
+            feats, new_anch = self.dataset._compute_transform(raw_chunk, t_start=0)
             
+            if final_obj_pos is not None:
+                new_anch['final_obj_pos'] = final_obj_pos[b]
+            
+            # Assemble Feature Vector (same logic as inference.py)
             current_parts = []
             obs_start_idx = self.dataset.num_features - self.dataset.num_observations
             cumulative_dim = 0
@@ -470,11 +468,15 @@ class MotionGenerator:
             next_states.append(c_state)
             next_anchors['ref_pos'].append(new_anch['ref_pos'])
             next_anchors['ref_quat'].append(new_anch['ref_quat'])
+            next_anchors['ref_obj_pos'].append(new_anch['ref_obj_pos'])
+            next_anchors['final_obj_pos'].append(new_anch.get('final_obj_pos', np.zeros(3)))
 
         next_state_tens = torch.stack(next_states)
         batched_anchor = {
             'ref_pos': np.stack(next_anchors['ref_pos']),
             'ref_quat': np.stack(next_anchors['ref_quat']),
+            'ref_obj_pos': np.stack(next_anchors['ref_obj_pos']),
+            'final_obj_pos': np.stack(next_anchors['final_obj_pos']),
         }
         return next_state_tens, batched_anchor
 
@@ -482,20 +484,24 @@ class MotionGenerator:
                             initial_condition: Dict, 
                             goal_condition: Union[Dict, np.ndarray],
                             stitch_steps: int = 1, 
-                            num_samples: int = 1):
+                            num_samples: int = 1,
+                            cfg_w: float = 1.0,
+                            deterministic: bool = True,
+                            end_error_threshold: float = 0.1):
         """
-        Generate trajectory.
+        Generate trajectory via autoregressive diffusion (mirrors inference.py).
         
         Args:
-            initial_condition: Dictionary with 'robot' (H, 36) and 'obj' (H, 7) history in world frame.
-                               OR indices or whatever dataset expects.
-                               However, standard inference logic assumes we start from normalized state tensor.
-                               For flexibility, let's assume the user passes world-frame history, 
-                               and we use dataset logic to normalize it.
-            goal_condition: Goal parameters (e.g. final object pos).
+            initial_condition: Dict with 'robot' (H, 36) and 'obj' (H, 7) history in world frame.
+            goal_condition: np.ndarray (3,) — final desired object position in world frame.
+            stitch_steps: Number of autoregressive segments.
+            num_samples: Number of parallel samples to generate.
+            cfg_w: Classifier-free guidance weight.
+            deterministic: Whether to use DDIM (True) or DDPM (False).
+            end_error_threshold: Stop stitching early if goal reached within this L2 error.
             
         Returns:
-            np.ndarray of shape (num_samples, T_total, D)
+            np.ndarray of shape (num_samples, T_total, D) where D = 36 (robot) + 7 (object).
         """
         if self.dataset is None:
              raise RuntimeError("Dataset not initialized. Call fit() or setup.")
@@ -503,97 +509,102 @@ class MotionGenerator:
         self.diffuser.model.eval()
         
         # 1. Process Initial Condition
-        # We assume initial_condition contains raw history to compute encoded state
-        # robot: (H, 36), obj: (H, 7)
-    
-        r_hist = initial_condition['robot'] # (H, 36)
-        o_hist = initial_condition['obj']   # (H, 7)
+        r_hist = np.asarray(initial_condition['robot'])  # (H, 36)
+        o_hist = np.asarray(initial_condition['obj'])    # (H, 7)
         
-        # If single sample provided, add batch dim
         if r_hist.ndim == 2: r_hist = r_hist[None, ...]
         if o_hist.ndim == 2: o_hist = o_hist[None, ...]
-        
-        # We first need to "update_condition" to get features from raw history
-        curr_state_tens, current_anchors = self._update_condition(r_hist, o_hist, goal_condition=None)
-        
-        # Now replicate for num_samples
-        if curr_state_tens.shape[0] == 1 and num_samples > 1:
-            curr_state_tens = curr_state_tens.repeat(num_samples, 1, 1).to(self.device)
-        
-        # 2. Process Goal (Absolute Frame, matching Training Pipeline)
-        
-        # Goal Parsing
-        if isinstance(goal_condition, (np.ndarray, list)):
-             gc = np.array(goal_condition) # (7,) or (1, 7) or (B, 7)
-             if gc.ndim == 1: gc = gc[None, :]
-             
-             # If broadcasting needed
-             if gc.shape[0] == 1 and curr_state_tens.shape[0] // num_samples > 1:
-                 # Match original batch size B
-                 B = curr_state_tens.shape[0] // num_samples
-                 gc = np.repeat(gc, B, axis=0)
 
-             task_params = torch.from_numpy(gc).float()
-
-        else:
-             # Assume dict, maybe extract?
-             raise ValueError("Goal condition format not supported yet")
+        # Get initial encoded state and anchors
+        curr_state_tens, current_anchors = self._update_condition(r_hist, o_hist)
         
-        # Normalize (Absolute) task params
-        task_params = self.dataset._normalize("task_params", task_params) # (B, D)
+        # Set final_obj_pos in anchors
+        final_obj_pos = np.asarray(goal_condition)
+        if final_obj_pos.ndim == 1:
+            final_obj_pos = final_obj_pos[None, :]  # (1, 3)
+        current_anchors['final_obj_pos'] = np.repeat(final_obj_pos, curr_state_tens.shape[0], axis=0)
         
         # Replicate for num_samples
-        if task_params.shape[0] == 1 and num_samples > 1:
-            task_params = task_params.repeat(num_samples, 1)
+        if curr_state_tens.shape[0] == 1 and num_samples > 1:
+            curr_state_tens = curr_state_tens.repeat(num_samples, 1, 1)
+            for k in current_anchors:
+                current_anchors[k] = np.repeat(current_anchors[k], num_samples, axis=0)
         
-        task_tens = task_params.to(self.device)
         curr_state_tens = curr_state_tens.to(self.device)
-        
-        # Update anchors for reconstruction
-        current_anchors['ref_pos'] = np.repeat(current_anchors['ref_pos'], num_samples, axis=0)
-        current_anchors['ref_quat'] = np.repeat(current_anchors['ref_quat'], num_samples, axis=0)
-        current_anchors['ref_obj_pos'] = np.repeat(current_anchors['ref_obj_pos'], num_samples, axis=0)
         
         history_size = self.dataset.history_size
         stitched_segments = []
         
-        # 3. Autoregressive Loop
+        # 2. Autoregressive Loop (mirrors inference.py)
         for step in range(stitch_steps):
-            # A. Inference
+            print(f"Generating segment {step+1}/{stitch_steps}...")
+
+            # A. Compute task params from current anchors (same as inference.py)
+            tp_init = compute_task_params(
+                current_robot_state=current_anchors['ref_quat'], 
+                current_obj_state=current_anchors['ref_obj_pos'], 
+                desired_obj_pos=current_anchors['final_obj_pos'],
+                normalize_goal_vec=self.data_cfg.get("normalize_goal_vec", False),
+                num_task_params=self.data_cfg["num_task_params"]
+            )
+            task_params = self.dataset._normalize("task_params", tp_init)
+            task_tens = task_params.repeat(num_samples, 1).to(self.device) if task_params.shape[0] == 1 else task_params.to(self.device)
+
+            # B. Inference
             normalized_sample = self.diffuser.getSample(
                 num_trajectories=num_samples,
                 state_cond=curr_state_tens,
                 goal_cond=task_tens,
-                deterministic=self.noise_cfg["deterministic_inference"],
-            ) # (B, T, D_out)
+                deterministic=deterministic,
+                cfg_w=cfg_w,
+            )
             
-            # B. Denormalize
+            # C. Denormalize
             denorm_btc = self.dataset.denormalize_global(normalized_sample)
             future_traj_np = denorm_btc.detach().cpu().numpy()
             
-            # C. Reconstruct World Frame
-            anchor_arr = np.concatenate([current_anchors['ref_pos'], current_anchors['ref_quat'], current_anchors['ref_obj_pos']], axis=-1)
+            # D. Reconstruct World Frame
+            anchor_arr = np.concatenate([
+                current_anchors['ref_pos'], 
+                current_anchors['ref_quat'], 
+                current_anchors['ref_obj_pos'],
+                current_anchors['final_obj_pos'],
+            ], axis=-1)
             
-            res = reconstruct_sbto_trajectory(anchor_arr, future_traj_np)
+            res = reconstruct_sbto_trajectory(
+                anchor_arr, future_traj_np, 
+                inpaint=self.diffuser.model_cfg.get("inpaint", False)
+            )
             r_world, o_world = res[0], res[1]
             
-            # Store Segment
-            # Robot(36) + Object(7)
+            # Store segment: Robot(36) + Object(7)
             segment_world = np.concatenate([r_world[..., :36], o_world[..., :7]], axis=-1)
             stitched_segments.append(segment_world)
+
+            # E. Early stopping check
+            err = np.linalg.norm(
+                current_anchors["final_obj_pos"][..., :self.data_cfg["num_task_params"]] 
+                - segment_world[:, -1, 36 : 36 + self.data_cfg["num_task_params"]]
+            )
+            if err < end_error_threshold:
+                print(f"Segment {step+1} reached goal (Error: {err:.4f}). Stopping.")
+                break
             
-            # D. Update Condition for next step
+            # F. Update Condition for next step
             if step < stitch_steps - 1:
                 r_hist_new = r_world[:, -history_size:, :]
                 o_hist_new = o_world[:, -history_size:, :]
-                curr_state_tens, current_anchors = self._update_condition(r_hist_new, o_hist_new)
+                curr_state_tens, current_anchors = self._update_condition(
+                    r_hist_new, o_hist_new, 
+                    final_obj_pos=np.repeat(final_obj_pos, num_samples, axis=0)
+                )
                 curr_state_tens = curr_state_tens.to(self.device)
         
         full_trajectory = np.concatenate(stitched_segments, axis=1)
 
-        # Interpolate if needed (based on dataset downsample config)
-        if hasattr(self, 'dataset') and self.dataset is not None:
-             full_trajectory = self._interpolate_trajectory(full_trajectory)
+        # Interpolate if needed
+        if self.dataset is not None:
+            full_trajectory = self._interpolate_trajectory(full_trajectory)
 
         return full_trajectory
 

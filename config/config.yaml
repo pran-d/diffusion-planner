@@ -53,11 +53,10 @@ training:
   add_obs_noise: True
   add_goal_noise: True
   state_conditioning_noise_level:
-    joints: 0.015
-    body_z: 0.01
+    joints: 0.005
     body_rot6d: 0.0025
-    obj_rel_pos: 0.005
-    obj_rel_rot6d: 0.005
+    obj_rel_pos: 0.0025
+    obj_rel_rot6d: 0.0025
     # joint_vel: 0.2
     # body_lin_vel: 0.1
     # body_ang_vel: 0.1
