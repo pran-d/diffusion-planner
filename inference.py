@@ -103,7 +103,7 @@ def main():
     parser.add_argument("--stitch_steps", type=int, default=None, help="Number of autoregressive segments to generate")
     parser.add_argument("--save_path", type=str, default="results/inference.npy")
     parser.add_argument("--sample_idx", type=int, default=0, help="Initial condition index (Overridden if traj_idx is set)")
-    parser.add_argument("--traj_idx", type=int, default=None, help="Trajectory (file) index")
+    parser.add_argument("--traj_idx", type=int, default=0, help="Trajectory (file) index")
     parser.add_argument("--batch_idx", type=int, default=0, help="Batch index within file")
     parser.add_argument("--start_time", type=int, default=0, help="Window start timestep")
     parser.add_argument("--device", type=str, default="cuda", help="Device for inference (cuda or cpu)")
@@ -175,6 +175,7 @@ def main():
     
     history_size = dataset.history_size
     stitched_segments = []
+    unreconstructed_segments = []
     goal_vectors = []
 
     # Override task params if provided
@@ -190,6 +191,7 @@ def main():
     }
 
     curr_state_tens = curr_state.unsqueeze(0).repeat(args.num_samples, 1, 1)
+    task_tens = task_params.repeat(args.num_samples, 1)
 
     if args.stitch_steps is None:
         args.stitch_steps = dataset.traj_lengths[args.traj_idx] // data_cfg["num_timesteps"] 
@@ -203,17 +205,19 @@ def main():
     for step in range(args.stitch_steps):
         print(f"Generating segment {step+1}/{args.stitch_steps}...")
 
-        tp_init = compute_task_params(
-            current_robot_state=current_anchors['ref_quat'], 
-            current_obj_state=current_anchors['ref_obj_pos'], 
-            desired_obj_pos=current_anchors["final_obj_pos"],
-            normalize_goal_vec=data_cfg.get("normalize_goal_vec", False),
-        )[..., :data_cfg["num_task_params"]]
-        task_params = dataset._normalize("task_params", tp_init)
-        task_tens = task_params.repeat(args.num_samples, 1)
-        
         # A. Inference
         if not args.visualize_dataset:
+            tp_init = compute_task_params(
+                current_robot_state=current_anchors['ref_quat'], 
+                current_obj_state=current_anchors['ref_obj_pos'], 
+                desired_obj_pos=current_anchors["final_obj_pos"],
+                normalize_goal_vec=data_cfg.get("normalize_goal_vec", False),
+                num_task_params=data_cfg["num_task_params"]
+            )
+            task_params = dataset._normalize("task_params", tp_init)
+            
+            task_tens = task_params.repeat(args.num_samples, 1)
+
             normalized_sample = diffuser.getSample(
                 num_trajectories=args.num_samples,
                 state_cond=curr_state_tens.to(device),
@@ -229,7 +233,10 @@ def main():
         # B. Denormalize
         denorm_btc = dataset.denormalize_global(normalized_sample)
         future_traj_np = denorm_btc.cpu().numpy()
-        
+
+        # Store unreconstructed segment for debugging   
+        unreconstructed_segments.append(future_traj_np)
+
         # C. Reconstruct World Frame
         anchor_arr = np.concatenate([
             current_anchors['ref_pos'], 
@@ -257,7 +264,7 @@ def main():
             task_denorm = torch.cat([task_denorm, torch.zeros_like(task_denorm[:, :1])], dim=1)
         task_denorm_3d = task_denorm[..., None] # (B, 3)
         goal_vec_global = (yaw_to_rot_matrix(yaw_from_quat(current_anchors['ref_quat'])) @ task_denorm_3d.cpu().numpy())[..., :data_cfg["num_task_params"], 0] # (B, 3)        
-        goal_vectors.append(goal_vec_global.repeat(segment_world.shape[1], 0)) # (B, 3)
+        goal_vectors.append(goal_vec_global.repeat(segment_world.shape[1], 0)[..., :2]) # (B, 3)
 
         # Desired Displacement (From Ground Truth Full Trajectory)                    
         err = np.linalg.norm(current_anchors["final_obj_pos"][..., :data_cfg["num_task_params"]] - segment_world[:, -1, 36 : 36 + data_cfg["num_task_params"]])
@@ -286,6 +293,7 @@ def main():
 
     # 6. Finalize
     full_trajectory = np.concatenate(stitched_segments, axis=1) # (B, T, D)
+    unreconstructed_trajectory = np.concatenate(unreconstructed_segments, axis=1) if len(unreconstructed_segments) > 0 else None
     goal_vectors = np.concatenate(goal_vectors, axis=0) # (B, task_dim)
 
     os.makedirs(os.path.dirname(args.save_path), exist_ok=True)

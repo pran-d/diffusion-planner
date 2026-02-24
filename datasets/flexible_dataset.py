@@ -7,12 +7,9 @@ import yaml
 from torch.utils.data import Dataset
 from tqdm import tqdm
 
-from utils.math.sbto_utils import compute_sbto_components, yaw_to_rot_matrix, yaw_from_quat
-from utils.math.rotation_conversions import (
-    rotation_6d_to_matrix, 
-    matrix_to_rotation_6d, 
+from utils.math.sbto_utils import compute_sbto_components, yaw_to_rot_matrix, yaw_from_quat, rot6d_to_rot, quat_to_rot, batch_rotation, rot_to_6d
+from utils.math.rotation_conversions import ( 
     axis_angle_to_quaternion, 
-    quaternion_to_matrix
 )
 
 class FlexibleWindowDataset(Dataset):
@@ -42,6 +39,13 @@ class FlexibleWindowDataset(Dataset):
         self.downsample = config.get("downsample", 1)
         self.start_timestep = config.get("start_timestep", 0)
         self.normalize_goal_vec = config.get("normalize_goal_vec", True)
+        self.num_task_params = config.get("num_task_params", 2)
+        self.normalization_type = config.get("normalization_type", "mean_std")  # 'mean_std' or 'min_max'
+        print(f"Using normalization type: {self.normalization_type}")
+
+        # Key mapping for flexible dataset keys
+        self.key_mapping = config.get("key_mapping", {})
+        print(f"Using key mapping: {self.key_mapping}")
 
         self.add_noise = add_noise
         self.add_goal_noise = add_goal_noise
@@ -52,6 +56,7 @@ class FlexibleWindowDataset(Dataset):
             "obj_delta_xy",
             "joints", "body_z", "body_rot6d",
             "obj_rel_pos", "obj_rel_rot6d",
+            # "ee_rel_pos",
         ]
         
         # Load file list
@@ -83,7 +88,9 @@ class FlexibleWindowDataset(Dataset):
                  
              self.file_paths = []
              for t in tasks:
-                 file_names = ["top_trajectories.npz", "best_trajectory_rand.npz"]
+                 file_names = ["best_trajectory_rand.npz"]
+                #  file_names = ["top_trajectories.npz"]
+                #  file_names = ["motion.npz"]
                  for file_name in file_names:
                      p = os.path.join(data_root, t, file_name)
                      if os.path.exists(p):
@@ -115,6 +122,9 @@ class FlexibleWindowDataset(Dataset):
             self._calculate_stats()
         elif norm_path and os.path.exists(norm_path):
             self._load_stats()
+
+    def get_k(self, key):
+        return self.key_mapping.get(key, key)
 
     def _preload_dataset(self):
         print(f"Preloading {len(self.file_paths)} files into RAM...")
@@ -152,6 +162,29 @@ class FlexibleWindowDataset(Dataset):
 
                     processed['joints'] = extract('joint_pos')
                     processed['obj'] = np.concatenate([extract('object_pos_w'), extract('object_quat_w')], axis=-1)
+
+                    if 'ee_rel_pos' in data:
+                        processed['ee_rel_pos'] = extract('ee_rel_pos')
+
+                elif self.get_k('body_pos_w') in data and self.get_k('body_quat_w') in data:
+                    # Same as above but with key mapping
+                    is_batched = data[self.get_k('body_pos_w')].ndim == 3
+
+                    def extract(key):
+                        real_key = self.get_k(key)
+                        arr = data[real_key]
+                        if not is_batched:
+                            arr = arr[None, ...]
+                        return arr[:, ::self.downsample]
+
+                    body_pos = extract(self.get_k('body_pos_w'))
+                    body_quat = extract(self.get_k('body_quat_w'))
+                    processed['base'] = np.concatenate([body_pos, body_quat], axis=-1)
+                    processed['joints'] = extract(self.get_k('joint_pos'))
+                    processed['obj'] = np.concatenate([extract(self.get_k('object_pos_w')), extract(self.get_k('object_quat_w'))], axis=-1)
+                    
+                    if 'ee_rel_pos' in data:
+                         processed['ee_rel_pos'] = extract('ee_rel_pos')
                     
                 elif 'base_xyz_quat' in data:
                     # SBTO Schema
@@ -173,10 +206,14 @@ class FlexibleWindowDataset(Dataset):
                         processed['joints_vel'] = extract('actuator_vel')
                     if 'obj_0_linvel_angvel' in data:
                         processed['obj_vel'] = extract('obj_0_linvel_angvel')
+
+                    if 'ee_rel_pos' in data:
+                        processed['ee_rel_pos'] = extract('ee_rel_pos')
                 
                 # Metadata
-                if 'fps' in data:
-                    fps_val = data['fps'].item() if data['fps'].ndim == 0 else data['fps'][0]
+                if self.get_k('fps') in data:
+                    val = data[self.get_k('fps')]
+                    fps_val = val.item() if val.ndim == 0 else val[0]
                     B_dim = processed['base'].shape[0]
                     processed['fps'] = np.repeat(fps_val, B_dim)
                     
@@ -191,8 +228,14 @@ class FlexibleWindowDataset(Dataset):
     def _get_single_traj(self, file_idx, batch_idx):
         """Get (T, D) dict for a specific trajectory."""
         file_data = self.ram_cache[file_idx]
-        return {k: v[batch_idx] for k, v in file_data.items()}
-            
+
+        pad_start = self.history_size
+        pad_end = self.traj_lengths[file_idx] - (file_data["base"][batch_idx].shape[0] + pad_start)
+
+        pad_kwargs = lambda arr: np.pad(arr, (((pad_start, pad_end),(0,0)) if arr.ndim==2 else ((0,0))), mode='edge')      
+        
+        return {k: pad_kwargs(v[batch_idx]) for k, v in file_data.items()}
+
     def _index_dataset(self):
         """
         Iterate through files to determine valid window start indices.
@@ -210,6 +253,12 @@ class FlexibleWindowDataset(Dataset):
                             B, T = arr.shape[0], arr.shape[1]
                         else:
                             T = arr.shape[0]
+                    if self.get_k('body_pos_w') in data:
+                        arr = data[self.get_k('body_pos_w')]
+                        if arr.ndim == 3:
+                            B, T = arr.shape[0], arr.shape[1]
+                        else:
+                            T = arr.shape[0]
                     elif 'base_xyz_quat' in data:
                          arr = data['base_xyz_quat']
                          if arr.ndim == 3: # (N, T, D)
@@ -221,14 +270,18 @@ class FlexibleWindowDataset(Dataset):
                     
                     # Apply downsampling effectively reduces T
                     T_down = T // self.downsample
-                    T_padded = T_down + 1
-                    self.traj_lengths.append(T_down)
+
+                    pad_start = self.history_size
+                    pad_end = self.window_size - (T_down + pad_start) % self.window_size + self.history_size
+
+                    T_padded = T_down + pad_start + pad_end
+                    self.traj_lengths.append(T_padded)
                     
                     w_size = self.window_size + self.history_size
-                    num_windows = T_padded - w_size + 1
+                    max_start = T_padded - w_size
                     
-                    if num_windows > 0:
-                        starts = np.arange(0, num_windows, self.stride)
+                    if max_start > 0:
+                        starts = np.arange(0, max_start + 1, self.stride)
                         for b in range(B):
                             for s in starts:
                                 self.indices.append((i, b, s))
@@ -243,44 +296,27 @@ class FlexibleWindowDataset(Dataset):
         
         T_traj = raw_traj['base'].shape[0]
         w_size = self.window_size + self.history_size
-        raw_start = t_start - 1
-        raw_end = raw_start + w_size
+        raw_end = t_start + w_size
         
         # Read with padding
-        read_start = max(0, raw_start)
+        read_start = max(0, t_start)
         read_end = min(T_traj, raw_end)
         
         # Slice
         b_slice = raw_traj['base'][read_start:read_end]
         j_slice = raw_traj['joints'][read_start:read_end]
         o_slice = raw_traj['obj'][read_start:read_end]
-        
-        # # Pad
-        pad_front = max(0, -raw_start)
-        pad_back = max(0, raw_end - T_traj)
-        
-        if pad_front > 0 or pad_back > 0:
-            p = ((pad_front, pad_back), (0,0))
-            b_slice = np.pad(b_slice, p, mode='edge')
-            j_slice = np.pad(j_slice, p, mode='edge')
-            o_slice = np.pad(o_slice, p, mode='edge')
-            
         # Velocity
         if 'base_vel' in raw_traj:
             bv = raw_traj['base_vel'][read_start:read_end]
             jv = raw_traj['joints_vel'][read_start:read_end]
             ov = raw_traj['obj_vel'][read_start:read_end]
-            if pad_front > 0 or pad_back > 0:
-                p = ((pad_front, pad_back), (0,0))
-                bv = np.pad(bv, p, mode='edge')
-                jv = np.pad(jv, p, mode='edge')
-                ov = np.pad(ov, p, mode='edge')
         else:
             bv, jv, ov = None, None, None
             
         # Reference frame for SBTO
         # "Current state" is usually history_size.
-        ref_idx = min(self.history_size - 1, w_size - 1)
+        ref_idx = self.history_size - 1
         
         # Batched SBTO call (Expects B, T, D)
         b_in = b_slice[np.newaxis, ...]
@@ -291,9 +327,16 @@ class FlexibleWindowDataset(Dataset):
         jv_in = jv[np.newaxis, ...] if jv is not None else None
         ov_in = ov[np.newaxis, ...] if ov is not None else None
 
+        # Pre-computed ee_rel_pos
+        ee_in = None
+        if 'ee_rel_pos' in raw_traj:
+            ee_slice = raw_traj['ee_rel_pos'][read_start:read_end]
+            ee_in = ee_slice[np.newaxis, ...]
+
         features_b, anchor_b = compute_sbto_components(
             b_in, j_in, o_in, ref_idx,
-            base_vel=bv_in, joints_vel=jv_in, obj_vel=ov_in
+            base_vel=bv_in, joints_vel=jv_in, obj_vel=ov_in,
+            ee_rel_pos=ee_in
         )
         
         # Unwrap batch dim
@@ -321,60 +364,91 @@ class FlexibleWindowDataset(Dataset):
         if obj_traj.shape[0] > 0:
             disp_vector_global = (obj_traj[-1, :3] - obj_traj[start_idx, :3])
             R_ref_inv = yaw_to_rot_matrix(-yaw_from_quat(base_traj[start_idx, 3:]))
-            disp_vector = (R_ref_inv @ disp_vector_global)[:2] # (2,)
+            disp_vector = (R_ref_inv @ disp_vector_global)[..., :self.num_task_params] # (2,)
             if self.normalize_goal_vec:
+                disp_vector = disp_vector[..., :self.num_task_params-1]
                 disp_vector_norm = np.linalg.norm(disp_vector)
-                if disp_vector_norm > 1e-6:
+                if disp_vector_norm > 1e-3:
                     disp_vector = disp_vector / disp_vector_norm
+                else:
+                    disp_vector = np.zeros_like(disp_vector)
+                disp_vector = np.concatenate([disp_vector, np.array([disp_vector_norm])], axis=-1)
             return disp_vector
-        return np.zeros(2)
+        return np.zeros(self.num_task_params)
 
     def _normalize(self, key, val):
-        min_k = self.stats.get(f"min_{key}")
-        max_k = self.stats.get(f"max_{key}")
-        
-        if min_k is None or max_k is None:
-            return val
-        
-        if isinstance(val, np.ndarray):
-            val = torch.from_numpy(val).float()
+        if self.normalization_type == "min_max":
+            min_k = self.stats.get(f"min_{key}")
+            max_k = self.stats.get(f"max_{key}")
             
-        dev = val.device
-        min_v = min_k.to(dev)
-        max_v = max_k.to(dev)
-        
-        # simple min-max to [-1, 1]
-        diff = max_v - min_v
-        # Prevent div zero
-        mask = diff < 1e-6
-        if mask.any():
-            diff = diff.clone()
-            diff[mask] = 1.0
+            if min_k is None or max_k is None:
+                return val
             
-        norm = (val - min_v) / diff
-        norm = norm * 2 - 1
-        return norm
+            if isinstance(val, np.ndarray):
+                val = torch.from_numpy(val).float()
+                
+            dev = val.device
+            min_v = min_k.to(dev)
+            max_v = max_k.to(dev)
+            
+            # (val - min) / (max - min). Range [0, 1]
+            denom = max_v - min_v
+            denom[denom < 1e-6] = 1.0 
+            norm = (val - min_v) / denom
+            return norm
+        else:
+            mean_k = self.stats.get(f"mean_{key}")
+            std_k = self.stats.get(f"std_{key}")
+            
+            if mean_k is None or std_k is None:
+                return val
+            
+            if isinstance(val, np.ndarray):
+                val = torch.from_numpy(val).float()
+                
+            dev = val.device
+            mean_v = mean_k.to(dev)
+            std_v = std_k.to(dev)
+            
+            norm = (val - mean_v) / std_v
+            return norm
     
     def _denormalize(self, key, val):
-        min_k = self.stats.get(f"min_{key}")
-        max_k = self.stats.get(f"max_{key}")
-        
-        if min_k is None or max_k is None:
-            return val
+        if self.normalization_type == "min_max":
+            min_k = self.stats.get(f"min_{key}")
+            max_k = self.stats.get(f"max_{key}")
             
-        dev = val.device
-        min_v = min_k.to(dev)
-        max_v = max_k.to(dev)
+            if min_k is None or max_k is None:
+                return val
+                
+            dev = val.device
+            min_v = min_k.to(dev)
+            max_v = max_k.to(dev)
 
-        denorm = (val + 1) / 2 * (max_v - min_v) + min_v
-        return denorm
+            # val * (max - min) + min
+            denom = max_v - min_v
+            denorm = val * denom + min_v
+            return denorm
+        else:
+            mean_k = self.stats.get(f"mean_{key}")
+            std_k = self.stats.get(f"std_{key}")
+            
+            if mean_k is None or std_k is None:
+                return val
+                
+            dev = val.device
+            mean_v = mean_k.to(dev)
+            std_v = std_k.to(dev)
+
+            denorm = val * std_v + mean_v
+            return denorm
 
     def _add_rotation_noise(self, tensor, noise_level):
         """Add noise to rotation features (e.g., 6D)."""
         # tensor: (T, 6)
         
         # 1. Convert to Rotation Matrix (T, 3, 3)
-        rot_mat = rotation_6d_to_matrix(tensor)
+        rot_mat = rot6d_to_rot(tensor.cpu().numpy())
         
         # 2. Generate random axis-angle noise
         # axis_angle = randn * noise_level represents a random rotation vector
@@ -382,21 +456,21 @@ class FlexibleWindowDataset(Dataset):
         
         # 3. Convert perturbation to Matrix
         perturbation_quat = axis_angle_to_quaternion(perturbation_axis_angle)
-        perturbation_mat = quaternion_to_matrix(perturbation_quat)
+        perturbation_mat = quat_to_rot(perturbation_quat.cpu().numpy())
         
         # 4. Apply perturbation: R_new = R * R_perturbation (Local perturbation)
-        rot_mat_noisy = torch.bmm(rot_mat, perturbation_mat)
+        rot_mat_noisy = perturbation_mat @ rot_mat
         
         # 5. Convert back to 6D
-        tensor_noisy = matrix_to_rotation_6d(rot_mat_noisy)
+        tensor_noisy = torch.from_numpy(rot_to_6d(rot_mat_noisy)).to(tensor.device)
         
         return tensor_noisy
     
     def _add_obs_noise(self, tensor, key):
         """Add noise based on config."""
-        if key in ["obj_rel_rot6d", "body_rot6d"]:
-            return self._add_rotation_noise(tensor, noise_level=self.noise_cfg[key])
-        elif key in self.noise_cfg:
+        # if key in ["obj_rel_rot6d", "body_rot6d"]:
+        #     return self._add_rotation_noise(tensor, noise_level=self.noise_cfg[key])
+        if key in self.noise_cfg:
             noise_level = self.noise_cfg[key]
             noise = torch.randn_like(tensor) * noise_level
             return tensor + noise
@@ -407,7 +481,6 @@ class FlexibleWindowDataset(Dataset):
         
         # Use RAM-cached data
         raw_traj = self._get_single_traj(file_idx, batch_idx)
-        
         # Compute features
         features, anchor = self._compute_transform(raw_traj, t_start)
 
@@ -442,13 +515,12 @@ class FlexibleWindowDataset(Dataset):
 
     def _calculate_stats(self):
         """
-        Optimized stats calculation:
-        1. Groups windows by file to minimize IO (load once per file).
-        2. Vectorizes operations where possible in large chunks.
+        Optimized stats calculation for Mean-Std:
+        1. Groups windows by file to minimize IO.
+        2. Accumulates sum, sum_sq, and count for each feature.
         """
-        print("Calculating normalization stats (min/max)...")
-        mins = {}
-        maxs = {}
+        print("Calculating normalization stats (mean/std)...")
+        accumulators = {}
         
         # Group indices by file/batch to avoid repeated IO
         file_map = {}
@@ -464,23 +536,24 @@ class FlexibleWindowDataset(Dataset):
             raw_traj = self._get_single_traj(file_idx, batch_idx)
                         
             # 2. Process Windows in Batches
-            BATCH_SIZE = 256 # Process windows in chunks to manage memory
+            BATCH_SIZE = 256
             
             w_size = self.window_size + self.history_size
-            ref_idx = min(self.history_size, w_size - 1)
+            ref_idx = self.history_size - 1
             raw_len = raw_traj['base'].shape[0]
 
-            # Pre-allocate generic buffer lists
             batch_data = {
                 "base": [], "joints": [], "obj": [],
-                "base_vel": [], "joints_vel": [], "obj_vel": []
+                "base_vel": [], "joints_vel": [], "obj_vel": [],
+                "ee_rel_pos": [],
             }
             batch_task_params = []
             
             has_vel = 'base_vel' in raw_traj
+            has_ee = 'ee_rel_pos' in raw_traj
             
             for s in starts:
-                raw_start = s - 1
+                raw_start = s
                 raw_end = raw_start + w_size
                 
                 # Logic mimicking _compute_transform padding
@@ -492,22 +565,11 @@ class FlexibleWindowDataset(Dataset):
                 j_slice = raw_traj['joints'][read_start:read_end]
                 o_slice = raw_traj['obj'][read_start:read_end]
 
-                # Task Params
                 if 'task_params' in raw_traj:
                     tp = raw_traj['task_params']
                 else:
                     tp = self._compute_task_params(raw_traj['base'], raw_traj['obj'], start_idx=read_start)
                 batch_task_params.append(tp)
-                
-                pad_front = max(0, -raw_start)
-                pad_back = max(0, raw_end - raw_len)
-                
-                if pad_front > 0 or pad_back > 0:
-                    pad_width = ((pad_front, pad_back), (0,0))
-                    b_slice = np.pad(b_slice, pad_width, mode='edge')
-                    j_slice = np.pad(j_slice, pad_width, mode='edge')
-                    o_slice = np.pad(o_slice, pad_width, mode='edge')
-                
                 batch_data["base"].append(b_slice)
                 batch_data["joints"].append(j_slice)
                 batch_data["obj"].append(o_slice)
@@ -517,76 +579,72 @@ class FlexibleWindowDataset(Dataset):
                      jv = raw_traj['joints_vel'][read_start:read_end] if 'joints_vel' in raw_traj else np.zeros_like(j_slice)
                      ov = raw_traj['obj_vel'][read_start:read_end] if 'obj_vel' in raw_traj else np.zeros_like(o_slice) 
                      
-                     if pad_front > 0 or pad_back > 0:
-                         pad_width = ((pad_front, pad_back), (0,0))
-                         bv = np.pad(bv, pad_width, mode='edge')
-                         jv = np.pad(jv, pad_width, mode='edge')
-                         ov = np.pad(ov, pad_width, mode='edge')
                      batch_data["base_vel"].append(bv)
                      batch_data["joints_vel"].append(jv)
                      batch_data["obj_vel"].append(ov)
+                
+                if has_ee:
+                    ee = raw_traj['ee_rel_pos'][read_start:read_end]
+                    batch_data["ee_rel_pos"].append(ee)
 
                 if len(batch_data["base"]) >= BATCH_SIZE:
-                    self._update_batch_stats(mins, maxs, batch_data, ref_idx, has_vel, task_params=batch_task_params)
-                    batch_data = {k: [] for k in batch_data}
+                    self._update_batch_stats(accumulators, batch_data, ref_idx, has_vel, task_params=batch_task_params)
+                    batch_data = {
+                        "base": [], "joints": [], "obj": [],
+                        "base_vel": [], "joints_vel": [], "obj_vel": [],
+                        "ee_rel_pos": [],
+                    }
                     batch_task_params = []
             
             if len(batch_data["base"]) > 0:
-                 self._update_batch_stats(mins, maxs, batch_data, ref_idx, has_vel, task_params=batch_task_params)
+                 self._update_batch_stats(accumulators, batch_data, ref_idx, has_vel, task_params=batch_task_params)
                  batch_task_params = []
 
-        # Store to stats dict
+        # Calculate Mean and Std
         self.stats = {}
-        
-        for k in mins:
-            self.stats[f"min_{k}"] = torch.as_tensor(mins[k]).float()
-            self.stats[f"max_{k}"] = torch.as_tensor(maxs[k]).float()
+        for k, acc in accumulators.items():
+            if self.normalization_type == "min_max":
+                min_v = acc['min']
+                max_v = acc['max']
 
-        # Shared Normalization Logic
-        shared_keys = ["delta_xy", "obj_delta_xy", "task_params"]
-        present_shared = [k for k in shared_keys if f"min_{k}" in self.stats]
+                # Avoid zero range
+                diff = max_v - min_v
+                diff[diff < 1e-6] = 1.0
+
+                self.stats[f"min_{k}"] = torch.as_tensor(min_v).float()
+                self.stats[f"max_{k}"] = torch.as_tensor(max_v).float()
+                # Store diff for convenience if desired, but we can compute dynamically
         
-        if len(present_shared) > 1:
-            # Collect XY mins/maxs
-            xy_mins = []
-            xy_maxs = []
-            
-            for k in present_shared:
-                v_min = self.stats[f"min_{k}"]
-                v_max = self.stats[f"max_{k}"]
+            else:
+                count = acc['count']
+                mean = acc['sum'] / count
                 
-                # Take first 2 dims (assuming X, Y are 0, 1)
-                xy_mins.append(v_min[:2])
-                xy_maxs.append(v_max[:2])
-            
-            # Compute global min/max for XY
-            global_min_xy = torch.min(torch.stack(xy_mins), dim=0)[0]
-            global_max_xy = torch.max(torch.stack(xy_maxs), dim=0)[0]
-                        
-            # Update stats in place
-            for k in present_shared:
-                # Update Min
-                curr_min = self.stats[f"min_{k}"].clone()
-                curr_min[:2] = global_min_xy
-                self.stats[f"min_{k}"] = curr_min
+                # Variance = E[x^2] - (E[x])^2
+                # Use max(0, var) to avoid numerical error -> sqrt
+                var = (acc['sq_sum'] / count) - (mean ** 2)
+                std = np.sqrt(np.maximum(var, 1e-8))
                 
-                # Update Max
-                curr_max = self.stats[f"max_{k}"].clone()
-                curr_max[:2] = global_max_xy
-                self.stats[f"max_{k}"] = curr_max
-                
+                # Avoid divide by zero
+                std[std < 1e-6] = 1.0
+
+                self.stats[f"mean_{k}"] = torch.as_tensor(mean).float()
+                self.stats[f"std_{k}"] = torch.as_tensor(std).float()
+
+        # Shared Normalization Logic if needed (e.g. sharing delta_xy mean/std)
+        # Note: Usually we want separate means but maybe shared std? 
+        # For now, let's keep separate unless requested.
+        
         # Save
         if self.norm_path:
             os.makedirs(os.path.dirname(self.norm_path), exist_ok=True)
-            # Save as numpy dict
             np_stats = {k: v.numpy() for k, v in self.stats.items()}
             np.savez(self.norm_path, **np_stats)
             print(f"Stats saved to {self.norm_path}")
             
         self._update_global_stats()
 
-    def _update_batch_stats(self, mins, maxs, batch_data, ref_idx, has_vel, task_params=None):
-        base = np.stack(batch_data["base"]) # (B, W, 7)
+    def _update_batch_stats(self, accumulators, batch_data, ref_idx, has_vel, task_params=None):
+        base = np.stack(batch_data["base"]) 
         joints = np.stack(batch_data["joints"])
         obj = np.stack(batch_data["obj"])
         
@@ -594,14 +652,18 @@ class FlexibleWindowDataset(Dataset):
         joints_vel = np.stack(batch_data["joints_vel"]) if has_vel else None
         obj_vel = np.stack(batch_data["obj_vel"]) if has_vel else None
         
+        ee_rel_pos = None
+        if "ee_rel_pos" in batch_data and len(batch_data["ee_rel_pos"]) > 0:
+             ee_rel_pos = np.stack(batch_data["ee_rel_pos"])
+
         comps, _ = compute_sbto_components(
             base, joints, obj, ref_idx,
-            base_vel=base_vel, joints_vel=joints_vel, obj_vel=obj_vel
+            base_vel=base_vel, joints_vel=joints_vel, obj_vel=obj_vel,
+            ee_rel_pos=ee_rel_pos
         )
 
         if task_params:
-            # list of (D,) -> (B, D) -> (B, 1, D) so it matches (B, W, D) logic
-            tp_stack = np.stack(task_params) # (B, D)
+            tp_stack = np.stack(task_params)
             if tp_stack.ndim == 2:
                 tp_stack = tp_stack[:, np.newaxis, :]
             comps['task_params'] = tp_stack
@@ -609,16 +671,27 @@ class FlexibleWindowDataset(Dataset):
         for k, v in comps.items():
             if v is None: continue
             v = v.astype(np.float64)
-            # v is (B, W, D). Min/Max over B(0) and W(1)
-            v_min = np.min(v, axis=(0, 1))
-            v_max = np.max(v, axis=(0, 1))
+            # v is (B, W, D). Combine B and W
+            B, W, D = v.shape
+            v_flat = v.reshape(-1, D)
+            count = v_flat.shape[0]
             
-            if k not in mins:
-                mins[k] = v_min
-                maxs[k] = v_max
+            s = np.sum(v_flat, axis=0) # (D,)
+            ss = np.sum(v_flat**2, axis=0) # (D,)
+
+            if k not in accumulators:
+                if self.normalization_type == "mean_std":
+                    accumulators[k] = {'sum': s, 'sq_sum': ss, 'count': count}
+                else:
+                    accumulators[k] = {'min': np.min(v_flat, axis=0), 'max': np.max(v_flat, axis=0)}
             else:
-                mins[k] = np.minimum(mins[k], v_min)
-                maxs[k] = np.maximum(maxs[k], v_max)
+                if self.normalization_type == "mean_std":
+                    accumulators[k]['sum'] += s
+                    accumulators[k]['sq_sum'] += ss
+                    accumulators[k]['count'] += count
+                else:
+                    accumulators[k]['min'] = np.minimum(accumulators[k]['min'], np.min(v_flat, axis=0))
+                    accumulators[k]['max'] = np.maximum(accumulators[k]['max'], np.max(v_flat, axis=0))
 
     def _load_stats(self):
         print(f"Loading stats from {self.norm_path}")
@@ -630,27 +703,51 @@ class FlexibleWindowDataset(Dataset):
         
     def _update_global_stats(self):
         # Precompute global stats for concatenated features
+        means = []
+        stds = []
         mins = []
         maxs = []
-        for key in self.feature_order:
-             # Check if key exists in stats
-             mk, MK = f"min_{key}", f"max_{key}"
-             if mk in self.stats and MK in self.stats:
-                 mins.append(self.stats[mk])
-                 maxs.append(self.stats[MK])
         
-        if mins:
-            self.global_min = torch.cat(mins, dim=-1)
-            self.global_max = torch.cat(maxs, dim=-1)
+        for key in self.feature_order:
+             if self.normalization_type == "min_max":
+                 mk, MK = f"min_{key}", f"max_{key}"
+                 if mk in self.stats and MK in self.stats:
+                     mins.append(self.stats[mk])
+                     maxs.append(self.stats[MK])
+             else:
+                 mk, sk = f"mean_{key}", f"std_{key}"
+                 if mk in self.stats and sk in self.stats:
+                     means.append(self.stats[mk])
+                     stds.append(self.stats[sk])
+        
+        if self.normalization_type == "min_max":
+            if mins:
+                self.global_min = torch.cat(mins, dim=-1)
+                self.global_max = torch.cat(maxs, dim=-1)
+        else:
+            if means:
+                self.global_mean = torch.cat(means, dim=-1)
+                self.global_std = torch.cat(stds, dim=-1)
 
     def denormalize_global(self, tensor):
         """Denormalize a concatenated feature tensor using global stats."""
-        if hasattr(self, 'global_min') and hasattr(self, 'global_max'):
-            device = tensor.device
-            min_val = self.global_min.to(device)
-            max_val = self.global_max.to(device)
-            return ((tensor + 1) / 2) * (max_val - min_val) + min_val
-        return tensor
+        if self.normalization_type == "min_max":
+            if hasattr(self, 'global_min') and hasattr(self, 'global_max'):
+                device = tensor.device
+                min_val = self.global_min.to(device)
+                max_val = self.global_max.to(device)
+                denom = max_val - min_val
+                # clamp just in case? no, linear
+                return tensor * denom + min_val
+            return tensor
+            
+        else:
+            if hasattr(self, 'global_mean') and hasattr(self, 'global_std'):
+                device = tensor.device
+                mean_val = self.global_mean.to(device)
+                std_val = self.global_std.to(device)
+                return tensor * std_val + mean_val
+            return tensor
 
     def __len__(self):
         return len(self.indices)

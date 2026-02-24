@@ -56,8 +56,7 @@ def parse_args():
 # -----------------------------------------------------------------------------
 
 def load_env_and_data():
-    # device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    device = "cpu"
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model_cfg, data_cfg, training_cfg, noise_cfg = load_config("config/config.yaml")
 
     data_path = get_data_path(data_cfg)
@@ -109,6 +108,10 @@ def autoregressive_rollout(args, diffuser, dataset, model_cfg, data_cfg, noise_c
     generated_segments = []
     fps = None
 
+    # Init state containers for autoregressive loop
+    new_curr_states = []
+    new_anchors = {'ref_pos': [], 'ref_quat': []}
+
     # Stitch Loop
     for i in range(args.stitch_steps):
         print(f"Segment {i+1}/{args.stitch_steps}")
@@ -122,12 +125,16 @@ def autoregressive_rollout(args, diffuser, dataset, model_cfg, data_cfg, noise_c
         anchors_list = []
         
         print(f"Loading initial conditions for indices: {indices}")
-        for idx in indices:
+        for j, idx in enumerate(indices):
             _, curr, task, anch = dataset[idx]
+            
+            # Autoregressive Logic:
+            # User requested NOT to use generated conditions, but always load from dataset (Teacher Forcing).
+            # This ensures we test how the model performs given the correct start state at each window.
             curr_states_list.append(curr)
-            goal_cond_list.append(task)
             anchors_list.append(anch)
-
+            goal_cond_list.append(task)
+            
         curr_state_tens = torch.stack(curr_states_list).to(diffuser.device)
 
         if fps is None and anchors_list and 'fps' in anchors_list[0]:
@@ -188,7 +195,7 @@ def autoregressive_rollout(args, diffuser, dataset, model_cfg, data_cfg, noise_c
                 num_trajectories=args.batch_size,
                 state_cond=curr_state_tens, 
                 goal_cond=goal_cond_tens,
-                deterministic=False,
+                deterministic=noise_cfg.get("deterministic_inference", False),
                 cfg_w=args.cfg_w
             ) 
             
@@ -214,7 +221,7 @@ def autoregressive_rollout(args, diffuser, dataset, model_cfg, data_cfg, noise_c
         generated_segments.append(segment)
 
         if args.generate:
-            # 3. Predict Next State (only needed for generation loop)
+            # Although we are computing next states for generation loop)
             ''' 
             We need to construct the next 'current_state' from the end of the generated segment.
             This involves:
@@ -290,16 +297,18 @@ def autoregressive_rollout(args, diffuser, dataset, model_cfg, data_cfg, noise_c
     
     # Select best SINGLE trajectory
     best_idx = 0    
-    if args.generate and args.batch_size > 1:
+    if args.generate and args.batch_size > 1 and args.task_height is not None:
         best_distance = float('inf')
-        goal_obj_height = args.task_params
+        goal_obj_height = args.task_height
         for b in range(0, args.batch_size):
             final_obj_height = stitched[b, -1, 36 + 2] # obj z-pos is at index 36+2
             if abs(final_obj_height - goal_obj_height) < best_distance:
                 best_idx = b
                 best_distance = abs(final_obj_height - goal_obj_height)
         print(f"Selected trajectory {best_idx} with final object height {stitched[best_idx, -1, 36 + 2].item():.3f} (distance to goal: {best_distance.item():.3f})")
-    
+    elif args.generate and args.batch_size > 1:
+        print("Batch size > 1 but no task_height specified for selection. Using index 0.")
+
     stitched = stitched[best_idx]
     
     return stitched, None, fps

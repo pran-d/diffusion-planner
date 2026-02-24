@@ -1,0 +1,94 @@
+0 - base_x
+1 - base_y
+2 - base_z
+3 - base_qw
+4 - base_qx
+5 - base_qy
+6 - base_qz
+7 - left_hip_pitch_joint
+8 - left_hip_roll_joint
+9 - left_hip_yaw_joint 
+10 - left_knee_joint
+11 - left_ankle_pitch_joint
+12 - left_ankle_roll_joint
+13 - right_hip_pitch_joint
+14 - right_hip_roll_joint
+15 - right_hip_yaw_joint
+16 - right_knee_joint
+17 - right_ankle_pitch_joint
+18 - right_ankle_roll_joint
+19 - waist_yaw_joint
+20 - waist_roll_joint
+21 - waist_pitch_joint
+22 - left_shoulder_pitch_joint
+23 - left_shoulder_roll_joint
+24 - left_shoulder_yaw_joint
+25 - left_elbow_joint
+26 - left_wrist_roll_joint
+27 - left_wrist_pitch_joint
+28 - left_wrist_yaw_joint
+29 - right_shoulder_pitch_joint
+30 - right_shoulder_roll_joint
+31 - right_shoulder_yaw_joint
+32 - right_elbow_joint
+33 - right_wrist_roll_joint
+34 - right_wrist_pitch_joint
+35 - right_wrist_yaw_joint
+36 - box_x
+37 - box_y
+38 - box_z
+39 - box_qw
+40 - box_qx
+41 - box_qy
+42 - box_qz
+
+# 0 - delta_x
+# 1 - delta_y
+# 2 - delta_yaw
+# 3 - obj_delta_x
+# 4 - obj_delta_y
+# 5 - left_hip_pitch_joint
+# 6 - left_hip_roll_joint
+# 7 - left_hip_yaw_joint 
+# 8 - left_knee_joint
+# 9 - left_ankle_pitch_joint
+# 10 - left_ankle_roll_joint
+# 11 - right_hip_pitch_joint
+# 12 - right_hip_roll_joint
+# 13 - right_hip_yaw_joint
+# 14 - right_knee_joint
+# 15 - right_ankle_pitch_joint
+# 16 - right_ankle_roll_joint
+# 17 - waist_yaw_joint
+# 18 - waist_roll_joint
+# 19 - waist_pitch_joint
+# 20 - left_shoulder_pitch_joint
+# 21 - left_shoulder_roll_joint
+# 22 - left_shoulder_yaw_joint
+# 23 - left_elbow_joint
+# 24 - left_wrist_roll_joint
+# 25 - left_wrist_pitch_joint
+# 26 - left_wrist_yaw_joint
+# 27 - right_shoulder_pitch_joint
+# 28 - right_shoulder_roll_joint
+# 29 - right_shoulder_yaw_joint
+# 30 - right_elbow_joint
+# 31 - right_wrist_roll_joint
+# 32 - right_wrist_pitch_joint
+# 33 - right_wrist_yaw_joint
+# 34 - body_z
+# 35 - body_rot6d_1
+# 36 - body_rot6d_2
+# 37 - body_rot6d_3
+# 38 - body_rot6d_4
+# 39 - body_rot6d_5
+# 40 - body_rot6d_6
+# 41 - obj_rel_pos_x
+# 42 - obj_rel_pos_y
+# 43 - obj_rel_pos_z
+# 44 - obj_rel_rot6d_1
+# 45 - obj_rel_rot6d_2
+# 46 - obj_rel_rot6d_3
+# 47 - obj_rel_rot6d_4
+# 48 - obj_rel_rot6d_5
+# 49 - obj_rel_rot6d_6

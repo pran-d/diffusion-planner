@@ -301,7 +301,20 @@ for epoch in range(starting_epoch, num_epochs):
             )
             model_pred = diff_output["xs_pred"]
             pred_loss = diff_output["loss"]
-            loss = pred_loss.mean()
+
+            if model_pred.shape[-1] > 50 and training_cfg.get("geom_loss_weight", 0.0) > 0.0:
+                pred_ee_pos = model_pred[..., 50:56].reshape(*model_pred.shape[:-1], 2, 3)
+                pred_obj_pos = model_pred[..., 41:44].reshape(*model_pred.shape[:-1], 1, 3)
+
+                true_ee_pos = prediction_target[..., 50:56].reshape(*model_pred.shape[:-1], 2, 3)
+                true_obj_pos = prediction_target[..., 41:44].reshape(*model_pred.shape[:-1], 1, 3)
+
+                geom_loss = F.mse_loss(pred_ee_pos - pred_obj_pos, true_ee_pos - true_obj_pos)
+                geom_loss = training_cfg.get("geom_loss_weight", 0.0) * geom_loss
+            else:
+                geom_loss = 0.0
+
+            loss = pred_loss.mean() + geom_loss
 
         optimizer.zero_grad()
         
@@ -344,9 +357,9 @@ for epoch in range(starting_epoch, num_epochs):
     # ===============================
     # Early Stopping Check
     # ===============================
-    patience = 75
-    target_loss = 0.0025  # Threshold for "low loss" (tune based on your problem)
-    stagnation_std = 5e-4  # Threshold for "roughly stagnant" (tune if needed)
+    patience = 100
+    target_loss = 0.002  # Threshold for "low loss" (tune based on your problem)
+    stagnation_std = 8e-5  # Threshold for "roughly stagnant" (tune if needed)
 
     if len(epoch_losses_history) >= patience:
         last_50_losses = epoch_losses_history[-patience:]

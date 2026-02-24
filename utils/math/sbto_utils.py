@@ -1,3 +1,4 @@
+import mujoco
 import numpy as np
 from .math_tools import (
     normalize_angle,
@@ -12,6 +13,113 @@ from .math_tools import (
     batch_rotation,
     transpose,
 )
+
+
+def enforce_quaternion_continuity(q_traj, q_start=None):
+    """
+    Ensure quaternion trajectory is continuous by flipping sign if dot product is negative.
+    Supports (B, T, 4) and (T, 4).
+    If q_start is provided (B, 4) or (4,), it is used to anchor the first element.
+    """
+    q_out = q_traj.copy()
+
+    # Check if batched
+    is_batched = (q_out.ndim == 3)
+    if not is_batched:
+        q_out = q_out[None, ...]  # (1, T, 4)
+
+    B, T, _ = q_out.shape
+    
+    # Handle start condition if provided
+    if q_start is not None:
+        if not is_batched and q_start.ndim == 1:
+            q_start = q_start[None, ...] # (1, 4)
+        
+        # Check alignment of first frame with q_start
+        dot_0 = np.sum(q_start * q_out[:, 0], axis=1) # (B,)
+        mask_0 = (dot_0 < 0)
+        q_out[mask_0, 0] *= -1.0
+
+    for t in range(1, T):
+        # Dot between q_{t-1} and q_t
+        # Note: q_out[:, t-1] is already processed/flipped
+        dot = np.sum(q_out[:, t - 1] * q_out[:, t], axis=1)  # (B,)
+
+        # If dot < 0, flip q_t
+        mask = (dot < 0)
+        q_out[mask, t] *= -1.0
+
+    if not is_batched:
+        return q_out[0]
+    return q_out
+
+
+def compute_fk_batched(model, 
+                       data, 
+                       qpos_batch, 
+                       base_name="pelvis", 
+                       ee_names=("left_wrist_roll_link", "right_wrist_roll_link"),
+                       joint_offset=7):
+    """
+    Computes relative coordinates for batched states of arbitrary dimensions (e.g., B, T, N).
+    Returns a NumPy array matching the input batch dimensions: (B, T, num_ees, 3).
+    """
+    # 1. Standardize input to NumPy
+    qpos_batch = np.asarray(qpos_batch)
+    
+    # Save the original batch dimensions (everything except the last feature dimension)
+    batch_dims = qpos_batch.shape[:-1]
+    N = qpos_batch.shape[-1]
+    num_ees = len(ee_names)
+    
+    # Flatten all batch/time dimensions into a single list of states: (Total_States, N)
+    qpos_flat = qpos_batch.reshape(-1, N)
+    total_states = qpos_flat.shape[0]
+    
+    # 2. Pre-fetch and validate all MuJoCo IDs ONCE for massive speedup
+    base_id = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_BODY, base_name)
+    if base_id == -1:
+        raise ValueError(f"Could not find base '{base_name}' in the model.")
+        
+    ee_ids = []
+    for ee in ee_names:
+        ee_id = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_BODY, ee)
+        if ee_id == -1:
+            raise ValueError(f"Could not find end-effector '{ee}' in the model.")
+        ee_ids.append(ee_id)
+
+    # 3. Pre-allocate the flat output array
+    relative_positions_flat = np.zeros((total_states, num_ees, 3))
+    
+    # 4. Fast loop over all states
+    for i in range(total_states):
+        # Inject the state for this step
+        if N == model.nq:
+            data.qpos[:] = qpos_flat[i]
+        else:
+            end_idx = joint_offset + N
+            if end_idx > model.nq:
+                raise ValueError(f"Array length {N} with offset {joint_offset} exceeds model.nq ({model.nq})")
+            data.qpos[joint_offset:end_idx] = qpos_flat[i]
+
+        # Compute Forward Kinematics
+        mujoco.mj_kinematics(model, data)
+        
+        # Extract base global position and rotation matrix (3x3)
+        base_pos_global = data.xpos[base_id]
+        base_rot_global = data.xmat[base_id].reshape(3, 3)
+        
+        # Calculate and store relative positions for each end-effector
+        for j, ee_id in enumerate(ee_ids):
+            ee_pos_global = data.xpos[ee_id]
+            
+            # P_rel = R_base^T * (P_ee_global - P_base_global)
+            global_diff = ee_pos_global - base_pos_global
+            relative_positions_flat[i, j, :] = base_rot_global.T @ global_diff
+            
+    # 5. Reshape back to the original batch dimensions + (num_ees, 3)
+    final_shape = batch_dims + (num_ees * 3, )
+    return relative_positions_flat.reshape(final_shape)
 
 # ============================================================
 # Feature Layouts
@@ -111,7 +219,8 @@ def compute_sbto_components(
     base_vel=None,
     joints_vel=None,
     obj_vel=None,
-    save_velocities=False
+    save_velocities=False,
+    ee_rel_pos=None
 ):
     """
     Core SBTO transformation logic returning a dictionary of components.
@@ -140,7 +249,9 @@ def compute_sbto_components(
     delta_yaw = normalize_angle(yaw - ref_yaw)[..., None]
 
     R_body = quat_to_rot(base_w[..., 3:])
-    R_body_no_yaw = remove_yaw_from_rot(R_body)
+    R_yaw_inv = yaw_to_rot_matrix(-yaw)
+    R_body_no_yaw = R_yaw_inv @ R_body
+     
     body_rot6d = rot_to_6d(R_body_no_yaw)
 
     # Velocities
@@ -168,6 +279,19 @@ def compute_sbto_components(
     obj_delta_pos_local = batch_rotation(R_ref_inv, obj_delta_pos_world)
     obj_delta_xy = obj_delta_pos_local[..., :2]
 
+    # End-effector relative 
+    if ee_rel_pos is None:
+        mj_model = mujoco.MjModel.from_xml_path("./mj_model.xml")
+        mj_data = mujoco.MjData(mj_model)
+        ee_rel_pos = compute_fk_batched(
+            model=mj_model,
+            data=mj_data,
+            qpos_batch=joints,
+            base_name="pelvis",
+            ee_names=["left_wrist_roll_link", "right_wrist_roll_link"],
+            joint_offset=7
+        )
+
     comps = {
         "joints": joints,
         "delta_xy": delta_xy,
@@ -177,6 +301,7 @@ def compute_sbto_components(
         "obj_rel_pos": obj_rel_pos,
         "obj_rel_rot6d": obj_rel_rot6d,
         "obj_delta_xy": obj_delta_xy,
+        "ee_rel_pos": ee_rel_pos,
     }
     
     if save_velocities:
@@ -426,30 +551,35 @@ def reconstruct_sbto_trajectory(
     # Z from absolute Z feature
     
     # Delta pos local (T, 3) - but we only have XY
-    delta_pos_local = np.zeros((_, T, 3))
-    delta_pos_local[:, :, :2] = traj_delta_xy
+    delta_pos_local = np.zeros(traj_delta_xy.shape[:-1] + (3,))
+    delta_pos_local[..., :2] = traj_delta_xy
     
     # Transform to world: pos = ref_pos + R_ref @ delta_local
     # Note: R_ref here is just the yaw rotation, as delta_xy is relative to ref frame yaw
     # Expand dims for broadcasting: (B, 1, 3, 3) @ (B, T, 3, 1) -> squeeze
     delta_pos_world = (R_ref_yaw[:, None, :, :] @ delta_pos_local[..., None]).squeeze(-1)
     
-    pos_world = np.zeros((_, T, 3))
-    pos_world[:, :, :2] = base_pos_world_anchor[:, None, :2] + delta_pos_world[..., :2]
+    pos_world = np.zeros(traj_delta_xy.shape[:-1] + (3,))
+    pos_world[..., :2] = base_pos_world_anchor[:, None, :2] + delta_pos_world[..., :2]
 
-    pos_world[:, :, 2] = traj_body_z
+    pos_world[..., 2] = traj_body_z
 
     # Orientation
     # yaw = ref_yaw + delta_yaw
     # R = RotZ(yaw) @ R_no_yaw
     
-    traj_yaw = ref_yaw[:, None] + traj_delta_yaw.squeeze(-1)
+    traj_yaw = normalize_angle(ref_yaw[:, None] + traj_delta_yaw.squeeze(-1))
     R_yaw = yaw_to_rot_matrix(traj_yaw)
     
     R_no_yaw = rot6d_to_rot(traj_body_rot6d)
     
     R_world = R_yaw @ R_no_yaw
     quat_world = rot_to_quat(R_world)
+    
+    # Enforce quaternion continuity relative to anchor
+    # Anchor quat is at base_pose_world[:, 3:7] (B, 4)
+    q_anchor = base_pose_world[:, 3:7]
+    quat_world = enforce_quaternion_continuity(quat_world, q_start=q_anchor)
 
     # --------------------------------------------------
     # Object pose
@@ -460,6 +590,10 @@ def reconstruct_sbto_trajectory(
     obj_pos_world = pos_world + (R_world @ traj_obj_pos_local[..., None]).squeeze(-1)
     obj_rot_world = R_world @ traj_obj_rot_local
     obj_quat_world = rot_to_quat(obj_rot_world)
+    
+    # Enforce quaternion continuity - Object
+    # Just continuous within traj for now
+    obj_quat_world = enforce_quaternion_continuity(obj_quat_world)
 
     if inpaint and has_obj_delta_xy:
         print("Inpainting object position with obj_delta_xy...")
@@ -673,7 +807,7 @@ def compute_guidance_vec(current_pos, target_pos, R_robot_yaw_inv, current_rot=N
 
     return np.concatenate([guidance_dir, dist], axis=-1).squeeze(1)
 
-def compute_task_params(current_robot_state, current_obj_state, desired_obj_pos, normalize_goal_vec=True):
+def compute_task_params(current_robot_state, current_obj_state, desired_obj_pos, normalize_goal_vec=True, num_task_params=3):
     """
     Computes the task parameters (local object displacement) for the diffusion model.
 
@@ -686,7 +820,7 @@ def compute_task_params(current_robot_state, current_obj_state, desired_obj_pos,
                                       representing the GOAL object position in world frame.
 
     Returns:
-        np.ndarray: Shape (2,) [delta_x_local, delta_y_local] normalized if needed.
+        np.ndarray: Shape (num_task_params,) [delta_x_local, delta_y_local, ...] normalized if needed.
     """
     # 1. Extract Positions
     curr_obj_pos = current_obj_state[:3]  # We only care about X, Y for displacement
@@ -706,8 +840,10 @@ def compute_task_params(current_robot_state, current_obj_state, desired_obj_pos,
     local_delta = (R_ref_inv @ world_delta[..., None])[..., 0]
 
     if normalize_goal_vec:    
-        local_delta_norm = np.linalg.norm(local_delta)
-        if local_delta_norm > 1e-6:
+        local_delta = local_delta[..., :num_task_params-1]
+        local_delta_norm = np.linalg.norm(local_delta, keepdims=True)
+        if local_delta_norm > 1e-3:
             local_delta = local_delta / local_delta_norm
-    
+        local_delta = np.concatenate([local_delta, local_delta_norm], axis=-1)
+        
     return local_delta

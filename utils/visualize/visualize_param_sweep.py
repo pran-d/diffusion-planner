@@ -124,7 +124,16 @@ def run_evaluation_batch(
     
     # We maintain current state tensor if using state cond
     curr_state_tens = initial_states.to(device) if initial_states is not None else None
-    
+    task_tens = norm_task_params.to(device)
+
+    if args.stitch_steps is None:
+        args.stitch_steps = dataset.traj_lengths[args.traj_idx] // diffuser.window_size
+        print(f"Auto-setting stitch_steps to {args.stitch_steps} based on dataset length.")
+
+    if args.action_horizon is not None:
+        args.stitch_steps *= (diffuser.window_size // args.action_horizon)
+        print(f"Adjusting stitch_steps to {args.stitch_steps} based on action horizon")
+
     # We maintain ground truth (or target) task params
     # Initial tasks (will be updated in loop dynamically)
     gt_task_tens = norm_task_params.to(device)
@@ -143,8 +152,9 @@ def run_evaluation_batch(
             
             tp = compute_task_params(
                 c_quat, c_obj, c_goal,
-                normalize_goal_vec=dataset.data_cfg.get("normalize_goal_vec", False)
-            )[..., :diffuser.data_cfg["num_task_params"]] # (2,) or (3,) depending on impl
+                normalize_goal_vec=dataset.normalize_goal_vec,
+                num_task_params=dataset.num_task_params 
+            ) # (2,) or (3,) depending on impl
             new_task_list.append(tp)
         
         new_task_arr = np.stack(new_task_list)
@@ -156,12 +166,6 @@ def run_evaluation_batch(
         # --------------------------------------------------------
         # Inference
         # --------------------------------------------------------
-        # Handle batching inside getSample? No, getSample takes batch.
-        # But we might run out of memory if num_samples is huge.
-        # Let's assume the caller handles batching or num_samples is small.
-        # Actually existing code loops batches. I should support that or just simplify.
-        # Given args.batch_size, let's loop batches here.
-        
         # Wait, if we stitching, we must process all samples for step K before step K+1.
         
         # So inside this step loop, we loop over batches.
@@ -193,7 +197,8 @@ def run_evaluation_batch(
             b_anchors = np.concatenate([
                 current_anchors['ref_pos'][b_start:b_end], 
                 current_anchors['ref_quat'][b_start:b_end], 
-                current_anchors['ref_obj_pos'][b_start:b_end]
+                current_anchors['ref_obj_pos'][b_start:b_end],
+                current_anchors['final_obj_pos'][b_start:b_end]
             ], axis=-1)
             
             try:
@@ -225,7 +230,6 @@ def run_evaluation_batch(
         # Update Condition for next step
         if step < args.stitch_steps - 1:
             # We need to update curr_state_tens and current_anchors
-            # based on full_step_segment
             # Robot: 0:36, Obj: 36:43
             r_full = full_step_segment[..., :36]
             o_full = full_step_segment[..., 36:43]

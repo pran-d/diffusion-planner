@@ -11,25 +11,18 @@ import sys
 # format: ( "path/to/specific_config.yaml", "Description of what this ablation tests" )
 
 ABLATIONS = [
+    # (
+    #     "config/ablations/normalized_goal/config.yaml",
+    #     "normalized goal vector (ablation of normalization)"
+    # ),
 
     (
-        "config/ablations/timesteps/config_1.yaml",
-        "1 time-step in future"
+        "config/ablations/geom_loss/config.yaml",
+        "using geometric loss (ablation of loss function components)"
     ),
-
     (
         "config/ablations/timesteps/config_5.yaml",
-        "5 time-steps in future"
-    ),
-
-    (
-        "config/ablations/timesteps/config_10.yaml",
-        "10 time-steps in future"
-    ),
-
-    (
-        "config/ablations/timesteps/config_20.yaml",
-        "20 time-steps in future"
+        "using 5 timesteps instead of 10 (ablation of number of diffusion steps)"
     ),
 
 ]

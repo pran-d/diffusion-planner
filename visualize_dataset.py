@@ -8,6 +8,7 @@ import os
 from config.configure import load_config, get_data_path, get_norm_path
 from datasets.flexible_dataset import FlexibleWindowDataset
 from utils.visualize.visualize import MjVisualizer
+from utils.math.sbto_utils import batch_rotation, quat_to_rot
 
 def load_env_and_data():
     # Use config from file
@@ -30,6 +31,7 @@ def main():
     parser = argparse.ArgumentParser("Visualize Dataset Trajectories")
     parser.add_argument("--start_idx", type=int, default=0, help="Index of unique trajectory to start from")
     parser.add_argument("--overlay", action="store_true", help="Overlay all object paths and hide robot")
+    parser.add_argument("--show_ee", action="store_true", help="Visualize computed EE paths")
     args = parser.parse_args()
 
     data_cfg, dataset = load_env_and_data()
@@ -117,6 +119,55 @@ def main():
             full_state[:, 2] = -100.0
             current_overlay = all_obj_paths
         
+        if args.show_ee and 'ee_rel_pos' in raw_traj:
+            # Visualize EE paths
+            # ee_rel_pos: (T, num_ees, 3)
+            # base: (T, 7)
+            # P_ee = P_base + R_base @ P_rel
+            
+            ee_rel = raw_traj['ee_rel_pos']
+            T_ee = min(len(base), len(ee_rel))
+            
+            base_pos = base[:T_ee, :3]
+            base_quat = base[:T_ee, 3:]
+            
+            base_rot = quat_to_rot(base_quat) # (T_ee, 3, 3)
+            
+            ee_global_paths = []
+            
+            # ee_rel is (T, num_ees * 3). Reshape to (T, num_ees, 3)
+            if ee_rel.ndim == 2:
+                num_dims = ee_rel.shape[1]
+                num_ees = num_dims // 3
+                ee_rel_reshaped = ee_rel[:T_ee].reshape(T_ee, num_ees, 3)
+            else:
+                 # In case it was saved as (T, N, 3)
+                 ee_rel_reshaped = ee_rel[:T_ee]
+                 num_ees = ee_rel_reshaped.shape[1]
+
+            for j in range(num_ees):
+                rel_pos = ee_rel_reshaped[:T_ee, j, :] # (T_ee, 3)
+                
+                # Transform each point
+                # batch_rotation expects R (..., 3, 3) and vectors (..., 3)
+                
+                ee_pos_delta = batch_rotation(base_rot, rel_pos)
+                ee_pos_global = base_pos + ee_pos_delta
+                
+                ee_global_paths.append(ee_pos_global)
+            
+            if current_overlay is None:
+                current_overlay = list(ee_global_paths)
+            else:
+                # If current_overlay is all_obj_paths (which is a list of arrays), we should probably not mutate it directly if we loop?
+                # But we are inside the loop. 
+                # If we extend all_obj_paths, it will grow every iteration!
+                if args.overlay:
+                    # Create a new list combining both
+                    current_overlay = all_obj_paths + ee_global_paths
+                else:
+                    current_overlay.extend(ee_global_paths)
+        
         print(f"  Trajectory length: {T}, Shape: {full_state.shape}")
         if 'fps' in raw_traj:
             print(f"  FPS: {raw_traj['fps']}")
@@ -126,8 +177,6 @@ def main():
         t = np.linspace(0, T * dt, T)
         
         # Visualize
-        print("  Playing (Repeated)... Press Enter in terminal to play next, 'q' to quit.")
-        
         # We need a way to keep visualizing until user input.
         # MjVisualizer.visualize_trajectory usually blocks or loops?
         # If repeat=True, it loops.
@@ -143,12 +192,13 @@ def main():
         # If it IS blocking, we wait for window close.
         # Let's try running it.
         
-        visualizer.visualize_trajectory(t, full_state, repeat=True, overlay_paths=current_overlay)
-        
-        # If non-blocking, we wait here.
-        user_in = input(">> Next? (Enter/q): ")
-        if user_in.strip().lower() == 'q':
-            break
+        visualizer.visualize_trajectory(
+            t, 
+            full_state, 
+            repeat=True, 
+            overlay_paths=current_overlay if args.overlay else None,
+            markers=ee_global_paths if args.show_ee and 'ee_rel_pos' in raw_traj else None
+        )
 
 if __name__ == "__main__":
     main()

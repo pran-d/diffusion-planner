@@ -21,6 +21,7 @@ class MjVisualizer():
         self.step = 0
         self.paused = {"active": False}  # use dict so closure can mutate
         self.step_request = {"delta": 0}
+        self.clean_request = {"active": False}
         self.exit_request = {"active": False}
         self.close_on_enter = close_on_enter
 
@@ -39,6 +40,8 @@ class MjVisualizer():
             # Enter
             elif keycode == 257:
                 self.exit_request["active"] = True
+            elif keycode == 67:  # 'C' for clean
+                self.clean_request["active"] = True
 
         self.viewer = mujoco.viewer.launch_passive(self.mj_model, self.mj_data, key_callback=key_callback)
 
@@ -63,6 +66,7 @@ class MjVisualizer():
         goal_pos: np.ndarray = None, 
         goal_quat: np.ndarray = None,
         overlay_paths: list = None,
+        markers: list = None,
     ) -> None:
         """
         Visualizes the trajectory in a Mujoco viewer with pause and step-by-step control.
@@ -179,6 +183,24 @@ class MjVisualizer():
                             p2
                         )
                         self.viewer.user_scn.ngeom += 1
+
+            # Markers (dynamic points at current frame)
+            if markers:
+                for marker_traj in markers:
+                    # marker_traj: (T, 3) or just (3,) if static? 
+                    # Assuming (T, 3) for now based on request "at each frame"
+                    if len(marker_traj) > self.step:
+                        pos = marker_traj[self.step]
+                        if self.viewer.user_scn.ngeom < self.viewer.user_scn.maxgeom:
+                            mujoco.mjv_initGeom(
+                                self.viewer.user_scn.geoms[self.viewer.user_scn.ngeom],
+                                type=mujoco.mjtGeom.mjGEOM_SPHERE,
+                                size=[0.02, 0, 0],
+                                pos=pos,
+                                mat=np.eye(3).flatten(),
+                                rgba=[1, 0, 0, 0.5] # Red
+                            )
+                            self.viewer.user_scn.ngeom += 1
 
             mujoco.mj_forward(self.mj_model, self.mj_data)
             # print(self.bodies_in_contact("left_wrist_pitch_link", "largebox"))

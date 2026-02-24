@@ -61,24 +61,6 @@ class MLP(nn.Module):
     def forward(self, x):
         return self.net(x)
 
-class HistoryAttention(nn.Module):
-    def __init__(self, state_dim, history_len):
-        super().__init__()
-        self.query = nn.Parameter(torch.zeros(1, 1, state_dim))
-        self.attn = nn.MultiheadAttention(
-            embed_dim=state_dim, num_heads=1, batch_first=True
-        )
-        self.norm = nn.LayerNorm(state_dim)
-
-    def forward(self, x):
-        # x: (B, C, H) or (B, C)
-        if x.ndim == 2: x = x.unsqueeze(-1) # (B, C, 1)
-        x = x.permute(0, 2, 1)  # (B, H, C)
-        q = self.query.expand(x.size(0), -1, -1)  # (B, 1, C)
-
-        out, _ = self.attn(q, x, x)  # (B, 1, C)
-        return self.norm(out.squeeze(1))  # (B, C)
-        
 
 class DFoTTrajectory(nn.Module):
     def __init__(self, model_config, data_config, noise_scheduler_config=None, training_config=None, noise_scheduler=None):
