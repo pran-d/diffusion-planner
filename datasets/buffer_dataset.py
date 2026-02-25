@@ -4,8 +4,9 @@ import os
 from torch.utils.data import Dataset
 from tqdm import tqdm
 
-from datasets.flexible_dataset import FlexibleWindowDataset
-
+from .flexible_dataset import FlexibleWindowDataset
+from mjlab.scripts.diffusion_planner.utils.math.sbto_utils import compute_task_params
+from mjlab.scripts.diffusion_planner.utils.math.math_tools import yaw_from_quat, yaw_to_rot_matrix
 
 class BufferDataset(FlexibleWindowDataset):
     """
@@ -20,46 +21,33 @@ class BufferDataset(FlexibleWindowDataset):
         - RL Rollout: body_pos_w, body_quat_w, joint_pos, object_pos_w, object_quat_w
         - SBTO:       base_xyz_quat, actuator_pos, obj_0_xyz_quat
     """
-
-    def __init__(self,
-                 data_buffer,
-                 config,
-                 feature_order=None,
-                 norm_path=None,
-                 calculate_stats=True,
-                 noise_cfg=None,
-                 add_noise=False,
-                 add_goal_noise=False):
-
-        # Store raw buffer before any init
+    def __init__(self, 
+        data_buffer, 
+        config, 
+        task_params=None,
+        feature_order=None, 
+        norm_path=None, 
+        calculate_stats=True, 
+        noise_cfg=None, 
+        add_noise=False,
+        add_goal_noise=False
+    ):
+        
+        super().__init__(
+            data_root=None,  # No files, data is in buffer # type: ignore
+            config=config,
+            feature_order=feature_order,
+            norm_path=norm_path,
+            calculate_stats=calculate_stats,
+            noise_cfg=noise_cfg,
+            add_noise=add_noise,
+            add_goal_noise=add_goal_noise,
+        )
+        
         self._raw_buffer = data_buffer
-
-        # ---- Config (mirrors FlexibleWindowDataset.__init__) ----
-        self.data_root = None
-        self.noise_cfg = noise_cfg or {}
-        self.num_observations = config.get("num_observations", 45)
-        self.num_features = config.get("num_features", 48)
-        self.history_size = config.get("state_history", 4)
-        self.window_size = config.get("num_timesteps", 50) // config.get("downsample", 1)
-        self.stride = config.get("stride", 1)
-        self.downsample = config.get("downsample", 1)
-        self.start_timestep = config.get("start_timestep", 0)
-        self.normalize_goal_vec = config.get("normalize_goal_vec", True)
-        self.num_task_params = config.get("num_task_params", 2)
-        self.normalization_type = config.get("normalization_type", "mean_std")
-        self.key_mapping = config.get("key_mapping", {})
-
-        self.add_noise = add_noise
-        self.add_goal_noise = add_goal_noise
-
-        self.feature_order = feature_order or [
-            "delta_xy", "delta_yaw", "obj_delta_xy",
-            "joints", "body_z", "body_rot6d",
-            "obj_rel_pos", "obj_rel_rot6d",
-        ]
+        self._task_params = task_params
 
         # No file paths for buffer dataset
-        self.file_paths = []
 
         # ---- Preload buffer into ram_cache ----
         self.ram_cache = []
@@ -191,10 +179,26 @@ class BufferDataset(FlexibleWindowDataset):
             else:
                 raise ValueError(f"Unrecognized buffer schema. Keys: {keys}")
 
-            # ---- External task_params (per-trajectory, no time dim) ----
-            if 'task_params' in keys:
-                tp = np.asarray(std_buf['task_params'][i])
-                processed['task_params'] = tp  # shape (D,) — not batched over time
+            # ---- External goal (per-trajectory, no time dim) ----
+            # The pipeline passes the desired final box position expressed in the
+            # coordinate frame of the initial robot pelvis.  Convert to world frame
+            # so every window can call compute_task_params(ref, obj, goal_world).
+            if self._task_params is not None:
+                goal_local = np.asarray(self._task_params[i], dtype=np.float64)
+
+                # Initial pelvis pose & initial object pos (first real frame)
+                init_base = processed['base'][0, 0, :]   # (7,) [x,y,z,w,x,y,z]
+                init_obj  = processed['obj'][0, 0, :3]    # (3,)
+
+                init_yaw = yaw_from_quat(init_base[3:7])
+                R_local_to_world = yaw_to_rot_matrix(init_yaw)
+
+                goal_3d = np.zeros(3, dtype=np.float64)
+                n = min(len(goal_local), 3)
+                goal_3d[:n] = goal_local[:n]
+
+                goal_world = (R_local_to_world @ goal_3d[:, None])[:, 0] + init_obj[:3]
+                processed['goal_obj_world'] = goal_world  # (3,) world frame
 
             self.ram_cache.append(processed)
 
@@ -246,7 +250,7 @@ class BufferDataset(FlexibleWindowDataset):
 
         result = {}
         for k, v in file_data.items():
-            if k == 'task_params':
+            if k in ('task_params', 'goal_obj_world'):
                 # Non-temporal — pass through as-is
                 result[k] = v
             else:
@@ -254,13 +258,36 @@ class BufferDataset(FlexibleWindowDataset):
         return result
 
     # ------------------------------------------------------------------
-    # Override _compute_transform to inject external task_params
+    # Override _compute_task_params so stats use compute_task_params
+    # ------------------------------------------------------------------
+    def _compute_task_params(self, base_traj, obj_traj, start_idx=0):
+        """Delegate to compute_task_params from sbto_utils for consistency."""
+        return compute_task_params(
+            current_robot_state=base_traj[start_idx],
+            current_obj_state=obj_traj[start_idx],
+            desired_obj_pos=obj_traj[-1, :3],
+            normalize_goal_vec=self.normalize_goal_vec,
+            num_task_params=self.num_task_params,
+        )
+
+    # ------------------------------------------------------------------
+    # Override _compute_transform to use world-frame goal per window
     # ------------------------------------------------------------------
     def _compute_transform(self, raw_traj, t_start):
-        """Call parent transform, then override task_params if provided externally."""
+        """Call parent transform, then recompute task_params with external goal if available."""
         feats, anchor = super()._compute_transform(raw_traj, t_start)
 
-        if 'task_params' in raw_traj:
-            feats['task_params'] = np.asarray(raw_traj['task_params'])
+        if 'goal_obj_world' in raw_traj:
+            goal_world = raw_traj['goal_obj_world']
+            read_start = max(0, t_start)
+
+            feats['task_params'] = compute_task_params(
+                current_robot_state=raw_traj['base'][read_start],
+                current_obj_state=raw_traj['obj'][read_start],
+                desired_obj_pos=goal_world,
+                normalize_goal_vec=self.normalize_goal_vec,
+                num_task_params=self.num_task_params,
+            )
+            anchor['final_obj_pos'] = goal_world
 
         return feats, anchor

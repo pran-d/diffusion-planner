@@ -2,6 +2,7 @@ import torch
 import numpy as np
 import yaml
 import os
+import math
 import time
 from typing import List, Dict, Union, Optional
 from torch.utils.data import DataLoader, WeightedRandomSampler
@@ -11,11 +12,13 @@ from tqdm import tqdm
 from scipy.interpolate import interp1d
 from scipy.spatial.transform import Rotation as R
 from scipy.spatial.transform import Slerp
+from scipy.ndimage import gaussian_filter1d
 
 from config.configure import load_config, get_data_path, get_save_path, get_norm_path
 from models.model import RobotDiffuser
 from datasets.buffer_dataset import BufferDataset
 from utils.math.sbto_utils import reconstruct_sbto_trajectory, compute_task_params
+from utils.math.math_tools import yaw_from_quat, yaw_to_rot_matrix
 
 
 def compute_dataset_weights(dataset, sigma=0.2):
@@ -52,10 +55,10 @@ def compute_dataset_weights(dataset, sigma=0.2):
         raw = dataset._get_single_traj(f, b)
         
         # BufferDataset check: if 'obj' is missing
-        if 'obj' not in raw and 'task_params' in raw:
+        if 'task_params' in raw:
              tp_raw = raw['task_params']
-        elif 'obj' in raw:
-             tp_raw = dataset._compute_task_params(raw['obj'])
+        elif 'obj' in raw and 'base' in raw:
+             tp_raw = dataset._compute_task_params(raw['base'], raw['obj'])
         else:
              print(f"Warning: No object data or task params found for {f},{b}")
              continue
@@ -173,11 +176,12 @@ class MotionGenerator:
             )
 
     def fit(self, 
-            data_source: Union[str, List[Dict]], 
-            task_params: Optional[List[Dict]] = None,
-            epochs: int = None, 
-            save_path: str = None,
-            checkpoint: Optional[str] = None):
+        data_source: Union[str, List[Dict]], 
+        task_params: Optional[List[Dict]] = None,
+        epochs: int = None, 
+        save_path: str = None,
+        checkpoint: Optional[str] = None):
+
         """
         Train the model.
         
@@ -198,10 +202,21 @@ class MotionGenerator:
         if isinstance(data_source, str):
             raise ValueError("MotionGenerator.fit no longer supports file paths. Please load data into a buffer first.")
         
+        
+        # If epochs is 0, we assume inference mode and load stats.
+        calc_stats = True
+        if epochs == 0:
+             if norm_path and os.path.exists(norm_path):
+                 print(f"Epochs=0 detected. Loading normalization stats from {norm_path} instead of recalculating.")
+                 calc_stats = False
+             else:
+                 print("Epochs=0 but no stats found at {norm_path}. Recalculating stats from data_source.")
+        
         self.dataset = BufferDataset(
             data_buffer=data_source,
+            task_params=task_params,
             config=self.data_cfg, 
-            calculate_stats=True, 
+            calculate_stats=calc_stats, 
             norm_path=norm_path, # will overwrite if provided
             noise_cfg=self.training_cfg.get("state_conditioning_noise_level", {}),
             add_noise=self.training_cfg.get("add_obs_noise", False), 
@@ -219,13 +234,15 @@ class MotionGenerator:
                 print("WeightedRandomSampler activated (Balance Task Density).")
 
         # Create DataLoader
+        # num_workers=0 avoids forking after CUDA context init
+        # (fork + CUDA → Warp error 3). Dataset is in-memory, so no I/O benefit.
         train_dataloader = DataLoader(
             self.dataset, 
             batch_size=self.data_cfg["batch_size"], 
-            num_workers=4,
+            num_workers=0,
             shuffle=shuffle,
             sampler=sampler,
-            pin_memory=True
+            pin_memory=False
         )
 
         # Optimizer & Scheduler
@@ -240,9 +257,8 @@ class MotionGenerator:
 
         if checkpoint:
             if os.path.exists(checkpoint):
-                print(f"Loading diffusion weights from {checkpoint}...")
-                ckpt = torch.load(checkpoint, map_location=self.device)
-                self.diffuser.model.load_state_dict(ckpt["model"])
+                # print(f"Loading diffusion weights from {checkpoint}...")
+                ckpt = self.diffuser.loadWeights(checkpoint)
                 if "optimizer" in ckpt:
                     optimizer.load_state_dict(ckpt["optimizer"])
                 if "scheduler" in ckpt:
@@ -266,8 +282,8 @@ class MotionGenerator:
             
             for step, batch in enumerate(pbar):
 
-                if self.training_cfg.get("batches_per_epoch") and step >= self.training_cfg["batches_per_epoch"]:
-                    break
+                # if self.training_cfg.get("batches_per_epoch") and step >= self.training_cfg["batches_per_epoch"]:
+                #     break
                 
                 if batch[0].shape[0] < self.data_cfg["batch_size"]:
                     current_bs = batch[0].shape[0]
@@ -376,6 +392,7 @@ class MotionGenerator:
             return trajectory
 
         # print(f"Interpolating trajectory with downsample factor {k}...")
+        # print(f"Interpolating trajectory with downsample factor {k}...")
         B, T, D = trajectory.shape
         # Original knots at 0, k, 2k, ...
         # If we have T knots, the duration is roughly (T-1)*k. 
@@ -417,6 +434,30 @@ class MotionGenerator:
                      interpolated[b, :, sl] = interp_q
         
         return interpolated
+
+    def _smooth_trajectory(self, trajectory, sigma=1.0):
+        """
+        Smooth trajectory using Gaussian filter.
+        trajectory: (B, T, D)
+        """
+        # Apply Gaussian filter along time axis
+        smoothed = gaussian_filter1d(trajectory, sigma=sigma, axis=1)
+        
+        # Renormalize quaternions
+        # Robot Quat: 3:7
+        # Object Quat: 39:43
+        quat_indices = [slice(3, 7), slice(39, 43)]
+        D = trajectory.shape[-1]
+
+        for sl in quat_indices:
+            if sl.stop <= D:
+                q_vals = smoothed[..., sl]
+                # Normalize
+                norm = np.linalg.norm(q_vals, axis=-1, keepdims=True)
+                # Avoid division by zero
+                norm = np.maximum(norm, 1e-8)
+                smoothed[..., sl] = q_vals / norm
+        return smoothed
 
     def _update_condition(self, robot_world_history, obj_world_history, final_obj_pos=None):
         """
@@ -483,128 +524,183 @@ class MotionGenerator:
     def generate_trajectory(self, 
                             initial_condition: Dict, 
                             goal_condition: Union[Dict, np.ndarray],
-                            stitch_steps: int = 1, 
+                            target_traj_length: int = None,
+                            stitch_steps: int = None, 
                             num_samples: int = 1,
-                            cfg_w: float = 1.0,
-                            deterministic: bool = True,
+                            cfg_w: float = 1.25,
                             end_error_threshold: float = 0.1):
         """
         Generate trajectory via autoregressive diffusion (mirrors inference.py).
         
         Args:
-            initial_condition: Dict with 'robot' (H, 36) and 'obj' (H, 7) history in world frame.
-            goal_condition: np.ndarray (3,) — final desired object position in world frame.
-            stitch_steps: Number of autoregressive segments.
-            num_samples: Number of parallel samples to generate.
+            initial_condition: Dict with 'robot' (B, H, 36) or (H, 36) and 
+                               'obj' (B, H, 7) or (H, 7) history in world frame.
+            goal_condition: np.ndarray (B, D_task) or (D_task,) — desired task params 
+                           (e.g. final object position) in world frame.
+            target_traj_length: Desired output trajectory length (pre-interpolation).
+                                Used to auto-compute stitch_steps from the model window size.
+                                Ignored if stitch_steps is explicitly provided.
+            stitch_steps: Number of autoregressive segments. If None, auto-computed from
+                          target_traj_length and model window size (minimum 1).
+            num_samples: Number of parallel samples **per input condition**.
+                         When input is already batched (B > 1), set to 1.
             cfg_w: Classifier-free guidance weight.
-            deterministic: Whether to use DDIM (True) or DDPM (False).
             end_error_threshold: Stop stitching early if goal reached within this L2 error.
             
         Returns:
-            np.ndarray of shape (num_samples, T_total, D) where D = 36 (robot) + 7 (object).
+            np.ndarray of shape (B * num_samples, T_total, D) where D = 36 (robot) + 7 (object).
         """
         if self.dataset is None:
              raise RuntimeError("Dataset not initialized. Call fit() or setup.")
 
         self.diffuser.model.eval()
         
+        window_size = self.dataset.window_size  # model output length per segment
+        history_size = self.dataset.history_size
+
+        # --- Auto-compute stitch_steps from target trajectory length ---
+        if stitch_steps is None:
+            if target_traj_length is not None and target_traj_length > window_size:
+                stitch_steps = target_traj_length // window_size + 1
+            else:
+                stitch_steps = 1
+
         # 1. Process Initial Condition
-        r_hist = np.asarray(initial_condition['robot'])  # (H, 36)
-        o_hist = np.asarray(initial_condition['obj'])    # (H, 7)
+        r_hist = np.asarray(initial_condition['robot'])  # (B, H, 36) or (H, 36)
+        o_hist = np.asarray(initial_condition['obj'])    # (B, H, 7) or (H, 7)
         
         if r_hist.ndim == 2: r_hist = r_hist[None, ...]
         if o_hist.ndim == 2: o_hist = o_hist[None, ...]
 
+        B_input = r_hist.shape[0]
+
         # Get initial encoded state and anchors
         curr_state_tens, current_anchors = self._update_condition(r_hist, o_hist)
         
-        # Set final_obj_pos in anchors
-        final_obj_pos = np.asarray(goal_condition)
-        if final_obj_pos.ndim == 1:
-            final_obj_pos = final_obj_pos[None, :]  # (1, 3)
-        current_anchors['final_obj_pos'] = np.repeat(final_obj_pos, curr_state_tens.shape[0], axis=0)
+        # 2. Process Goal
+        #    Pipeline passes the desired final object position expressed in the
+        #    coordinate frame of the initial robot pelvis.  Convert to world frame
+        #    so compute_task_params receives world-frame inputs.
+        if isinstance(goal_condition, (np.ndarray, list)):
+             gc_np = np.asarray(goal_condition, dtype=np.float64)  # (D,) or (B, D)
+             if gc_np.ndim == 1: gc_np = gc_np[None, :]
+             
+             # Broadcast single goal to match batch
+             if gc_np.shape[0] == 1 and B_input > 1:
+                 gc_np = np.repeat(gc_np, B_input, axis=0)
+        else:
+             raise ValueError("Goal condition format not supported yet. Pass np.ndarray or list.")
         
-        # Replicate for num_samples
-        if curr_state_tens.shape[0] == 1 and num_samples > 1:
+        # Convert from initial-pelvis-local frame to world frame
+        init_base = r_hist[:, 0, :7]   # (B, 7) initial pelvis [x,y,z,w,x,y,z]
+        goal_world = np.zeros((B_input, 3), dtype=np.float64)
+        for b in range(B_input):
+            yaw = yaw_from_quat(init_base[b, 3:7])
+            R_local_to_world = yaw_to_rot_matrix(yaw)
+            goal_3d = np.zeros(3, dtype=np.float64)
+            n = min(gc_np.shape[-1], 3)
+            goal_3d[:n] = gc_np[b, :n]
+            goal_world[b] = (R_local_to_world @ goal_3d[:, None])[:, 0] + init_base[b, :3]
+
+        # 3. Replicate for num_samples (when generating multiple samples per condition)
+        if num_samples > 1 and curr_state_tens.shape[0] == 1:
             curr_state_tens = curr_state_tens.repeat(num_samples, 1, 1)
             for k in current_anchors:
                 current_anchors[k] = np.repeat(current_anchors[k], num_samples, axis=0)
+            goal_world = np.repeat(goal_world, num_samples, axis=0)
         
         curr_state_tens = curr_state_tens.to(self.device)
+        effective_batch = curr_state_tens.shape[0]
         
-        history_size = self.dataset.history_size
         stitched_segments = []
-        
-        # 2. Autoregressive Loop (mirrors inference.py)
-        for step in range(stitch_steps):
-            print(f"Generating segment {step+1}/{stitch_steps}...")
 
-            # A. Compute task params from current anchors (same as inference.py)
-            tp_init = compute_task_params(
-                current_robot_state=current_anchors['ref_quat'], 
-                current_obj_state=current_anchors['ref_obj_pos'], 
-                desired_obj_pos=current_anchors['final_obj_pos'],
-                normalize_goal_vec=self.data_cfg.get("normalize_goal_vec", False),
-                num_task_params=self.data_cfg["num_task_params"]
-            )
-            task_params = self.dataset._normalize("task_params", tp_init)
-            task_tens = task_params.repeat(num_samples, 1).to(self.device) if task_params.shape[0] == 1 else task_params.to(self.device)
-
-            # B. Inference
-            normalized_sample = self.diffuser.getSample(
-                num_trajectories=num_samples,
-                state_cond=curr_state_tens,
-                goal_cond=task_tens,
-                deterministic=deterministic,
-                cfg_w=cfg_w,
-            )
-            
-            # C. Denormalize
-            denorm_btc = self.dataset.denormalize_global(normalized_sample)
-            future_traj_np = denorm_btc.detach().cpu().numpy()
-            
-            # D. Reconstruct World Frame
-            anchor_arr = np.concatenate([
-                current_anchors['ref_pos'], 
-                current_anchors['ref_quat'], 
-                current_anchors['ref_obj_pos'],
-                current_anchors['final_obj_pos'],
-            ], axis=-1)
-            
-            res = reconstruct_sbto_trajectory(
-                anchor_arr, future_traj_np, 
-                inpaint=self.diffuser.model_cfg.get("inpaint", False)
-            )
-            r_world, o_world = res[0], res[1]
-            
-            # Store segment: Robot(36) + Object(7)
-            segment_world = np.concatenate([r_world[..., :36], o_world[..., :7]], axis=-1)
-            stitched_segments.append(segment_world)
-
-            # E. Early stopping check
-            err = np.linalg.norm(
-                current_anchors["final_obj_pos"][..., :self.data_cfg["num_task_params"]] 
-                - segment_world[:, -1, 36 : 36 + self.data_cfg["num_task_params"]]
-            )
-            if err < end_error_threshold:
-                print(f"Segment {step+1} reached goal (Error: {err:.4f}). Stopping.")
-                break
-            
-            # F. Update Condition for next step
-            if step < stitch_steps - 1:
-                r_hist_new = r_world[:, -history_size:, :]
-                o_hist_new = o_world[:, -history_size:, :]
-                curr_state_tens, current_anchors = self._update_condition(
-                    r_hist_new, o_hist_new, 
-                    final_obj_pos=np.repeat(final_obj_pos, num_samples, axis=0)
+        # 4. Autoregressive Loop
+        with torch.no_grad():
+            for step in range(stitch_steps):
+                # A. Compute per-step task params (world-frame goal → local displacement)
+                task_cond_np = compute_task_params(
+                    current_robot_state=current_anchors['ref_quat'],
+                    current_obj_state=current_anchors['ref_obj_pos'],
+                    desired_obj_pos=goal_world,
+                    normalize_goal_vec=self.data_cfg.get("normalize_goal_vec", True),
+                    num_task_params=self.data_cfg.get("num_task_params", 3),
                 )
-                curr_state_tens = curr_state_tens.to(self.device)
+                task_cond = self.dataset._normalize(
+                    'task_params',
+                    torch.from_numpy(task_cond_np.astype(np.float32)).to(self.device),
+                )
+
+                # B. Generate normalized sample
+                normalized_sample = self.diffuser.getSample(
+                    num_trajectories=effective_batch,
+                    state_cond=curr_state_tens,
+                    goal_cond=task_cond,
+                    deterministic=self.noise_cfg.get("deterministic_inference", False),
+                    cfg_w=cfg_w,
+                )  # (B, T, D_out)
+                
+                # C. Denormalize
+                denorm_btc = self.dataset.denormalize_global(normalized_sample)
+                future_traj_np = denorm_btc.detach().cpu().numpy()
+                
+                # D. Reconstruct World Frame from SBTO features
+                #    final_obj_pos in anchor must be in world frame for reconstruction
+                current_anchors['final_obj_pos'] = goal_world
+
+                anchor_arr = np.concatenate([
+                    current_anchors['ref_pos'], 
+                    current_anchors['ref_quat'], 
+                    current_anchors['ref_obj_pos'],
+                    current_anchors['final_obj_pos'],
+                ], axis=-1)
+                
+                res = reconstruct_sbto_trajectory(
+                    anchor_arr, future_traj_np, 
+                    inpaint=self.diffuser.model_cfg.get("inpaint", False)
+                )
+                r_world, o_world = res[0], res[1]
+                
+                # Store segment: Robot(36) + Object(7)
+                segment_world = np.concatenate([r_world[..., :36], o_world[..., :7]], axis=-1)
+
+                if step == stitch_steps - 1 and target_traj_length is not None:
+                    if target_traj_length % window_size != 0:
+                        # Trim to target length if last segment overshoots
+                        segment_world = segment_world[:, :(target_traj_length % window_size), :]
+                    else:
+                        segment_world = None
+                
+                if segment_world is not None:
+                    stitched_segments.append(segment_world)
+
+
+                # E. Early stopping check (world-frame goal vs. achieved object position)
+                # err = np.linalg.norm(
+                #     goal_world - segment_world[:, -1, 36:39],
+                #     axis=-1,
+                # ).mean()
+                # if err < end_error_threshold:
+                #     print(f"Segment {step+1} reached goal (Error: {err:.4f}). Stopping.")
+                #     break
+                
+                # F. Update Condition for next step
+                if step < stitch_steps - 1:
+                    r_hist_new = r_world[:, -history_size:, :]
+                    o_hist_new = o_world[:, -history_size:, :]
+                    curr_state_tens, current_anchors = self._update_condition(
+                        r_hist_new, o_hist_new, 
+                        final_obj_pos=goal_world,
+                    )
+                    curr_state_tens = curr_state_tens.to(self.device)
         
         full_trajectory = np.concatenate(stitched_segments, axis=1)
 
-        # Interpolate if needed
+        # Interpolate if needed (based on dataset downsample config)
         if self.dataset is not None:
-            full_trajectory = self._interpolate_trajectory(full_trajectory)
+             full_trajectory = self._interpolate_trajectory(full_trajectory)
+
+        # Smooth trajectory
+        full_trajectory = self._smooth_trajectory(full_trajectory, sigma=2.0)
 
         return full_trajectory
 
