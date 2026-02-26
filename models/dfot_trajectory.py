@@ -13,6 +13,8 @@ from einops.layers.torch import Rearrange
 import numpy as np
 from utils.configcls import Config
 
+from utils.math.sbto_utils import FEATURE_LAYOUT_NO_VEL, get_feature_indices
+
 # =========================
 # Conditioning Embeddings
 # =========================
@@ -63,13 +65,12 @@ class MLP(nn.Module):
 
 
 class DFoTTrajectory(nn.Module):
-    def __init__(self, model_config, data_config, noise_scheduler_config=None, training_config=None, noise_scheduler=None):
+    def __init__(self, model_config, data_config, noise_scheduler_config=None, training_config=None):
         super().__init__()
         self.model_config = model_config
         self.data_config = data_config
         self.noise_scheduler_config = noise_scheduler_config 
         self.training_config = training_config
-        self.noise_scheduler = noise_scheduler
         
         self.x_shape = torch.Size([data_config['num_features']])
         self.state_condition = model_config.get("state_condition", False)
@@ -120,11 +121,11 @@ class DFoTTrajectory(nn.Module):
             raise ValueError(f"Unknown backbone type: {backbone_type}")
         
         # Map beta schedule
-        beta_schedule = self.noise_scheduler_config.get("beta_schedule", "squaredcos_cap_v2")
+        beta_schedule = self.noise_scheduler_config.get("beta_schedule", "sigmoid")
 
         # Map prediction type
         prediction_type = self.noise_scheduler_config.get("prediction_type", "v_prediction")
-        objective = "pred_v" if prediction_type == "v_prediction" else "pred_noise"
+        objective = "pred_v" if prediction_type == "v_prediction" else "pred_x0" if prediction_type == "sample" else "pred_noise"
 
         # Diffusion config
         diffusion_cfg = Config({
@@ -146,14 +147,10 @@ class DFoTTrajectory(nn.Module):
             "clip_noise": 20.0,
             "use_causal_mask": self.noise_scheduler_config.get("use_causal_mask", False),
         })
-        
-        # Extract betas from noise_scheduler if available
-        betas = None
-        if self.noise_scheduler is not None:
-            betas = self.noise_scheduler.betas
 
         self.max_tokens = data_config['num_timesteps'] // data_config.get('downsample', 1)
 
+        betas=None
         self.diffusion_model = DiscreteDiffusion(
             cfg=diffusion_cfg,
             backbone_cfg=backbone_cfg,
@@ -354,6 +351,7 @@ class DFoTTrajectory(nn.Module):
 
         cond_list = []
         if self.state_condition and state_cond_input is not None:
+            self.state_cond = state_cond_input
             s_cond = self.state_embedding(state_cond_input) # (B, C)
             if no_state_cond:
                 s_cond = apply_condition_dropout(
@@ -362,6 +360,7 @@ class DFoTTrajectory(nn.Module):
                 )
             cond_list.append(s_cond)
         if self.task_condition and task_cond is not None:
+            self.task_cond = task_cond
             t_cond = self.task_embedding(task_cond) # (B, D)
             cond_list.append(t_cond)
         
@@ -550,7 +549,12 @@ class DFoTTrajectory(nn.Module):
                 tc = tc.to(xs_pred.device, dtype=xs_pred.dtype)
                 
                 if inpaint:
-                    xs_pred[..., -1, 3:3 + tc.shape[-1]] = tc
+                    f_map = get_feature_indices(FEATURE_LAYOUT_NO_VEL)
+                    xs_pred[..., 0, f_map['joints']] = self.state_cond[..., :29]
+                    xs_pred[..., 0, f_map['body_z']] = self.state_cond[..., 29:30]
+                    xs_pred[..., 0, f_map['body_rot6d']] = self.state_cond[..., 30:36]
+                    xs_pred[..., 0, f_map['obj_rel_pos']] = self.state_cond[..., 36:39]
+                    xs_pred[..., 0, f_map['obj_rel_rot6d']] = self.state_cond[..., 39:45]
             
             pbar.update(1)
 

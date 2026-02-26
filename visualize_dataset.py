@@ -31,6 +31,9 @@ def main():
     parser = argparse.ArgumentParser("Visualize Dataset Trajectories")
     parser.add_argument("--start_idx", type=int, default=0, help="Index of unique trajectory to start from")
     parser.add_argument("--overlay", action="store_true", help="Overlay all object paths and hide robot")
+    parser.add_argument("--traj_idx", type=int, default=None, help="Trajectory (file) index")
+    parser.add_argument("--batch_idx", type=int, default=0, help="Batch index within file")
+    parser.add_argument("--start_time", type=float, default=0.0, help="Start time in seconds for visualization")
     parser.add_argument("--show_ee", action="store_true", help="Visualize computed EE paths")
     args = parser.parse_args()
 
@@ -46,38 +49,7 @@ def main():
     # Pre-load all trajectories for overlay
     all_trajs_data = []
     all_obj_paths = []
-    
-    if args.overlay:
-        print("Pre-loading ALL trajectories for overlay...")
-        from tqdm import tqdm
-        for f_idx, b_idx in tqdm(unique_trajs):
-            try:
-                raw = dataset._get_single_traj(f_idx, b_idx)
-                all_trajs_data.append(raw)
-                if 'obj' in raw:
-                    # Ensure numpy array
-                    path = raw['obj'][:, :3] if isinstance(raw['obj'], np.ndarray) else np.array(raw['obj'])[:, :3]
-                    all_obj_paths.append(path)
-                else:
-                    all_obj_paths.append(np.zeros((1, 3)))
-            except Exception as e:
-                print(f"Error loading {f_idx}, {b_idx}: {e}")
-                all_trajs_data.append(None)
-                all_obj_paths.append(np.zeros((1, 3)))
-    else:
-        # Just lazy load in loop (or just load standard way - but we already refactored loop to use all_trajs_data, so we should populate it or reverting logic)
-        # To minimize code change, let's just populate all_trajs_data but maybe skip obj paths if not needed? 
-        # Actually loading 1000 files is fast. Let's just do it consistently but only compute paths if needed.
-        # Wait, if !args.overlay, we don't need all_obj_paths.
-        print("Pre-loading trajectories...")
-        from tqdm import tqdm
-        for f_idx, b_idx in tqdm(unique_trajs):
-             # We need to load data anyway for the loop structure we committed
-             try:
-                raw = dataset._get_single_traj(f_idx, b_idx)
-                all_trajs_data.append(raw)
-             except:
-                all_trajs_data.append(None)
+
 
     # Initialize Visualizer
     xml_path = "./mj_model.xml"
@@ -86,13 +58,23 @@ def main():
     
     visualizer = MjVisualizer(xml_path, close_on_enter=False) # We handle advancement manually
     
+    if args.traj_idx is not None:
+        target = (args.traj_idx, args.batch_idx)
+        try:
+            args.start_idx = unique_trajs.index(target)
+            print(f"Mapped {target} -> Sample {args.start_idx}")
+        except ValueError:
+            print(f"Error: Target {target} not found in unique trajectories.")
+            raise ValueError(f"Target indices {target} (Trajectory {args.traj_idx}, Batch {args.batch_idx}) not present in valid window list.")
+
+
     for i in range(args.start_idx, len(unique_trajs)):
         file_idx, batch_idx = unique_trajs[i]
         
         print(f"\n[{i}/{len(unique_trajs)}] Visualizing File {file_idx}, Batch {batch_idx}")
         
         # Get Full Raw Trajectory
-        raw_traj = all_trajs_data[i]
+        raw_traj = dataset._get_single_traj(file_idx, batch_idx, start_timestep=int(args.start_time))
         if raw_traj is None: continue
         
         # Extract components

@@ -112,7 +112,8 @@ def main():
     parser.add_argument("--visualize_dataset", action="store_true", help="Whether to visualize the original dataset trajectory instead of the generated one")
     parser.add_argument("--action_horizon", type=int, default=None, help="Number of future steps to visualize/control (for dataset visualization)")
     parser.add_argument("--end_error_threshold", type=float, default=0.1, help="End error threshold for stitching")
-    
+    parser.add_argument("--goal_multiplier", type=float, default=1.0, help="Scaling factor for goal (for testing different r for same theta)")
+
     # Guidance arguments
     parser.add_argument("--guidance_wt", type=float, default=0.0, help="Test-time gradient guidance strength")
     parser.add_argument("--guidance_goal", nargs="+", type=float, default=None, help="Target values for guidance (normalized)")
@@ -180,8 +181,13 @@ def main():
 
     # Override task params if provided
     if args.task_params is not None:
-        print(f"Overriding final box pos {anchor['final_obj_pos']} with: {args.task_params}")
-        anchor["final_obj_pos"] = torch.tensor(args.task_params, dtype=torch.float32)
+        anchor["final_obj_pos"][..., :2] = torch.tensor(args.task_params, dtype=torch.float32)
+    
+    if args.goal_multiplier != 1.0:
+        print(f"Scaling goal by multiplier {args.goal_multiplier}")
+        anchor["final_obj_pos"][..., :2] = anchor["ref_obj_pos"][..., :2] + args.goal_multiplier * (anchor["final_obj_pos"] - anchor["ref_obj_pos"])[..., :2]
+
+    print(f"Using final box pos: {anchor['final_obj_pos']} for computing task parameters.")
 
     current_anchors = {
         'ref_pos': np.tile(anchor['ref_pos'][None], (args.num_samples, 1)),
@@ -203,7 +209,7 @@ def main():
 
     # 5. Autoregressive Loop
     for step in range(args.stitch_steps):
-        print(f"Generating segment {step+1}/{args.stitch_steps}...")
+        # print(f"Generating segment {step+1}/{args.stitch_steps}...")
 
         # A. Inference
         if not args.visualize_dataset:

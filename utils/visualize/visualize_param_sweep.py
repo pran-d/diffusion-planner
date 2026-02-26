@@ -107,7 +107,8 @@ def parse_args():
 def run_evaluation_batch(
     args, diffuser, dataset, device, 
     initial_states, norm_task_params, anchors_dict, 
-    use_state_cond=True, desc="Eval"
+    use_state_cond=True, desc="Eval",
+    stitch_steps_list=None
 ):
     """
     Runs inference for a batch of tasks and returns trajectories and displacements.
@@ -126,13 +127,18 @@ def run_evaluation_batch(
     curr_state_tens = initial_states.to(device) if initial_states is not None else None
     task_tens = norm_task_params.to(device)
 
-    if args.stitch_steps is None:
-        args.stitch_steps = dataset.traj_lengths[args.traj_idx] // diffuser.window_size
-        print(f"Auto-setting stitch_steps to {args.stitch_steps} based on dataset length.")
+    if stitch_steps_list is not None:
+        max_stitch_steps = max(stitch_steps_list)
+        print(f"Using max stitch_steps {max_stitch_steps} for this batch.")
+    elif args.stitch_steps is None:
+        max_stitch_steps = dataset.traj_lengths[args.sample_idx] // diffuser.input_size
+        print(f"Auto-setting stitch_steps to {max_stitch_steps} based on dataset length.")
+    else:
+        max_stitch_steps = args.stitch_steps
 
     if args.action_horizon is not None:
-        args.stitch_steps *= (diffuser.window_size // args.action_horizon)
-        print(f"Adjusting stitch_steps to {args.stitch_steps} based on action horizon")
+        max_stitch_steps *= (diffuser.input_size // args.action_horizon)
+        print(f"Adjusting stitch_steps to {max_stitch_steps} based on action horizon")
 
     # We maintain ground truth (or target) task params
     # Initial tasks (will be updated in loop dynamically)
@@ -140,7 +146,7 @@ def run_evaluation_batch(
 
     generated_segments = []
 
-    for step in range(args.stitch_steps):
+    for step in range(max_stitch_steps):
         # --------------------------------------------------------
         # Dynamic Task Re-Targeting (Closed Loop Control)
         # --------------------------------------------------------
@@ -228,7 +234,7 @@ def run_evaluation_batch(
         generated_segments.append(full_step_segment)
         
         # Update Condition for next step
-        if step < args.stitch_steps - 1:
+        if step < max_stitch_steps - 1:
             # We need to update curr_state_tens and current_anchors
             # Robot: 0:36, Obj: 36:43
             r_full = full_step_segment[..., :36]
@@ -354,6 +360,7 @@ def main():
         initial_states = []
         anchors = {'ref_pos': [], 'ref_quat': [], 'ref_obj_pos': [], 'final_obj_pos': []}
         gt_deltas = []
+        stitch_steps_list = []
         
         for idx in tqdm(selected, desc="Prep Dataset Tasks"):
             _, curr_state, _, anchor = dataset[idx]
@@ -375,6 +382,12 @@ def main():
             anchors['final_obj_pos'].append(final_pos)
             
             gt_deltas.append((final_pos - anchor['ref_obj_pos'])[:data_cfg["num_task_params"]])
+            
+            # Calculate required stitch steps for this trajectory
+            traj_len = traj_data['obj'].shape[0] if 'obj' in traj_data else traj_data['joints'].shape[0]
+            window_size = diffuser.input_size
+            required_steps = int(np.ceil((traj_len - 1) / (window_size - 1)))
+            stitch_steps_list.append(required_steps)
 
         # Prepare Batch
         initial_states = torch.stack(initial_states) # (N, C)
@@ -386,7 +399,8 @@ def main():
         traj_w, gen_displacements = run_evaluation_batch(
             args, diffuser, dataset, device, 
             initial_states, dummy_task, anchors_arr, 
-            use_state_cond=True, desc="Dataset Eval"
+            use_state_cond=True, desc="Dataset Eval",
+            stitch_steps_list=stitch_steps_list
         )
         
         # Stats
@@ -438,6 +452,7 @@ def main():
         random_deltas = (np.random.rand(args.num_ood_tasks, data_cfg["num_task_params"]) - 0.5) * 1.0 
         
         target_deltas = []
+        stitch_steps_list_ood = []
 
         for i, idx in enumerate(tqdm(selected, desc="Prep OOD Tasks")):
             _, curr_state, _, anchor = dataset[idx]
@@ -456,6 +471,14 @@ def main():
             anchors['final_obj_pos'].append(target_pos)
             
             target_deltas.append(random_deltas[i])
+            
+            # Calculate required stitch steps for this trajectory
+            file_idx, batch_idx, _ = dataset.indices[idx]
+            traj_data = dataset._get_single_traj(file_idx, batch_idx)
+            traj_len = traj_data['obj'].shape[0] if 'obj' in traj_data else traj_data['joints'].shape[0]
+            window_size = diffuser.input_size
+            required_steps = int(np.ceil((traj_len - 1) / (window_size - 1)))
+            stitch_steps_list_ood.append(required_steps)
 
         initial_states = torch.stack(initial_states)
         anchors_arr = {k: np.stack(v) for k, v in anchors.items()}
@@ -465,7 +488,8 @@ def main():
         traj_w, gen_displacements = run_evaluation_batch(
             args, diffuser, dataset, device, 
             initial_states, dummy_task, anchors_arr, 
-            use_state_cond=False, desc="OOD Eval"
+            use_state_cond=False, desc="OOD Eval",
+            stitch_steps_list=stitch_steps_list_ood
         )
         
         target_deltas = np.array(target_deltas)

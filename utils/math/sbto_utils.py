@@ -146,7 +146,6 @@ FEATURE_LAYOUT_NO_VEL = {
     "delta_yaw": 1,
     "obj_delta_xy": 2,
     "joints": 29,
-    "joints_vel": 29,
     "body_z": 1,
     "body_rot6d": 6,
     "obj_rel_pos": 3,
@@ -278,19 +277,6 @@ def compute_sbto_components(
     obj_delta_pos_world = obj_w[..., :3] - obj_w[..., [ref_idx], :3]
     obj_delta_pos_local = batch_rotation(R_ref_inv, obj_delta_pos_world)
     obj_delta_xy = obj_delta_pos_local[..., :2]
-
-    # End-effector relative 
-    if ee_rel_pos is None:
-        mj_model = mujoco.MjModel.from_xml_path("./mj_model.xml")
-        mj_data = mujoco.MjData(mj_model)
-        ee_rel_pos = compute_fk_batched(
-            model=mj_model,
-            data=mj_data,
-            qpos_batch=joints,
-            base_name="pelvis",
-            ee_names=["left_wrist_roll_link", "right_wrist_roll_link"],
-            joint_offset=7
-        )
 
     comps = {
         "joints": joints,
@@ -596,7 +582,7 @@ def reconstruct_sbto_trajectory(
     obj_quat_world = enforce_quaternion_continuity(obj_quat_world)
 
     if inpaint and has_obj_delta_xy:
-        print("Inpainting object position with obj_delta_xy...")
+        # print("Inpainting object_xy...")
         delta_obj_local = np.zeros((_, T, 3))
         delta_obj_local[..., :2] = traj_delta_obj_xy
         delta_obj_global = (R_ref_yaw[:, None, :, :] @ delta_obj_local[..., None]).squeeze(-1)
@@ -847,3 +833,15 @@ def compute_task_params(current_robot_state, current_obj_state, desired_obj_pos,
         local_delta = np.concatenate([local_delta, local_delta_norm], axis=-1)
         
     return local_delta
+
+def get_feature_indices(feature_layout):
+    """
+    Utility to get feature indices based on the provided layout dictionary.
+    Returns a dict of slices for each feature.
+    """
+    indices = {}
+    idx = 0
+    for key, size in feature_layout.items():
+        indices[key] = slice(idx, idx + size)
+        idx += size
+    return indices

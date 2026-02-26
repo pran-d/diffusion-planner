@@ -34,26 +34,12 @@ class RobotDiffuser():
         self.goal_condition = self.model_cfg.get("goal_condition", False)
         self.state_condition = self.model_cfg.get("state_condition", False)
 
-        self.noise_scheduler = DDPMScheduler(
-            num_train_timesteps=self.noise_schedule_cfg["train_timesteps"], 
-            beta_schedule=self.noise_schedule_cfg["beta_schedule"],
-            prediction_type=self.noise_schedule_cfg["prediction_type"],
-        )
-
-        self.deterministic_noise_scheduler = DDIMScheduler(
-            num_train_timesteps=self.noise_schedule_cfg["train_timesteps"], 
-            beta_schedule=self.noise_schedule_cfg["beta_schedule"],
-            prediction_type=self.noise_schedule_cfg["prediction_type"], 
-        )
-
         if model_type == "simple_diffusion":
             self.model = SimpleDiffuser(inp_size=self.input_size, num_channels=self.num_channels).to(self.device)
         elif model_type == "latent_diffusion":
             self.model = UNetDiffuser(inp_size=self.input_size, num_channels=self.num_channels).to(self.device)
         elif model_type == "dfot":
-            self.model = DFoTTrajectory(self.model_cfg, self.data_cfg, self.noise_schedule_cfg, self.training_cfg, self.noise_scheduler).to(self.device)
-        elif model_type == "dit1d_wrapper":
-            self.model = SimpleTrajectoryDiffuser(self.model_cfg, self.data_cfg, self.noise_schedule_cfg, self.noise_scheduler).to(self.device)
+            self.model = DFoTTrajectory(self.model_cfg, self.data_cfg, self.noise_schedule_cfg, self.training_cfg).to(self.device)
         else:
             raise ValueError(f"Unknown model type: {model_type}")           
         
@@ -91,14 +77,6 @@ class RobotDiffuser():
         """
         Run reverse diffusion to generate trajectories.
         """
-        if deterministic:
-            print("Using DDIM Scheduler for inference...")
-            inference_noise_scheduler = self.deterministic_noise_scheduler
-        else:
-            print("Using DDPM Scheduler for inference...")
-            inference_noise_scheduler = self.noise_scheduler
-
-        inference_noise_scheduler.set_timesteps(self.noise_schedule_cfg["inference_timesteps"])
         sample = torch.randn(num_trajectories, self.num_channels, self.input_size).to(self.device)
         
         cond_list = []
@@ -121,8 +99,6 @@ class RobotDiffuser():
             'guidance_wt': guidance_wt, 'inpaint': self.model_cfg.get("inpaint", False),
             'no_state_cond': no_state_cond
         }
-        if self.model_cfg['type'] == "dit1d_wrapper":
-            sample_kwargs['scheduler'] = inference_noise_scheduler
 
         sample = self.model.sample(
             num_trajectories, 

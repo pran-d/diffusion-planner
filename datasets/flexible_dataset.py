@@ -108,12 +108,12 @@ class FlexibleWindowDataset(Dataset):
         # 1. Index dataset (determine B, T for all files)
         self.indices = []
         self.traj_lengths = []
-        self._index_dataset()
         
         # 2. Preload processed data to RAM (Speed Optimization for small-medium datasets)
         # Replacing LRU cache with full load (~500MB for 4k trajectories)
         self.ram_cache = []
         self._preload_dataset()
+        self._index_dataset()
 
         # Normalization
         self.norm_path = norm_path
@@ -147,7 +147,7 @@ class FlexibleWindowDataset(Dataset):
                         arr = data[key] # (N, T, ...) or (T, ...)
                         if not is_batched:
                             arr = arr[None, ...] # Make (1, T, ...)
-                        return arr[:, ::self.downsample]
+                        return arr[:, self.start_timestep::self.downsample]
                     
                     # Base (Merge pos+quat)
                     body_pos = extract('body_pos_w') 
@@ -165,7 +165,7 @@ class FlexibleWindowDataset(Dataset):
 
                     if 'ee_rel_pos' in data:
                         processed['ee_rel_pos'] = extract('ee_rel_pos')
-
+                    
                 elif self.get_k('body_pos_w') in data and self.get_k('body_quat_w') in data:
                     # Same as above but with key mapping
                     is_batched = data[self.get_k('body_pos_w')].ndim == 3
@@ -216,6 +216,25 @@ class FlexibleWindowDataset(Dataset):
                     fps_val = val.item() if val.ndim == 0 else val[0]
                     B_dim = processed['base'].shape[0]
                     processed['fps'] = np.repeat(fps_val, B_dim)
+
+                # Pre-compute ee_rel_pos via FK if not in file.
+                if 'ee_rel_pos' in self.feature_order and 'ee_rel_pos' not in processed and 'joints' in processed:
+                    try:
+                        import mujoco
+                        from utils.math.sbto_utils import compute_fk_batched
+                        mj_model = mujoco.MjModel.from_xml_path("./mj_model.xml")
+                        mj_data = mujoco.MjData(mj_model)
+                        # processed['joints'] is (N, T, 29)
+                        processed['ee_rel_pos'] = compute_fk_batched(
+                            model=mj_model,
+                            data=mj_data,
+                            qpos_batch=processed['joints'],
+                            base_name="pelvis",
+                            ee_names=["left_wrist_roll_link", "right_wrist_roll_link"],
+                            joint_offset=7,
+                        )
+                    except Exception as e:
+                        print(f"Warning: Could not pre-compute ee_rel_pos for {fpath}: {e}")
                     
         except Exception as e:
             print(f"Failed to load {fpath}: {e}")
@@ -233,7 +252,7 @@ class FlexibleWindowDataset(Dataset):
         pad_end = self.traj_lengths[file_idx] - (file_data["base"][batch_idx].shape[0] + pad_start)
 
         pad_kwargs = lambda arr: np.pad(arr, (((pad_start, pad_end),(0,0)) if arr.ndim==2 else ((0,0))), mode='edge')      
-        
+
         return {k: pad_kwargs(v[batch_idx]) for k, v in file_data.items()}
 
     def _index_dataset(self):
@@ -242,52 +261,42 @@ class FlexibleWindowDataset(Dataset):
         Mimics create_dataset.py padding and windowing logic.
         """
         print("Indexing dataset...")
-        for i, fpath in enumerate(self.file_paths):
+        for i in range(len(self.file_paths)):
             try:
-                with np.load(fpath, allow_pickle=True) as data:
-                     # Identify Length & Batch
-                    B, T = 1, 0
-                    if 'body_pos_w' in data:
-                        arr = data['body_pos_w']
-                        if arr.ndim == 4: # (N, T, K, 3)
-                            B, T = arr.shape[0], arr.shape[1]
-                        else:
-                            T = arr.shape[0]
-                    if self.get_k('body_pos_w') in data:
-                        arr = data[self.get_k('body_pos_w')]
-                        if arr.ndim == 3:
-                            B, T = arr.shape[0], arr.shape[1]
-                        else:
-                            T = arr.shape[0]
-                    elif 'base_xyz_quat' in data:
-                         arr = data['base_xyz_quat']
-                         if arr.ndim == 3: # (N, T, D)
-                             B, T = arr.shape[0], arr.shape[1]
-                         else: # (T, D)
-                             T = arr.shape[0]
+                data = self.ram_cache[i] if i < len(self.ram_cache) else self._load_and_process_file(self.file_paths[i])
+                
+                # Identify Length & Batch
+                B, T = 1, 0
+                if 'joints' in data:
+                    arr = data['joints']
+                    if arr.ndim == 3: # (N, T, 29)
+                        B, T = arr.shape[0], arr.shape[1]
                     else:
-                        continue 
-                    
-                    # Apply downsampling effectively reduces T
-                    T_down = T // self.downsample
+                        T = arr.shape[0]
+                else:
+                    print("Warning: 'joints' key not found in data. Skipping indexing for this file.")
+                    continue 
+                
+                # Apply downsampling effectively reduces T
+                T_down = T // self.downsample
 
-                    pad_start = self.history_size
-                    pad_end = self.window_size - (T_down + pad_start) % self.window_size + self.history_size
-
-                    T_padded = T_down + pad_start + pad_end
-                    self.traj_lengths.append(T_padded)
-                    
-                    w_size = self.window_size + self.history_size
-                    max_start = T_padded - w_size
-                    
-                    if max_start > 0:
-                        starts = np.arange(0, max_start + 1, self.stride)
-                        for b in range(B):
-                            for s in starts:
-                                self.indices.append((i, b, s))
+                pad_start = self.history_size
+                pad_end = self.window_size - (T_down + pad_start) % self.window_size + self.history_size
+            
+                T_padded = T_down + pad_start + pad_end
+                self.traj_lengths.append(T_padded)
+                
+                w_size = self.window_size
+                max_start = T_padded - w_size
+                
+                if max_start > 0:
+                    starts = np.arange(0, max_start + 1, self.stride)
+                    for b in range(B):
+                        for s in starts:
+                            self.indices.append((i, b, s))
 
             except Exception as e:
-                print(f"Error indexing {fpath}: {e}")
+                print(f"Error indexing {self.file_paths[i]}: {e}")
         print(f"Indexed {len(self.indices)} windows.")
 
     def _compute_transform(self, raw_traj, t_start):
@@ -295,7 +304,7 @@ class FlexibleWindowDataset(Dataset):
         # t_start is the index of the start of the window
         
         T_traj = raw_traj['base'].shape[0]
-        w_size = self.window_size + self.history_size
+        w_size = self.window_size
         raw_end = t_start + w_size
         
         # Read with padding
@@ -503,7 +512,7 @@ class FlexibleWindowDataset(Dataset):
         current_state = window_tensor[:self.history_size, (self.num_features-self.num_observations):].clone()
 
         # Future trajectory
-        future_states = window_tensor[self.history_size:, :].clone()
+        future_states = window_tensor.clone()
 
         task_params = torch.from_numpy(features["task_params"]).float()
         task_params = self._normalize("task_params", task_params)
@@ -538,7 +547,7 @@ class FlexibleWindowDataset(Dataset):
             # 2. Process Windows in Batches
             BATCH_SIZE = 256
             
-            w_size = self.window_size + self.history_size
+            w_size = self.window_size
             ref_idx = self.history_size - 1
             raw_len = raw_traj['base'].shape[0]
 

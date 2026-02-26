@@ -6,6 +6,7 @@ from torch.nn import functional as F
 from torch.utils.data import DataLoader, WeightedRandomSampler
 from torch.utils.tensorboard import SummaryWriter
 from torch.amp import GradScaler
+from tqdm import tqdm
 from matplotlib import pyplot as plt
 from tqdm import tqdm
 import os
@@ -226,7 +227,7 @@ mj_data = mujoco.MjData(mj_model)
 # ===============================
 losses = []
 epoch_losses_history = []
-window_size = 100
+window_size = 5
 
 log_dir = get_log_path(model_cfg, data_cfg, training_cfg)
 os.makedirs(log_dir, exist_ok=True)
@@ -241,9 +242,14 @@ num_epochs = training_cfg["num_epochs"] + 1
 
 for epoch in range(starting_epoch, num_epochs):
     epoch_losses = []
-    for step, batch in enumerate(train_dataloader):
+
+    total_batches = training_cfg.get("batches_per_epoch", len(train_dataloader))
+    
+    pbar = tqdm(enumerate(train_dataloader), total=total_batches, desc=f"Epoch {epoch}/{num_epochs-1}")
+
+    for step, batch in pbar:
         
-        if training_cfg.get("batches_per_epoch") and step >= training_cfg["batches_per_epoch"]:
+        if training_cfg.get("batches_per_epoch", False) and step >= training_cfg["batches_per_epoch"]:
             break
 
         if batch[0].shape[0] < data_cfg["batch_size"]:
@@ -342,6 +348,9 @@ for epoch in range(starting_epoch, num_epochs):
         writer.add_scalar("Loss/train_step", loss.item(), global_step)
         writer.add_scalar("Loss/pred_loss", pred_loss.mean().item(), global_step)
 
+        pbar.set_postfix({
+            "Mean loss": f"{np.mean(epoch_losses).item():.5f}"
+        })
 
     # Epoch summary
     mean_loss = np.mean(epoch_losses)
@@ -352,7 +361,7 @@ for epoch in range(starting_epoch, num_epochs):
     writer.add_scalar("Learning Rate", scheduler.get_last_lr()[0], epoch)
 
     window_mean = np.mean(epoch_losses_history[-window_size:])
-    print(f"Epoch [{epoch}/{num_epochs-1}] - Mean Loss: {window_mean:.5f}")
+    print(f"Epoch [{epoch}/{num_epochs-1}] - Windowed Mean Loss: {window_mean:.5f}")
 
     # ===============================
     # Early Stopping Check

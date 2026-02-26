@@ -13,9 +13,9 @@ data:
   num_task_params: 3
   num_observations: 45
   start_timestep: 0
-  num_timesteps: 1
+  num_timesteps: 5
   state_history: 1
-  normalize_goal_vec: True
+  normalize_goal_vec: False
 
   key_mapping:
     body_pos_w: "root_pos"
@@ -40,7 +40,7 @@ model:
 training:
   save_dir: "./runs/ablations/exp1/"
   log_dir: "./logs/ablations/exp1/"
-  suffix: "_all_motions"
+  suffix: "_all_motions_unnorm"
   num_epochs: 5000
   batches_per_epoch: 256
   balance_task_density: False
