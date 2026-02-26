@@ -798,8 +798,8 @@ def compute_task_params(current_robot_state, current_obj_state, desired_obj_pos,
     Computes the task parameters (local object displacement) for the diffusion model.
 
     Args:
-        current_robot_state (np.ndarray): Shape (7,) or (3,) [x, y, z, qx, qy, qz, qw]
-                                          representing the robot base pose.
+        current_robot_state (np.ndarray): Shape (7,) or (4,) [x, y, z, qx, qy, qz, qw]
+                                          representing the robot base pose (or quat).
         current_obj_state (np.ndarray): Shape (3,) or (7,) [x, y, z, ...]
                                         representing the current object position.
         desired_obj_pos (np.ndarray): Shape (3,) [x, y, z] 
@@ -830,7 +830,10 @@ def compute_task_params(current_robot_state, current_obj_state, desired_obj_pos,
         local_delta_norm = np.linalg.norm(local_delta, keepdims=True)
         if local_delta_norm > 1e-3:
             local_delta = local_delta / local_delta_norm
-        local_delta = np.concatenate([local_delta, local_delta_norm], axis=-1)
+        else:
+            local_delta = np.zeros_like(local_delta)
+            local_delta_norm = 0.0
+        local_delta = np.concatenate([local_delta, np.atleast_1d(np.clip(local_delta_norm, a_min=None, a_max=3.0))], axis=-1)
         
     return local_delta
 

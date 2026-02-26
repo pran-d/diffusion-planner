@@ -7,7 +7,7 @@ import yaml
 from torch.utils.data import Dataset
 from tqdm import tqdm
 
-from utils.math.sbto_utils import compute_sbto_components, yaw_to_rot_matrix, yaw_from_quat, rot6d_to_rot, quat_to_rot, batch_rotation, rot_to_6d
+from utils.math.sbto_utils import compute_sbto_components, yaw_to_rot_matrix, yaw_from_quat, rot6d_to_rot, quat_to_rot, compute_task_params, rot_to_6d
 from utils.math.rotation_conversions import ( 
     axis_angle_to_quaternion, 
 )
@@ -370,20 +370,13 @@ class FlexibleWindowDataset(Dataset):
 
     def _compute_task_params(self, base_traj, obj_traj, start_idx=0):
         # Default: Object X, Y displacement from start to end of trajectory
-        if obj_traj.shape[0] > 0:
-            disp_vector_global = (obj_traj[-1, :3] - obj_traj[start_idx, :3])
-            R_ref_inv = yaw_to_rot_matrix(-yaw_from_quat(base_traj[start_idx, 3:]))
-            disp_vector = (R_ref_inv @ disp_vector_global)[..., :self.num_task_params] # (2,)
-            if self.normalize_goal_vec:
-                disp_vector = disp_vector[..., :self.num_task_params-1]
-                disp_vector_norm = np.linalg.norm(disp_vector)
-                if disp_vector_norm > 1e-3:
-                    disp_vector = disp_vector / disp_vector_norm
-                else:
-                    disp_vector = np.zeros_like(disp_vector)
-                disp_vector = np.concatenate([disp_vector, np.array([disp_vector_norm])], axis=-1)
-            return disp_vector
-        return np.zeros(self.num_task_params)
+        return compute_task_params(
+            current_robot_state=base_traj[start_idx, 3:],
+            current_obj_state=obj_traj[start_idx, :3],
+            desired_obj_pos=obj_traj[-1, :3],
+            normalize_goal_vec=self.normalize_goal_vec,
+            num_task_params=self.num_task_params,
+        )
 
     def _normalize(self, key, val):
         if self.normalization_type == "min_max":
