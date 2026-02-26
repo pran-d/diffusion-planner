@@ -3,13 +3,11 @@ import numpy as np
 import yaml
 import os
 import argparse
-import time
-from scipy.interpolate import interp1d
-from scipy.spatial.transform import Rotation as R
-from scipy.spatial.transform import Slerp
 from config.configure import load_config, get_data_path, get_norm_path
 from models.model import RobotDiffuser
-from datasets.flexible_dataset import FlexibleWindowDataset, yaw_to_rot_matrix, yaw_from_quat
+from datasets import BufferDataset
+from utils.data.load_dataset import preload_dataset
+from datasets.flexible_dataset import yaw_to_rot_matrix, yaw_from_quat
 from utils.math.sbto_utils import reconstruct_sbto_trajectory, compute_task_params
 
 def update_condition(dataset, robot_world_history, obj_world_history, final_obj_pos=None):
@@ -136,10 +134,11 @@ def main():
     if norm_path and os.path.exists(norm_path):
         calculate_stats = False
 
-    dataset = FlexibleWindowDataset(
-        data_root=data_path, config=data_cfg, 
+    data_buffer = preload_dataset(data_cfg, data_path)
+    dataset = BufferDataset(
+        data_buffer=data_buffer, config=data_cfg, task_params=None,
         calculate_stats=calculate_stats, norm_path=norm_path,
-        noise_cfg={}
+        training_cfg={},
     )
 
     # 3. Model
@@ -181,8 +180,8 @@ def main():
 
     # Override task params if provided
     if args.task_params is not None:
-        anchor["final_obj_pos"][..., :2] = torch.tensor(args.task_params, dtype=torch.float32)
-    
+        anchor["final_obj_pos"][..., :2] = args.task_params
+            
     if args.goal_multiplier != 1.0:
         print(f"Scaling goal by multiplier {args.goal_multiplier}")
         anchor["final_obj_pos"][..., :2] = anchor["ref_obj_pos"][..., :2] + args.goal_multiplier * (anchor["final_obj_pos"] - anchor["ref_obj_pos"])[..., :2]
@@ -221,8 +220,7 @@ def main():
                 num_task_params=data_cfg["num_task_params"]
             )
             task_params = dataset._normalize("task_params", tp_init)
-            
-            task_tens = task_params.repeat(args.num_samples, 1)
+            task_tens = task_params if isinstance(task_params, torch.Tensor) else torch.tensor(task_params, dtype=torch.float32)
 
             normalized_sample = diffuser.getSample(
                 num_trajectories=args.num_samples,
@@ -234,7 +232,7 @@ def main():
                 guidance_goal=args.guidance_goal,
             )
         else:
-            normalized_sample = fut_traj.unsqueeze(0)
+            normalized_sample = fut_traj.unsqueeze(0).repeat(args.num_samples, 1, 1)
         
         # B. Denormalize
         denorm_btc = dataset.denormalize_global(normalized_sample)
@@ -269,7 +267,8 @@ def main():
         if task_denorm.shape[1] < 3:
             task_denorm = torch.cat([task_denorm, torch.zeros_like(task_denorm[:, :1])], dim=1)
         task_denorm_3d = task_denorm[..., None] # (B, 3)
-        goal_vec_global = (yaw_to_rot_matrix(yaw_from_quat(current_anchors['ref_quat'])) @ task_denorm_3d.cpu().numpy())[..., :data_cfg["num_task_params"], 0] # (B, 3)        
+        
+        goal_vec_global = (yaw_to_rot_matrix(yaw_from_quat(current_anchors['ref_quat'])) @ task_denorm_3d.cpu().numpy())[..., :data_cfg["num_task_params"], 0]
         goal_vectors.append(goal_vec_global.repeat(segment_world.shape[1], 0)[..., :2]) # (B, 3)
 
         # Desired Displacement (From Ground Truth Full Trajectory)                    
@@ -284,14 +283,21 @@ def main():
             o_hist = o_world[:, -history_size:, :]
             curr_state_tens, current_anchors = update_condition(dataset, r_hist, o_hist, final_obj_pos=current_anchors['final_obj_pos'])
 
-            if  args.visualize_dataset: 
-                # Update Task Params for next window
+            if args.visualize_dataset: 
+                # Update Task Params and anchor for next window from ground truth
                 next_start = current_start_time + (step + 1) * dataset.window_size
                 target_key = (current_file_idx, current_batch_idx, next_start)
                 if target_key in index_map:
                     next_idx = index_map[target_key]
-                    fut_traj, _, next_task, _ = dataset[next_idx]
+                    fut_traj, _, next_task, next_anchor = dataset[next_idx]
                     task_tens = next_task.unsqueeze(0).repeat(args.num_samples, 1).to(device)
+                    # Use ground truth anchor so reconstruction errors don't accumulate
+                    current_anchors = {
+                        'ref_pos': np.tile(next_anchor['ref_pos'][None], (args.num_samples, 1)),
+                        'ref_quat': np.tile(next_anchor['ref_quat'][None], (args.num_samples, 1)),
+                        'ref_obj_pos': np.tile(next_anchor['ref_obj_pos'][None], (args.num_samples, 1)),
+                        'final_obj_pos': np.tile(next_anchor['final_obj_pos'][None], (args.num_samples, 1)),
+                    }
                     print(f"Updated task params for step {step+1} to sample {next_idx} (Start T={next_start})")
                 else:
                     print(f"Warning: Could not find next window starting at {next_start}. Reusing previous task params.")

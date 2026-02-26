@@ -74,7 +74,7 @@ def main():
         print(f"\n[{i}/{len(unique_trajs)}] Visualizing File {file_idx}, Batch {batch_idx}")
         
         # Get Full Raw Trajectory
-        raw_traj = dataset._get_single_traj(file_idx, batch_idx, start_timestep=int(args.start_time))
+        raw_traj = dataset._get_single_traj(file_idx, batch_idx)
         if raw_traj is None: continue
         
         # Extract components
@@ -92,7 +92,7 @@ def main():
         # Concatenate for visualization: [Base(7) | Joints(29) | Object(7)]
         # Total 43 dims
         full_state = np.concatenate([base, joints, obj], axis=-1)
-        
+    
         # Handle Overlay / Hide Robot
         current_overlay = None
         if args.overlay:

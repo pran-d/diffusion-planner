@@ -79,7 +79,6 @@ class MjVisualizer():
 
         # Get goal marker mocap id if goals provided
         goal_mocap_id = -1
-        goal_geom_id = -1
         if goal_pos is not None:
              try:
                 goal_body_id = mujoco.mj_name2id(self.mj_model, mujoco.mjtObj.mjOBJ_BODY, "goal_marker")

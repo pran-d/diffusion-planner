@@ -809,7 +809,7 @@ def compute_task_params(current_robot_state, current_obj_state, desired_obj_pos,
         np.ndarray: Shape (num_task_params,) [delta_x_local, delta_y_local, ...] normalized if needed.
     """
     # 1. Extract Positions
-    curr_obj_pos = current_obj_state[:3]  # We only care about X, Y for displacement
+    curr_obj_pos = current_obj_state[:3]
     goal_obj_pos = desired_obj_pos[:3]
     
     # 2. Calculate World Displacement
@@ -833,7 +833,7 @@ def compute_task_params(current_robot_state, current_obj_state, desired_obj_pos,
         else:
             local_delta = np.zeros_like(local_delta)
             local_delta_norm = 0.0
-        local_delta = np.concatenate([local_delta, np.atleast_1d(np.clip(local_delta_norm, a_min=None, a_max=3.0))], axis=-1)
+        local_delta = np.concatenate([local_delta, np.atleast_1d(np.clip(local_delta_norm, a_min=None, a_max=5.0))], axis=-1)
         
     return local_delta
 

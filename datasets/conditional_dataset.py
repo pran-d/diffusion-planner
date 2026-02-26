@@ -47,7 +47,6 @@ class ConditionalStateDataset(Dataset):
              raise ValueError("Dataset must contain 'future' key")
 
         self.num_traj = 1 if config.get("overfit") else ref_shape[0]
-        self.start_timestep = config.get("start_timestep", 0)
         self.num_timesteps = config.get("num_timesteps", ref_shape[1])
         self.history_size = config.get("state_history", 1)
         self.hp_overlap = config.get("hp_overlap", 0)

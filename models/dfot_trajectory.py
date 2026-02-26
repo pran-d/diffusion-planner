@@ -104,7 +104,7 @@ class DFoTTrajectory(nn.Module):
                 "depth": model_config.get("depth", 12),
                 "num_heads": model_config.get("num_heads", 4),
                 "mlp_ratio": model_config.get("mlp_ratio", 4.0),
-                "pos_emb_type": "learned_1d",
+                "pos_emb_type": model_config.get("pos_emb_type", "learned_1d"),
                 "use_gradient_checkpointing": False,
                 "external_cond_dropout": model_config.get("external_cond_dropout", 0.1),
             })

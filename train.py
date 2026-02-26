@@ -14,9 +14,10 @@ import yaml
 import mujoco
 
 from diffusers import EMAModel
-from datasets import FlexibleWindowDataset, ConditionalStateDataset
+from datasets import BufferDataset, ConditionalStateDataset
 from models.model import RobotDiffuser
 from config.configure import load_config, get_data_path, get_save_path, get_log_path, get_norm_path
+from utils.data.load_dataset import preload_dataset
 
 # ===============================
 # Helper Functions
@@ -187,12 +188,12 @@ if data_cfg.get("dataset_class", "flexible") == "conditional":
         task_condition=task_condition, action_condition=False, 
         load_norm=True, norm_path=norm_path
     )
-else:
-    dataset = FlexibleWindowDataset(
-        data_root=data_path, config=data_cfg, 
+elif data_cfg.get("dataset_class", "flexible") == "flexible":
+    data_buffer = preload_dataset(data_cfg, data_path)
+    dataset = BufferDataset(
+        data_buffer=data_buffer, config=data_cfg, task_params=None,
         calculate_stats=calculate_stats, norm_path=norm_path,
-        noise_cfg=training_cfg.get("state_conditioning_noise_level", {}),
-        add_noise=training_cfg.get("add_obs_noise", False), add_goal_noise=training_cfg.get("add_goal_noise", False)
+        training_cfg=training_cfg,
     )
 
 sampler = None

@@ -19,103 +19,53 @@ class FlexibleWindowDataset(Dataset):
     and assembles features based on a configurable order.
     """
     def __init__(self, 
-        data_root, 
+        data_buffer, 
         config, 
-        feature_order=None, 
+        task_params=None,
         norm_path=None, 
         calculate_stats=False,
-        noise_cfg=None, 
-        add_noise=False,
-        add_goal_noise=False,
+        training_cfg=None,  
     ):
         
-        self.data_root = data_root
-        self.noise_cfg = noise_cfg or {}
+        self.noise_cfg = training_cfg.get("state_conditioning_noise_level", {})
         self.num_observations = config.get("num_observations", 45)
         self.num_features = config.get("num_features", 48)
         self.history_size = config.get("state_history", 4)
         self.window_size = config.get("num_timesteps", 50) // config.get("downsample", 1)
         self.stride = config.get("stride", 1)
         self.downsample = config.get("downsample", 1)
-        self.start_timestep = config.get("start_timestep", 0)
         self.normalize_goal_vec = config.get("normalize_goal_vec", True)
         self.num_task_params = config.get("num_task_params", 2)
         self.normalization_type = config.get("normalization_type", "mean_std")  # 'mean_std' or 'min_max'
-        print(f"Using normalization type: {self.normalization_type}")
+        self.feature_order = config.get("feature_order", 
+                [
+                    "delta_xy", "delta_yaw", "obj_delta_xy",
+                    "joints", "body_z", "body_rot6d", 
+                    "obj_rel_pos", "obj_rel_rot6d",
+                ]
+        )
 
-        # Key mapping for flexible dataset keys
         self.key_mapping = config.get("key_mapping", {})
+        
+        print(f"Using feature order: {self.feature_order}")
+        print(f"Using normalization type: {self.normalization_type}")
         print(f"Using key mapping: {self.key_mapping}")
 
-        self.add_noise = add_noise
-        self.add_goal_noise = add_goal_noise
-        
-        # Default feature order if not provided
-        self.feature_order = feature_order or [
-            "delta_xy", "delta_yaw",
-            "obj_delta_xy",
-            "joints", "body_z", "body_rot6d",
-            "obj_rel_pos", "obj_rel_rot6d",
-            # "ee_rel_pos",
-        ]
-        
-        # Load file list
-        task_list_path = config.get("task_list_path", None)
-        
-        # Try to resolve path if provided
-        if task_list_path:
-             # 1. Absolute or CWD relative
-             if not os.path.exists(task_list_path):
-                 # 2. Relative to data_root (usually includes train_path)
-                 possible_1 = os.path.join(data_root, task_list_path)
-                 if os.path.exists(possible_1):
-                     task_list_path = possible_1
-                 else:
-                     # 3. Relative to base dir_path (if separate)
-                     base_dir = config.get("dir_path", "")
-                     possible_2 = os.path.join(base_dir, task_list_path)
-                     if os.path.exists(possible_2):
-                         task_list_path = possible_2
-                         
-        if task_list_path and os.path.exists(task_list_path):
-             print(f"Loading task list from {task_list_path}")
-             with open(task_list_path, 'r') as f:
-                 tasks = yaml.safe_load(f)
-             
-             if isinstance(tasks, dict):
-                 if 'tasks' in tasks: tasks = tasks['tasks']
-                 else: tasks = list(tasks.keys())
-                 
-             self.file_paths = []
-             for t in tasks:
-                 file_names = ["best_trajectory_rand.npz"]
-                #  file_names = ["top_trajectories.npz"]
-                #  file_names = ["motion.npz"]
-                 for file_name in file_names:
-                     p = os.path.join(data_root, t, file_name)
-                     if os.path.exists(p):
-                         self.file_paths.append(p)
-                         break
-                     print(f"Warning: {p} not found.")
-        else:
-            if task_list_path:
-                print(f"Warning: task_list_path '{task_list_path}' configured but not found. Falling back to glob.")
-            self.file_paths = sorted(glob.glob(os.path.join(data_root, "**/*.npz"), recursive=True))
+        self.add_noise = training_cfg.get("add_obs_noise", False)
+        self.add_goal_noise = training_cfg.get("add_goal_noise", False)
 
-        if not self.file_paths:
-            print(f"Warning: No .npz files found in {data_root}")
+        self._raw_buffer = data_buffer
+        self._task_params = task_params
         
-        # 1. Index dataset (determine B, T for all files)
-        self.indices = []
-        self.traj_lengths = []
-        
-        # 2. Preload processed data to RAM (Speed Optimization for small-medium datasets)
-        # Replacing LRU cache with full load (~500MB for 4k trajectories)
+        # ---- Preload buffer into ram_cache ----
         self.ram_cache = []
-        self._preload_dataset()
+        self.traj_lengths = []
+        self.indices = []
+
+        self._preload_from_buffer()
         self._index_dataset()
 
-        # Normalization
+        # ---- Normalization ----
         self.norm_path = norm_path
         self.stats = {}
         if calculate_stats:
@@ -123,137 +73,143 @@ class FlexibleWindowDataset(Dataset):
         elif norm_path and os.path.exists(norm_path):
             self._load_stats()
 
+
+    def _standardize_buffer(self):
+        """Normalize buffer into {key: list_of_(T,D)_arrays}."""
+        buf = self._raw_buffer
+
+        if isinstance(buf, list):
+            if len(buf) == 0:
+                return {}
+            keys = buf[0].keys()
+            return {k: [item.get(k) for item in buf] for k in keys}
+
+        if isinstance(buf, dict):
+            standardized = {}
+            # Determine expected batch count from a temporal key
+            num_trajs = None
+            if 'joints' in buf.keys():
+                v = buf['joints']
+                if isinstance(v, (list, tuple)):
+                    num_trajs = len(v)
+                elif isinstance(v, np.ndarray) and v.ndim >= 3:
+                    num_trajs = v.shape[0]
+
+            for key, val in buf.items():
+                if isinstance(val, (list, tuple)):
+                    standardized[key] = list(val)
+                elif isinstance(val, np.ndarray):
+                    # Split along batch dim if first dim matches num_trajs
+                    if num_trajs is not None and val.shape[0] == num_trajs and val.ndim >= 2:
+                        standardized[key] = [val[i] for i in range(val.shape[0])]
+                    elif val.ndim >= 3:
+                        standardized[key] = [val[i] for i in range(val.shape[0])]
+                    else:
+                        standardized[key] = [val]
+                elif isinstance(val, torch.Tensor):
+                    val_np = val.cpu().numpy()
+                    if num_trajs is not None and val_np.shape[0] == num_trajs and val_np.ndim >= 2:
+                        standardized[key] = [val_np[i] for i in range(val_np.shape[0])]
+                    elif val_np.ndim >= 3:
+                        standardized[key] = [val_np[i] for i in range(val_np.shape[0])]
+                    else:
+                        standardized[key] = [val_np]
+                else:
+                    standardized[key] = [val]
+            return standardized
+
+        raise ValueError("BufferDataset expects a dict or list of dicts.")
+    
     def get_k(self, key):
+        """Helper to get mapped key from config."""
         return self.key_mapping.get(key, key)
 
-    def _preload_dataset(self):
-        print(f"Preloading {len(self.file_paths)} files into RAM...")
-        for fpath in tqdm(self.file_paths, desc="Loading Data"):
-            self.ram_cache.append(self._load_and_process_file(fpath))
-
-    def _load_and_process_file(self, fpath):
+    def _preload_from_buffer(self):
         """
-        Loads file and returns dict of (N, T, D) arrays with downsampling applied.
+        Process _raw_buffer (list of dicts from load_dataset.py) into ram_cache.
+        Each dict has keys like 'base', 'joints', 'obj' with shapes (N_i, T_i, D).
+        Each dict becomes one entry in ram_cache.
+
+        If _task_params is provided, it should be a flat list/array of length
+        sum(N_i), one per trajectory across all files. goal_obj_world is computed
+        from task_params and stored as (N_i, 3) in each file dict.
         """
-        raw = {}
-        processed = {}
-        try:
-            with np.load(fpath, allow_pickle=True) as data:
-                # RL Rollout Schema
-                if 'body_pos_w' in data:
-                    is_batched = data['body_pos_w'].ndim == 4
-                    # Helper to get (N, T, D)
-                    def extract(key):
-                        arr = data[key] # (N, T, ...) or (T, ...)
-                        if not is_batched:
-                            arr = arr[None, ...] # Make (1, T, ...)
-                        return arr[:, self.start_timestep::self.downsample]
-                    
-                    # Base (Merge pos+quat)
-                    body_pos = extract('body_pos_w') 
-                    body_quat = extract('body_quat_w')
-                    # Expect (N, T, K, 3). Take K=0
-                    # If (N, T, D), then just take it.
-                    if body_pos.ndim == 4:
-                         processed['base'] = np.concatenate([body_pos[:, :, 0, :], body_quat[:, :, 0, :]], axis=-1)
-                    else:
-                         # Assume already (N, T, 3) 
-                         processed['base'] = np.concatenate([body_pos, body_quat], axis=-1)
+        if not self._raw_buffer:
+            return
 
-                    processed['joints'] = extract('joint_pos')
-                    processed['obj'] = np.concatenate([extract('object_pos_w'), extract('object_quat_w')], axis=-1)
+        total_trajs = 0
+        tp_offset = 0  # running offset into the flat task_params list
 
-                    if 'ee_rel_pos' in data:
-                        processed['ee_rel_pos'] = extract('ee_rel_pos')
-                    
-                elif self.get_k('body_pos_w') in data and self.get_k('body_quat_w') in data:
-                    # Same as above but with key mapping
-                    is_batched = data[self.get_k('body_pos_w')].ndim == 3
+        for file_data in self._raw_buffer:
+            if not file_data:
+                continue
 
-                    def extract(key):
-                        real_key = self.get_k(key)
-                        arr = data[real_key]
-                        if not is_batched:
-                            arr = arr[None, ...]
-                        return arr[:, ::self.downsample]
+            # Ensure batch dimension exists on temporal arrays
+            for k in list(file_data.keys()):
+                v = file_data[k]
+                if isinstance(v, np.ndarray) and k in (
+                    'base', 'joints', 'obj',
+                    'base_vel', 'joints_vel', 'obj_vel', 'ee_rel_pos',
+                ):
+                    if v.ndim == 2:  # (T, D) -> (1, T, D)
+                        file_data[k] = v[None]
 
-                    body_pos = extract(self.get_k('body_pos_w'))
-                    body_quat = extract(self.get_k('body_quat_w'))
-                    processed['base'] = np.concatenate([body_pos, body_quat], axis=-1)
-                    processed['joints'] = extract(self.get_k('joint_pos'))
-                    processed['obj'] = np.concatenate([extract(self.get_k('object_pos_w')), extract(self.get_k('object_quat_w'))], axis=-1)
-                    
-                    if 'ee_rel_pos' in data:
-                         processed['ee_rel_pos'] = extract('ee_rel_pos')
-                    
-                elif 'base_xyz_quat' in data:
-                    # SBTO Schema
-                    is_batched = data['base_xyz_quat'].ndim == 3
-                     # Helper
-                    def extract(key):
-                        arr = data[key]
-                        if not is_batched:
-                            arr = arr[None, ...]
-                        return arr[:, ::self.downsample]
+            N_i = file_data['base'].shape[0]
 
-                    processed['base'] = extract('base_xyz_quat')
-                    processed['joints'] = extract('actuator_pos')
-                    processed['obj'] = extract('obj_0_xyz_quat')
-                    
-                    if 'base_linvel_angvel' in data:
-                        processed['base_vel'] = extract('base_linvel_angvel')
-                    if 'actuator_vel' in data:
-                        processed['joints_vel'] = extract('actuator_vel')
-                    if 'obj_0_linvel_angvel' in data:
-                        processed['obj_vel'] = extract('obj_0_linvel_angvel')
+            # Compute goal_obj_world from task_params if provided
+            if self._task_params is not None:
+                goal_world = np.zeros((N_i, 3), dtype=np.float64)
+                for j in range(N_i):
+                    goal_local = np.asarray(self._task_params[tp_offset + j], dtype=np.float64)
 
-                    if 'ee_rel_pos' in data:
-                        processed['ee_rel_pos'] = extract('ee_rel_pos')
-                
-                # Metadata
-                if self.get_k('fps') in data:
-                    val = data[self.get_k('fps')]
-                    fps_val = val.item() if val.ndim == 0 else val[0]
-                    B_dim = processed['base'].shape[0]
-                    processed['fps'] = np.repeat(fps_val, B_dim)
+                    # Initial pelvis pose & initial object pos (first frame)
+                    init_base = file_data['base'][j, 0, :]   # (7,) [x,y,z,qw,qx,qy,qz]
+                    init_obj  = file_data['obj'][j, 0, :3]    # (3,)
 
-                # Pre-compute ee_rel_pos via FK if not in file.
-                if 'ee_rel_pos' in self.feature_order and 'ee_rel_pos' not in processed and 'joints' in processed:
-                    try:
-                        import mujoco
-                        from utils.math.sbto_utils import compute_fk_batched
-                        mj_model = mujoco.MjModel.from_xml_path("./mj_model.xml")
-                        mj_data = mujoco.MjData(mj_model)
-                        # processed['joints'] is (N, T, 29)
-                        processed['ee_rel_pos'] = compute_fk_batched(
-                            model=mj_model,
-                            data=mj_data,
-                            qpos_batch=processed['joints'],
-                            base_name="pelvis",
-                            ee_names=["left_wrist_roll_link", "right_wrist_roll_link"],
-                            joint_offset=7,
-                        )
-                    except Exception as e:
-                        print(f"Warning: Could not pre-compute ee_rel_pos for {fpath}: {e}")
-                    
-        except Exception as e:
-            print(f"Failed to load {fpath}: {e}")
-            # Return dummy or handle error? indices should prevent access if validation worked.
-            # But indices() only reads header. 
-            pass 
-            
-        return processed
+                    init_yaw = yaw_from_quat(init_base[3:7])
+                    R_local_to_world = yaw_to_rot_matrix(init_yaw)
+
+                    goal_3d = np.zeros(3, dtype=np.float64)
+                    n = min(len(goal_local), 3)
+                    goal_3d[:n] = goal_local[:n]
+
+                    goal_world[j] = (R_local_to_world @ goal_3d[:, None])[:, 0] + init_obj
+
+                file_data['goal_obj_world'] = goal_world  # (N_i, 3)
+                tp_offset += N_i
+
+            self.ram_cache.append(file_data)
+            total_trajs += N_i
+
+        print(f"Loaded {len(self.ram_cache)} files ({total_trajs} total trajectories) into RAM cache.")
+
+    # Keys that are non-temporal (no time dimension to pad)
+    _NON_TEMPORAL_KEYS = {'goal_obj_world', 'fps'}
 
     def _get_single_traj(self, file_idx, batch_idx):
-        """Get (T, D) dict for a specific trajectory."""
+        """Get padded (T, D) dict for a specific trajectory.
+        Non-temporal keys (goal_obj_world, fps) are passed through without padding.
+        """
         file_data = self.ram_cache[file_idx]
 
         pad_start = self.history_size
         pad_end = self.traj_lengths[file_idx] - (file_data["base"][batch_idx].shape[0] + pad_start)
 
-        pad_kwargs = lambda arr: np.pad(arr, (((pad_start, pad_end),(0,0)) if arr.ndim==2 else ((0,0))), mode='edge')      
+        pad_kwargs = lambda arr: np.pad(
+            arr,
+            ((pad_start, pad_end), (0, 0)) if arr.ndim == 2 else ((0, 0),),
+            mode='edge',
+        )
 
-        return {k: pad_kwargs(v[batch_idx]) for k, v in file_data.items()}
+        result = {}
+        for k, v in file_data.items():
+            if k in self._NON_TEMPORAL_KEYS:
+                # Non-temporal — just index batch dim, no padding
+                result[k] = v[batch_idx] if hasattr(v, '__getitem__') and np.asarray(v).ndim >= 1 else v
+            else:
+                result[k] = pad_kwargs(v[batch_idx])
+        return result
+        
 
     def _index_dataset(self):
         """
@@ -261,7 +217,7 @@ class FlexibleWindowDataset(Dataset):
         Mimics create_dataset.py padding and windowing logic.
         """
         print("Indexing dataset...")
-        for i in range(len(self.file_paths)):
+        for i in range(len(self.ram_cache)):
             try:
                 data = self.ram_cache[i] if i < len(self.ram_cache) else self._load_and_process_file(self.file_paths[i])
                 
@@ -357,10 +313,18 @@ class FlexibleWindowDataset(Dataset):
             return x
 
         anchor = {k: np.array(_sq(v[0])) for k, v in anchor_b.items()}
-        anchor["final_obj_pos"] = raw_traj['obj'][-1, :3]
-
-        # Add task params
-        features["task_params"] = self._compute_task_params(raw_traj['base'], raw_traj['obj'], start_idx=read_start)
+        # Use external goal if available, otherwise fall back to trajectory's final obj pos
+        if 'goal_obj_world' in raw_traj:
+            goal_world = raw_traj['goal_obj_world']  # (3,)
+            anchor["final_obj_pos"] = goal_world
+            features["task_params"] = self._compute_task_params(
+                current_robot_state=raw_traj['base'][read_start, 3:],
+                current_obj_state=raw_traj['obj'][read_start, :3],
+                desired_obj_pos=goal_world,
+            )
+        else:
+            anchor["final_obj_pos"] = raw_traj['obj'][-1, :3]
+            features["task_params"] = self._compute_task_params(raw_traj['base'], raw_traj['obj'], start_idx=read_start)
         
         # Add metadata to anchor
         if 'fps' in raw_traj:
@@ -475,7 +439,9 @@ class FlexibleWindowDataset(Dataset):
         if key in self.noise_cfg:
             noise_level = self.noise_cfg[key]
             noise = torch.randn_like(tensor) * noise_level
-            return tensor + noise
+            tensor = tensor + noise
+        if key == "task_params" and self.noise_cfg.get("task_magnitude", 0) > 0:
+            tensor[..., 2] *= torch.rand_like(tensor[..., 2]) * self.noise_cfg["task_magnitude"] # Large noise for goal distance to encourage generalization
         return tensor
 
     def __getitem__(self, idx):

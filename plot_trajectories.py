@@ -10,6 +10,7 @@ from tqdm import tqdm
 
 from config.configure import load_config, get_data_path, get_norm_path
 from datasets.flexible_dataset import FlexibleWindowDataset
+from utils.math.math_tools import yaw_from_quat, yaw_to_rot_matrix
 
 def load_dataset():
     # Load config file relative to here? Or root. Assuming run from root.
@@ -91,84 +92,258 @@ def main():
     parser.add_argument("--max_trajs", type=int, default=100, help="Max trajectories if --all is used")
     parser.add_argument("--features", nargs="+", default=["obj:0"], help="Features to plot (e.g. 'obj:0', 'base:2' or '0')")
     parser.add_argument("--xy", action="store_true", help="Plot first two features against each other (XY plot)")
+    parser.add_argument("--obj_disp", action="store_true", help="Plot object displacement (obj pos - initial obj pos) yaw-rotated to the initial pelvis frame")
     parser.add_argument("--save_path", default="trajectory_plot.png", help="Path to save plot")
+    parser.add_argument("--dataset_paths", nargs="+", type=str, default=None, help="One or more dataset paths (folders or .npz files) to overlay. Legend uses folder names.")
     args = parser.parse_args()
     
-    dataset = load_dataset()
+    # Build list of (dataset, label) pairs
+    if args.dataset_paths:
+        datasets_and_labels = []
+        for dp in args.dataset_paths:
+            label = os.path.basename(os.path.normpath(dp.replace(".npz", "")))
+            model_cfg, data_cfg, training_cfg, noise_cfg = load_config("config/config.yaml")
+            norm_path = get_norm_path(model_cfg, training_cfg, data_cfg)
+            # If it's a .npz file, pass its parent dir and let the dataset find it
+            # But we need to bypass task_list logic
+            data_cfg_copy = dict(data_cfg)
+            data_cfg_copy.pop("task_list_path", None)  # Don't use task list for explicit paths
+            ds = FlexibleWindowDataset(
+                data_root=dp,
+                config=data_cfg_copy,
+                norm_path=norm_path,
+                calculate_stats=False
+            )
+            datasets_and_labels.append((ds, label))
+    else:
+        dataset = load_dataset()
+        # Group file_paths by parent folder name
+        # For a single dataset, each file_idx maps to a file_path
+        datasets_and_labels = [(dataset, "default")]
+
+    if args.obj_disp:
+        _plot_obj_disp(args, datasets_and_labels)
+    elif args.xy:
+        _plot_xy(args, datasets_and_labels)
+    else:
+        _plot_timeseries(args, datasets_and_labels)
+
+
+def _get_unique_trajs_and_indices(dataset, args):
+    """Return unique (file_idx, batch_idx) pairs and the indices to plot."""
     unique_trajs = sorted(list(set((f, b) for f, b, t in dataset.indices)))
     
-    idxs_to_plot = []
     if args.all:
-        idxs_to_plot = range(len(unique_trajs))
-        if args.max_trajs < len(idxs_to_plot):
-            print(f"Limiting to first {args.max_trajs} trajectories (use --max_trajs to change).")
-            idxs_to_plot = idxs_to_plot[:args.max_trajs]
+        idxs = list(range(len(unique_trajs)))
+        if args.max_trajs < len(idxs):
+            print(f"Limiting to first {args.max_trajs} trajectories.")
+            idxs = idxs[:args.max_trajs]
     elif args.indices:
-        idxs_to_plot = args.indices
+        idxs = args.indices
     else:
-        idxs_to_plot = [0]
+        idxs = [0]
         print("No indices specified, plotting index 0.")
-        
-    print(f"Plotting {len(idxs_to_plot)} trajectories...")
     
-    # Collect data
-    data_per_feature = {k: [] for k in args.features}
-    
-    for idx_i in tqdm(idxs_to_plot):
-        if idx_i >= len(unique_trajs):
-            print(f"Index {idx_i} out of bounds ({len(unique_trajs)} total).")
-            continue
-            
-        f_idx, b_idx = unique_trajs[idx_i]
-        try:
-            raw = dataset._get_single_traj(f_idx, b_idx)
-            for feat_spec in args.features:
-                val = get_feature(raw, feat_spec)
-                data_per_feature[feat_spec].append(val)
-        except Exception as e:
-            print(f"Error loading {f_idx}, {b_idx}: {e}")
+    return unique_trajs, idxs
 
-    # Plotting
-    if args.xy:
-        if len(args.features) < 2:
-            print("Error: --xy requires at least 2 features.")
-            return
+
+def _get_file_label(dataset, file_idx):
+    """Get a human-readable label from the file path's parent folder."""
+    fpath = dataset.file_paths[file_idx]
+    # Use the parent directory name as the label
+    return os.path.basename(os.path.dirname(fpath))
+
+
+def _plot_obj_disp(args, datasets_and_labels):
+    """Plot object displacement yaw-rotated to initial pelvis frame."""
+    plt.figure(figsize=(10, 10))
+    
+    # Assign a colour to each (dataset_label, file_idx) group
+    color_cycle = list(plt.cm.tab20.colors) + list(plt.cm.tab20b.colors) + list(plt.cm.tab20c.colors)
+    color_idx = 0
+    legend_handles = {}
+    
+    for dataset, ds_label in datasets_and_labels:
+        unique_trajs, idxs_to_plot = _get_unique_trajs_and_indices(dataset, args)
+        print(f"[{ds_label}] Plotting {len(idxs_to_plot)} trajectories...")
         
-        feat_x = args.features[0]
-        feat_y = args.features[1]
+        # Group trajectories by file_idx for colouring
+        file_groups = {}
+        for idx_i in idxs_to_plot:
+            if idx_i >= len(unique_trajs):
+                print(f"Index {idx_i} out of bounds ({len(unique_trajs)} total).")
+                continue
+            f_idx, b_idx = unique_trajs[idx_i]
+            file_groups.setdefault(f_idx, []).append((idx_i, f_idx, b_idx))
         
-        vals_x = data_per_feature[feat_x]
-        vals_y = data_per_feature[feat_y]
-        
-        plt.figure(figsize=(10, 10))
-        for vx, vy in zip(vals_x, vals_y):
-            # Ensure lengths match
-            min_len = min(len(vx), len(vy))
-            plt.plot(vx[:min_len], vy[:min_len], alpha=0.5)
+        for f_idx, group in file_groups.items():
+            # Determine label: use dataset label if multiple datasets, else folder name
+            if len(datasets_and_labels) > 1:
+                file_label = ds_label
+            else:
+                file_label = _get_file_label(dataset, f_idx) or ds_label
             
-        plt.xlabel(feat_x)
-        plt.ylabel(feat_y)
-        plt.title(f"XY Plot: {feat_x} vs {feat_y}")
-        plt.axis('equal')
-        plt.grid(True)
-        
-    else:
-        # Time series / Subplots
-        n_feats = len(args.features)
-        fig, axes = plt.subplots(n_feats, 1, figsize=(10, 5*n_feats), squeeze=False)
-        
-        for i, feat_spec in enumerate(args.features):
-            ax = axes[i, 0]
-            vals = data_per_feature[feat_spec]
-            if not vals: continue
+            color = color_cycle[color_idx % len(color_cycle)]
             
-            for seq in vals:
-                ax.plot(seq, alpha=0.5)
-            ax.set_title(f"Feature: {feat_spec}")
-            ax.set_ylabel("Value")
-            ax.set_xlabel("Time step")
-            ax.grid(True)
+            for idx_i, fi, bi in tqdm(group, desc=f"  {file_label}"):
+                try:
+                    raw = dataset._get_single_traj(fi, bi)
+                    
+                    # Get object position (T, 3+) and base quaternion
+                    if 'obj' not in raw or 'base' not in raw:
+                        print(f"  Skipping traj {idx_i}: missing 'obj' or 'base' key.")
+                        continue
+                    
+                    obj_pos = raw['obj'][:, :3]        # (T, 3)
+                    base_quat = raw['base'][:, 3:7]    # (T, 4) wxyz
+                    
+                    # Initial pelvis yaw
+                    initial_yaw = yaw_from_quat(base_quat[0])
+                    # Inverse rotation: rotate by -yaw
+                    R_inv = yaw_to_rot_matrix(-initial_yaw)  # (3, 3)
+                    
+                    # Object displacement relative to initial object position
+                    disp = obj_pos - obj_pos[0:1, :]  # (T, 3)
+                    
+                    # Rotate into initial pelvis frame
+                    disp_rot = (R_inv @ disp.T).T  # (T, 3)
+                    
+                    label_for_plot = file_label if file_label not in legend_handles else None
+                    line, = plt.plot(disp_rot[:, 0], disp_rot[:, 1], color=color, alpha=0.5, label=label_for_plot)
+                    if file_label not in legend_handles:
+                        legend_handles[file_label] = line
+                    
+                    # Mark start
+                    plt.plot(disp_rot[0, 0], disp_rot[0, 1], 'o', color=color, markersize=4, alpha=0.7)
+                    # Mark end
+                    plt.plot(disp_rot[-1, 0], disp_rot[-1, 1], 'x', color=color, markersize=5, alpha=0.7)
+                    
+                except Exception as e:
+                    print(f"  Error loading traj {idx_i} ({fi}, {bi}): {e}")
             
+            color_idx += 1
+    
+    plt.xlabel("X displacement (pelvis frame)")
+    plt.ylabel("Y displacement (pelvis frame)")
+    plt.title("Object Displacement in Initial Pelvis Frame")
+    plt.axis('equal')
+    plt.grid(True)
+    plt.legend()
+    plt.tight_layout()
+    plt.savefig(args.save_path)
+    plt.show()
+    print(f"Saved plot to {args.save_path}")
+
+
+def _plot_xy(args, datasets_and_labels):
+    """XY scatter/line plot of first two features."""
+    if len(args.features) < 2:
+        print("Error: --xy requires at least 2 features.")
+        return
+    
+    feat_x = args.features[0]
+    feat_y = args.features[1]
+    
+    plt.figure(figsize=(10, 10))
+    color_cycle = plt.cm.tab10.colors
+    color_idx = 0
+    legend_handles = {}
+    
+    for dataset, ds_label in datasets_and_labels:
+        unique_trajs, idxs_to_plot = _get_unique_trajs_and_indices(dataset, args)
+        
+        file_groups = {}
+        for idx_i in idxs_to_plot:
+            if idx_i >= len(unique_trajs):
+                continue
+            f_idx, b_idx = unique_trajs[idx_i]
+            file_groups.setdefault(f_idx, []).append((idx_i, f_idx, b_idx))
+        
+        for f_idx, group in file_groups.items():
+            if len(datasets_and_labels) > 1:
+                file_label = ds_label
+            else:
+                file_label = _get_file_label(dataset, f_idx) or ds_label
+            
+            color = color_cycle[color_idx % len(color_cycle)]
+            
+            for idx_i, fi, bi in group:
+                try:
+                    raw = dataset._get_single_traj(fi, bi)
+                    vx = get_feature(raw, feat_x)
+                    vy = get_feature(raw, feat_y)
+                    min_len = min(len(vx), len(vy))
+                    
+                    label_for_plot = file_label if file_label not in legend_handles else None
+                    line, = plt.plot(vx[:min_len], vy[:min_len], color=color, alpha=0.5, label=label_for_plot)
+                    if file_label not in legend_handles:
+                        legend_handles[file_label] = line
+                except Exception as e:
+                    print(f"Error loading {fi}, {bi}: {e}")
+            
+            color_idx += 1
+    
+    plt.xlabel(feat_x)
+    plt.ylabel(feat_y)
+    plt.title(f"XY Plot: {feat_x} vs {feat_y}")
+    plt.axis('equal')
+    plt.grid(True)
+    plt.legend()
+    plt.tight_layout()
+    plt.savefig(args.save_path)
+    plt.show()
+    print(f"Saved plot to {args.save_path}")
+
+
+def _plot_timeseries(args, datasets_and_labels):
+    """Time series subplot for each feature."""
+    n_feats = len(args.features)
+    fig, axes = plt.subplots(n_feats, 1, figsize=(10, 5*n_feats), squeeze=False)
+    
+    color_cycle = plt.cm.tab10.colors
+    
+    for feat_i, feat_spec in enumerate(args.features):
+        ax = axes[feat_i, 0]
+        color_idx = 0
+        legend_handles = {}
+        
+        for dataset, ds_label in datasets_and_labels:
+            unique_trajs, idxs_to_plot = _get_unique_trajs_and_indices(dataset, args)
+            
+            file_groups = {}
+            for idx_i in idxs_to_plot:
+                if idx_i >= len(unique_trajs):
+                    continue
+                f_idx, b_idx = unique_trajs[idx_i]
+                file_groups.setdefault(f_idx, []).append((idx_i, f_idx, b_idx))
+            
+            for f_idx, group in file_groups.items():
+                if len(datasets_and_labels) > 1:
+                    file_label = ds_label
+                else:
+                    file_label = _get_file_label(dataset, f_idx) or ds_label
+                
+                color = color_cycle[color_idx % len(color_cycle)]
+                
+                for idx_i, fi, bi in group:
+                    try:
+                        raw = dataset._get_single_traj(fi, bi)
+                        seq = get_feature(raw, feat_spec)
+                        label_for_plot = file_label if file_label not in legend_handles else None
+                        line, = ax.plot(seq, color=color, alpha=0.5, label=label_for_plot)
+                        if file_label not in legend_handles:
+                            legend_handles[file_label] = line
+                    except Exception as e:
+                        print(f"Error loading {fi}, {bi}: {e}")
+                
+                color_idx += 1
+        
+        ax.set_title(f"Feature: {feat_spec}")
+        ax.set_ylabel("Value")
+        ax.set_xlabel("Time step")
+        ax.grid(True)
+        ax.legend()
+    
     plt.tight_layout()
     plt.savefig(args.save_path)
     plt.show()
