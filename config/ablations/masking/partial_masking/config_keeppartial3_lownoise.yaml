@@ -52,7 +52,7 @@ model:
 training:
   save_dir: "./runs/ablations/masking/"
   log_dir: "./logs/ablations/masking/"
-  suffix: "_increased_noise"
+  suffix: "_keep_partial3"
   num_epochs: 500
   balance_task_density: False
   learning_rate: 0.0005
@@ -72,15 +72,15 @@ training:
 
   # In-betweening (waypoint-masked trajectory completion)
   inbetweening:
-    enabled: False
+    enabled: True
     min_keyframes: 1        # minimum number of unmasked keyframes per window
-    max_keyframes: 2        # maximum number of unmasked keyframes per window
+    max_keyframes: 3        # maximum number of unmasked keyframes per window
     always_keep_first: True # always keep t=0 as a full keyframe
     always_keep_last: False # always keep t=T-1 as a keyframe
-    waypoint_noise_fraction: 0.75  # max noise level for partial waypoint frames (fraction of total timesteps)
+    waypoint_noise_fraction: 0.4  # max noise level for partial waypoint frames (fraction of total timesteps)
     arrival_ratio: 0.85            # object reaches target in this fraction of remaining time
     partial_masking:
-      enabled: False
+      enabled: True
       prob: 1.0             # probability a waypoint is partial (vs full)
       feature_groups:       # named groups of features for partial masking
         locomotion: [delta_xy, delta_yaw, object_delta_xy]
@@ -88,8 +88,8 @@ training:
         pose: [joints, body_z, body_rot6d]
         object_rot: [obj_rel_rot6d]
       group_keep_prob:      # per-group probability of being kept clean in a partial waypoint
-        locomotion: 0.5
-        object_pos: 0.15
+        locomotion: 0.7
+        object_pos: 0.0
         pose: 0.0
         object_rot: 0.0
 

@@ -1,0 +1,1 @@
+This geom_loss has to be applied ideally only when the robot and box are supposed to be in contact.

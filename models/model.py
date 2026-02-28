@@ -73,7 +73,7 @@ class RobotDiffuser():
         else:
             self.model.load_state_dict(weights)
 
-    def getSample(self, num_trajectories=1, state_cond=None, goal_cond=None, deterministic=False, cfg_w=1.0, guidance_wt=1.0, guidance_goal=None, no_state_cond=False):
+    def getSample(self, num_trajectories=1, state_cond=None, goal_cond=None, deterministic=False, cfg_w=1.0, guidance_wt=0.0, guidance_goal=None, no_state_cond=False, waypoint_values=None, waypoint_mask=None):
         """
         Run reverse diffusion to generate trajectories.
         """
@@ -97,7 +97,9 @@ class RobotDiffuser():
         sample_kwargs = {
             'guidance_goal': guidance_goal if guidance_goal is not None else goal_cond, 
             'guidance_wt': guidance_wt, 'inpaint': self.model_cfg.get("inpaint", False),
-            'no_state_cond': no_state_cond
+            'no_state_cond': no_state_cond,
+            'waypoint_values': waypoint_values,
+            'waypoint_mask': waypoint_mask,
         }
 
         sample = self.model.sample(

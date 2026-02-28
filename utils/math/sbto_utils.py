@@ -793,7 +793,7 @@ def compute_guidance_vec(current_pos, target_pos, R_robot_yaw_inv, current_rot=N
 
     return np.concatenate([guidance_dir, dist], axis=-1).squeeze(1)
 
-def compute_task_params(current_robot_state, current_obj_state, desired_obj_pos, normalize_goal_vec=True, num_task_params=3):
+def compute_task_params(current_robot_state, current_obj_state, desired_obj_pos, normalize_goal_vec=True, num_task_params=3, max_goal_dist=None):
     """
     Computes the task parameters (local object displacement) for the diffusion model.
 
@@ -833,9 +833,11 @@ def compute_task_params(current_robot_state, current_obj_state, desired_obj_pos,
         else:
             local_delta = np.zeros_like(local_delta)
             local_delta_norm = 0.0
-        local_delta = np.concatenate([local_delta, np.atleast_1d(np.clip(local_delta_norm, a_min=None, a_max=5.0))], axis=-1)
+        if max_goal_dist is not None:
+            local_delta_norm_clipped = np.clip(local_delta_norm, min=0.0, max=max_goal_dist)
+        local_delta = np.concatenate([local_delta, np.atleast_1d(local_delta_norm_clipped)], axis=-1)
         
-    return local_delta
+    return local_delta, local_delta_norm
 
 def get_feature_indices(feature_layout):
     """

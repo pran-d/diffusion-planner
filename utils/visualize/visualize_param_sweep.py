@@ -10,6 +10,7 @@ import matplotlib.cm as cm
 from config.configure import load_config, get_data_path, get_norm_path
 from models.model import RobotDiffuser
 from datasets.flexible_dataset import FlexibleWindowDataset, yaw_to_rot_matrix, yaw_from_quat
+from utils.data.load_dataset import preload_dataset
 from utils.math.sbto_utils import reconstruct_sbto_trajectory, compute_task_params
 
 def update_condition(dataset, robot_world_history, obj_world_history, final_obj_pos=None):
@@ -101,6 +102,12 @@ def parse_args():
 
     # Guidance
     parser.add_argument("--guidance_wt", type=float, default=0.0)
+
+    # Goal multiplier sweep
+    parser.add_argument("--goal_multiplier", type=float, default=1.0,
+                        help="Single goal multiplier (scales displacement magnitude, keeps direction)")
+    parser.add_argument("--goal_multipliers", nargs="+", type=float, default=None,
+                        help="Sweep over multiple goal multipliers (e.g. --goal_multipliers 0.5 1.0 1.5 2.0)")
     
     return parser.parse_args()
 
@@ -156,10 +163,11 @@ def run_evaluation_batch(
             c_obj = current_anchors['ref_obj_pos'][bi]
             c_goal = current_anchors['final_obj_pos'][bi]
             
-            tp = compute_task_params(
+            tp, _ = compute_task_params(
                 c_quat, c_obj, c_goal,
-                normalize_goal_vec=dataset.normalize_goal_vec,
-                num_task_params=dataset.num_task_params 
+                normalize_goal_vec=dataset.normalize_goal_vec,       
+                num_task_params=dataset.num_task_params,
+                max_goal_dist=dataset.max_obj_displacement,
             ) # (2,) or (3,) depending on impl
             new_task_list.append(tp)
         
@@ -335,8 +343,10 @@ def main():
         args.stitch_steps *= (data_cfg['num_timesteps'] // args.action_horizon) + 1
     
     print("Loading dataset...")
+    data_buffer = preload_dataset(data_cfg, data_path)
     dataset = FlexibleWindowDataset(
-        data_root=data_path, config=data_cfg, norm_path=norm_path, calculate_stats=False
+        data_buffer=data_buffer, config=data_cfg, norm_path=norm_path, calculate_stats=False,
+        training_cfg=training_cfg,
     )
     
     diffuser = RobotDiffuser(
@@ -379,6 +389,12 @@ def main():
             anchors['ref_pos'].append(anchor['ref_pos'])
             anchors['ref_quat'].append(anchor['ref_quat'])
             anchors['ref_obj_pos'].append(anchor['ref_obj_pos'])
+            # Apply goal multiplier: keep direction, scale magnitude
+            if args.goal_multiplier != 1.0:
+                delta = final_pos - anchor['ref_obj_pos']
+                final_pos = anchor['ref_obj_pos'].copy()
+                final_pos[:2] += args.goal_multiplier * delta[:2]
+
             anchors['final_obj_pos'].append(final_pos)
             
             gt_deltas.append((final_pos - anchor['ref_obj_pos'])[:data_cfg["num_task_params"]])
@@ -512,6 +528,208 @@ def main():
         # Plot Trajectories
         if args.num_ood_tasks <= 50:
             plot_trajectories(traj_w, anchors_arr, "eval_ood_trajs.png", "OOD Trajectories (No State Cond)")
+
+    # --------------------------------------------------------
+    # Goal Multiplier Sweep
+    # --------------------------------------------------------
+    if args.goal_multipliers is not None and args.num_dataset_tasks > 0:
+        multipliers = sorted(set(args.goal_multipliers) | {1.0})  # always include original
+        print(f"\nGoal Multiplier Sweep: {multipliers}")
+        print(f"Using {args.num_dataset_tasks} dataset tasks as base directions.")
+
+        # Collect base initial conditions (same for every multiplier)
+        start_indices = [i for i, (f, b, t) in enumerate(dataset.indices) if t == 0]
+        if len(start_indices) < args.num_dataset_tasks:
+            selected = start_indices
+        else:
+            selected = np.random.choice(start_indices, args.num_dataset_tasks, replace=False)
+
+        base_states = []
+        base_anchors = {'ref_pos': [], 'ref_quat': [], 'ref_obj_pos': [], 'final_obj_pos': []}
+        base_gt_deltas = []  # unit-multiplier delta
+        base_stitch_list = []
+
+        for idx in tqdm(selected, desc="Prep Multiplier Base"):
+            _, curr_state, _, anchor = dataset[idx]
+            file_idx, batch_idx, _ = dataset.indices[idx]
+            traj_data = dataset._get_single_traj(file_idx, batch_idx)
+            final_pos = traj_data['obj'][-1, :3] if 'obj' in traj_data else anchor['ref_obj_pos'][:3]
+
+            base_states.append(curr_state)
+            base_anchors['ref_pos'].append(anchor['ref_pos'])
+            base_anchors['ref_quat'].append(anchor['ref_quat'])
+            base_anchors['ref_obj_pos'].append(anchor['ref_obj_pos'])
+            base_anchors['final_obj_pos'].append(final_pos)  # unscaled
+            base_gt_deltas.append((final_pos - anchor['ref_obj_pos'])[:data_cfg["num_task_params"]])
+
+            traj_len = traj_data['obj'].shape[0] if 'obj' in traj_data else traj_data['joints'].shape[0]
+            window_size = diffuser.input_size
+            base_stitch_list.append(int(np.ceil((traj_len - 1) / (window_size - 1))))
+
+        base_states_t = torch.stack(base_states)
+        base_gt_deltas = np.array(base_gt_deltas)  # (N, num_task_params)
+        N = len(base_states)
+
+        # Run for each multiplier
+        sweep_results = {}  # multiplier -> (gen_deltas, obj_traj_w, errors)
+        for mult in multipliers:
+            print(f"\n--- Goal Multiplier = {mult} ---")
+            # Scale the goal positions
+            scaled_anchors = {k: np.stack(v) for k, v in base_anchors.items()}
+            for i in range(N):
+                ref_obj = scaled_anchors['ref_obj_pos'][i]
+                orig_final = scaled_anchors['final_obj_pos'][i].copy()
+                delta = orig_final - ref_obj
+                scaled_final = ref_obj.copy()
+                scaled_final[:2] += mult * delta[:2]
+                scaled_anchors['final_obj_pos'][i] = scaled_final
+
+            dummy_task = torch.zeros(N, data_cfg["num_task_params"])
+
+            traj_w, gen_disp = run_evaluation_batch(
+                args, diffuser, dataset, device,
+                base_states_t.clone(), dummy_task, scaled_anchors,
+                use_state_cond=True, desc=f"Multiplier {mult}",
+                stitch_steps_list=base_stitch_list * int(mult),
+            )
+
+            scaled_gt = base_gt_deltas * mult  # expected delta at this multiplier
+            gen_d = gen_disp[:, :data_cfg["num_task_params"]]
+            errs = np.linalg.norm(scaled_gt - gen_d, axis=1)
+            print(f"  Mean Error: {np.mean(errs):.4f}, Std: {np.std(errs):.4f}")
+            sweep_results[mult] = (gen_d, traj_w, errs, scaled_gt)
+
+        # ---- Combined Trajectory + Target Plot (single image) ----
+        # Plot relative to robot frame
+        n_mult = len(multipliers)
+        cmap = cm.get_cmap("tab10", n_mult)
+        mult_colors = {m: cmap(i) for i, m in enumerate(multipliers)}
+
+        # Helper to transform world points to ego-relative displacement
+        def to_ego_frame(world_pts, start_obj_pos, start_robot_quat):
+            # world_pts: (N, T, 2) or (N, 2)
+            # start_obj_pos: (N, 2)
+            # start_robot_quat: (N, 4)
+            if world_pts.ndim == 2:
+                world_pts = world_pts[:, None, :] # (N, 1, 2)
+            
+            # 1. Translation relative to object start (displacement)
+            diff = world_pts - start_obj_pos[:, None, :2] # (N, T, 2)
+
+            # 2. Rotation into robot frame
+            # Using torch for robust yaw extraction (consistent with model)
+            q_t = torch.from_numpy(start_robot_quat).float()
+            
+            # Check shape of q_t. Ensure it is correct for yaw_from_quat
+            # Assuming yaw_from_quat is robust to [x,y,z,w] vs [w,x,y,z] if it's the one from flexible_dataset
+            yaw = yaw_from_quat(q_t) # (N,) or (N, 1)
+            yaw = yaw.view(-1).numpy()
+
+            # Rotate by -yaw to get into ego frame
+            # The rotation matrix from Body to World is R(yaw).
+            # We want World to Body (Displacement), so R(-yaw).
+            c = np.cos(-yaw)
+            s = np.sin(-yaw)
+            
+            x = diff[..., 0]
+            y = diff[..., 1]
+            new_x = c[:, None] * x - s[:, None] * y
+            new_y = s[:, None] * x + c[:, None] * y
+            
+            return np.stack([new_x, new_y], axis=-1)
+
+        base_ref_obj = np.stack(base_anchors['ref_obj_pos'])[:, :2] # (N, 2)
+        base_ref_quat = np.stack(base_anchors['ref_quat']) # (N, 4)
+
+        # Gather ego-frame points for limits
+        all_x, all_y = [], []
+        
+        sweep_ego_data = {} # Cache transformed data
+        
+        for mult in multipliers:
+            gen_d, traj_w, _, scaled_gt = sweep_results[mult]
+            
+            # Trajectories (N, T, 2)
+            traj_ego = to_ego_frame(traj_w[:, :, :2], base_ref_obj, base_ref_quat) # (N, T, 2)
+            
+            # Targets (N, 2) -> (N, 1, 2)
+            targets_world = base_ref_obj + mult * base_gt_deltas[:, :2]
+            target_ego = to_ego_frame(targets_world, base_ref_obj, base_ref_quat) # (N, 1, 2)
+            target_ego = target_ego.squeeze(1) # (N, 2)
+            
+            sweep_ego_data[mult] = (traj_ego, target_ego)
+            
+            all_x.append(traj_ego[..., 0].flatten())
+            all_y.append(traj_ego[..., 1].flatten())
+            all_x.append(target_ego[..., 0].flatten())
+            all_y.append(target_ego[..., 1].flatten())
+
+        all_x = np.concatenate(all_x)
+        all_y = np.concatenate(all_y)
+        max_dist = np.max(np.sqrt(all_x**2 + all_y**2)) * 1.15
+
+        fig, ax = plt.subplots(1, 1, figsize=(12, 12))
+
+        # Origin is always (0,0) - object start
+        ax.scatter([0], [0], marker='o', s=100, c='black', zorder=10, label='obj start')
+
+        for mult in multipliers:
+            c = mult_colors[mult]
+            gen_d, traj_w, errs, scaled_gt = sweep_results[mult]
+            traj_ego, target_ego = sweep_ego_data[mult]
+            
+            is_orig = (mult == 1.0)
+            lw = 2.0 if is_orig else 1.2
+            alpha_line = 0.8 if is_orig else 0.5
+
+            # Plot target stars
+            ax.scatter(target_ego[:, 0], target_ego[:, 1],
+                       marker='*', s=120, c=[c], edgecolors='black', linewidths=0.5,
+                       zorder=8, label=f"target ×{mult}")
+
+            # Plot achieved end positions
+            end_ego = traj_ego[:, -1, :]
+            ax.scatter(end_ego[:, 0], end_ego[:, 1],
+                       marker='D', s=40, c=[c], edgecolors='white', linewidths=0.6,
+                       zorder=7, alpha=0.85,
+                       label=f"achieved ×{mult} (err={np.mean(errs):.3f})")
+
+            # Plot trajectories
+            for i in range(N):
+                path = traj_ego[i]
+                ax.plot(path[:, 0], path[:, 1], color=c, alpha=alpha_line,
+                        linewidth=lw)
+
+                # Thin line from achieved end to target
+                ax.plot([end_ego[i, 0], target_ego[i, 0]],
+                        [end_ego[i, 1], target_ego[i, 1]],
+                        color=c, alpha=0.2, linewidth=0.6, linestyle='--')
+
+        ax.set_xlim(-max_dist, max_dist)
+        ax.set_ylim(-max_dist, max_dist)
+        ax.set_xlabel("Forward (Robot Frame)")
+        ax.set_ylabel("Left (Robot Frame)")
+        ax.set_title("Goal Multiplier Sweep — Object Displacement (Robot Frame)")
+        ax.set_aspect('equal')
+        ax.grid(True, alpha=0.3)
+        ax.legend(fontsize=7, ncol=2, loc='upper left')
+        fig.tight_layout()
+        fig.savefig("eval_goal_multiplier_all.png", dpi=150)
+        print(f"Saved combined trajectory plot to eval_goal_multiplier_all.png")
+
+        # ---- Error vs Multiplier Curve ----
+        fig_curve, ax_c = plt.subplots(1, 1, figsize=(8, 5))
+        means = [np.mean(sweep_results[m][2]) for m in multipliers]
+        stds = [np.std(sweep_results[m][2]) for m in multipliers]
+        ax_c.errorbar(multipliers, means, yerr=stds, marker='o', capsize=4)
+        ax_c.set_xlabel("Goal Multiplier")
+        ax_c.set_ylabel("L2 Displacement Error")
+        ax_c.set_title("Goal Multiplier vs Displacement Error")
+        ax_c.grid(True, alpha=0.3)
+        fig_curve.tight_layout()
+        fig_curve.savefig("eval_goal_multiplier_curve.png", dpi=150)
+        print(f"Saved error curve to eval_goal_multiplier_curve.png")
+
 
 if __name__ == "__main__":
     main()

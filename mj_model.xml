@@ -332,11 +332,11 @@
     <body name="largebox" pos="0.4 0 0.17">
     <!-- <body name="largebox" pos="0.35 0 0.115"> -->
       <joint type="free"/>
-      <geom name="obj" size="0.155 0.155 0.17" pos="0 0 0" type="box" quat="0.00991298 0.849052 -0.523456 0.0707591" contype="0" group="1" priority="1" friction="0.6 0.001" solmix="3" solref="0.04" mass="0.6" rgba="0.3 0.3 0.3 1"/>
+      <geom name="obj" size="0.155 0.155 0.17" pos="0 0 0.0105" type="box" quat="1.0 0.0 0.0 0.0" contype="0" group="1" priority="1" friction="0.6 0.001" solmix="3" solref="0.04" mass="0.6" rgba="0.3 0.3 0.3 1"/>
       <!-- <geom name="obj" size="0.1 0.1 0.115" pos="0 0 0" type="box" contype="0" group="1" priority="1" friction="0.6 0.001" solmix="3" solref="0.04" mass="0.6" rgba="0.3 0.3 0.3 1"/> -->
     </body>
     <body name="goal_marker" mocap="true" pos="0 0 -1">
-      <geom type="box" size="0.155 0.155 0.17" pos="0 0 0.0105" quat="0.00991298 0.849052 -0.523456 0.0707591" rgba="0 1 0 0.3" conaffinity="0" contype="0"/>
+      <geom type="box" size="0.155 0.155 0.17" pos="0 0 0.0" rgba="0 1 0 0.3" conaffinity="0" contype="0"/>
     </body>
     <body name="guidance_arrow" mocap="true" pos="0 0 -1">
       <geom type="cylinder" size="0.01 0.25" pos="0 0 0.25" rgba="0 1 0 1" conaffinity="0" contype="0"/>

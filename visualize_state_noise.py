@@ -8,6 +8,7 @@ from tqdm import tqdm
 
 from config.configure import load_config, get_data_path, get_norm_path
 from datasets.flexible_dataset import FlexibleWindowDataset
+from utils.data.load_dataset import preload_dataset
 from utils.visualize.visualize import MjVisualizer
 from utils.math.sbto_utils import rot6d_to_rot, rot_to_quat, reconstruct_sbto_trajectory
 
@@ -224,9 +225,10 @@ def main():
 
     print("Loading dataset...")
     # Clean dataset to start
+    data_buff = preload_dataset(data_cfg, data_path)
     dataset = FlexibleWindowDataset(
-        data_root=data_path, config=data_cfg, norm_path=norm_path,
-        calculate_stats=False, add_noise=False, noise_cfg=obs_noise_cfg
+        data_buffer=data_buff, config=data_cfg, norm_path=norm_path,
+        calculate_stats=False, training_cfg=training_cfg,
     )
     
     feature_dims = get_feature_dims(dataset)

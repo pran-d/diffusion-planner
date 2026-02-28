@@ -8,7 +8,215 @@ from models.model import RobotDiffuser
 from datasets import BufferDataset
 from utils.data.load_dataset import preload_dataset
 from datasets.flexible_dataset import yaw_to_rot_matrix, yaw_from_quat
-from utils.math.sbto_utils import reconstruct_sbto_trajectory, compute_task_params
+from utils.math.sbto_utils import reconstruct_sbto_trajectory, compute_task_params, FEATURE_LAYOUT_NO_VEL
+
+
+def build_keyframes(normalized_window, keep_first=True, keep_last=True, num_samples=1):
+    """
+    Build waypoint tensor and feature-level mask from a normalized trajectory window.
+
+    Args:
+        normalized_window: (T, D) tensor — a single normalized ground truth window
+        keep_first: whether to mark t=0 as a waypoint (all features)
+        keep_last:  whether to mark t=-1 as a waypoint (all features)
+        num_samples: batch size to tile to
+
+    Returns:
+        waypoint_values: (B, T, D) tensor
+        waypoint_mask:   (B, T, D) bool tensor — True = known feature
+    """
+    T, D = normalized_window.shape
+    values = normalized_window.unsqueeze(0).repeat(num_samples, 1, 1)  # (B, T, D)
+    mask = torch.zeros(num_samples, T, D, dtype=torch.bool)
+    if keep_first:
+        mask[:, 0, :] = True
+    if keep_last:
+        mask[:, -1, :] = True
+    return values, mask
+
+
+def build_first_keyframe_from_state(curr_state_tens, dataset, num_features, window_size):
+    """
+    Build a waypoint tensor where only t=0 is marked (all features known),
+    constructed from the current observation state.  The first
+    `num_features - num_observations` dims (delta_xy, delta_yaw, obj_delta_xy)
+    are zero at t=0 (no motion yet).
+
+    Args:
+        curr_state_tens: (B, H, obs_dim)  — current observation (last H frames)
+        dataset:         the dataset object (for normalization)
+        num_features:    total feature dim (D)
+        window_size:     T tokens in a window
+
+    Returns:
+        waypoint_values: (B, T, D)
+        waypoint_mask:   (B, T, D) bool — True at t=0 for all features
+    """
+    B = curr_state_tens.shape[0]
+    obs_dim = curr_state_tens.shape[-1]
+    D = num_features
+    T = window_size
+
+    # At t=0 deltas are zero — normalize them
+    prefix_dim = D - obs_dim  # typically 5 (delta_xy=2, delta_yaw=1, obj_delta_xy=2)
+
+    # Normalize each delta component
+    prefix_parts = []
+    cumulative = 0
+    for key in dataset.feature_order:
+        key_dim_map = {
+            'delta_xy': 2, 'delta_yaw': 1, 'obj_delta_xy': 2,
+        }
+        if key in key_dim_map:
+            kd = key_dim_map[key]
+            part = dataset._normalize(key, torch.zeros(1, kd))
+            prefix_parts.append(part.squeeze(0))
+            cumulative += kd
+        if cumulative >= prefix_dim:
+            break
+
+    if prefix_parts:
+        normalized_prefix = torch.cat(prefix_parts)  # (prefix_dim,)
+    else:
+        normalized_prefix = torch.zeros(prefix_dim)
+
+    # Build first frame: [normalized_deltas=0, observation_features]
+    obs_frame = curr_state_tens[:, -1, :]  # (B, obs_dim) — latest observation frame
+    first_frame = torch.cat([
+        normalized_prefix.unsqueeze(0).expand(B, -1),
+        obs_frame
+    ], dim=-1)  # (B, D)
+
+    # Construct waypoint tensor (B, T, D) — zeros, then fill t=0
+    waypoint_values = torch.zeros(B, T, D, device=curr_state_tens.device)
+    waypoint_values[:, 0, :] = first_frame
+
+    # Feature-level mask: all features known at t=0
+    waypoint_mask = torch.zeros(B, T, D, dtype=torch.bool, device=curr_state_tens.device)
+    waypoint_mask[:, 0, :] = True
+
+    return waypoint_values, waypoint_mask
+
+
+def build_last_frame_waypoints(
+    task_params_raw,     # (B, num_task_params) denormalized task params
+    window_size,         # T
+    dataset,             # for normalization
+    feature_order,       # list of feature keys
+    num_features,        # D
+    remaining_steps=1,   # how many windows remain to reach goal
+    arrival_ratio=0.85,  # finish in this fraction of remaining time
+):
+    """
+    Build a partial waypoint at the last frame (t=T-1) of the window.
+
+    Sets:
+    - obj_delta_xy: constant-velocity object displacement to reach goal,
+      arriving in `arrival_ratio` fraction of the remaining time.
+- delta_yaw: robot faces along the goal direction.
+
+    Returns:
+        waypoint_values: (B, T, D) float tensor — values at waypoint positions
+        waypoint_mask:   (B, T, D) bool tensor — True = known feature
+    """
+    if isinstance(task_params_raw, np.ndarray):
+        task_params_raw = torch.from_numpy(task_params_raw).float()
+    if task_params_raw.ndim == 1:
+        task_params_raw = task_params_raw.unsqueeze(0)
+
+    B = task_params_raw.shape[0]
+    T = window_size
+    D = num_features
+
+    values = torch.zeros(B, T, D)
+    mask = torch.zeros(B, T, D, dtype=torch.bool)
+
+    # Parse task params: [dir_x, dir_y, distance] or [delta_x, delta_y]
+    if task_params_raw.shape[-1] >= 3:
+        direction = task_params_raw[:, :2]   # (B, 2)
+        distance = task_params_raw[:, 2:3]   # (B, 1)
+        total_remaining_delta = direction * distance  # (B, 2)
+    else:
+        total_remaining_delta = task_params_raw[:, :2]  # (B, 2)
+
+    # Per-window object displacement (arrive early)
+    effective_remaining = max(remaining_steps * arrival_ratio, 1.0)
+    per_window_delta = total_remaining_delta / effective_remaining  # (B, 2)
+
+    # Robot yaw: face along goal direction
+    goal_yaw = torch.atan2(task_params_raw[:, 1], task_params_raw[:, 0])  # (B,)
+
+    # Build feature index map
+    feature_idx = {}
+    idx = 0
+    for key in feature_order:
+        dim = FEATURE_LAYOUT_NO_VEL.get(key, 0)
+        if dim > 0:
+            feature_idx[key] = slice(idx, idx + dim)
+            idx += dim
+
+    t_last = T - 1
+
+    # Set obj_delta_xy at last frame
+    if "obj_delta_xy" in feature_idx:
+        norm_obj_delta = dataset._normalize("obj_delta_xy", per_window_delta)
+        if not isinstance(norm_obj_delta, torch.Tensor):
+            norm_obj_delta = torch.tensor(norm_obj_delta, dtype=torch.float32)
+        values[:, t_last, feature_idx["obj_delta_xy"]] = norm_obj_delta.reshape(B, -1)
+        mask[:, t_last, feature_idx["obj_delta_xy"]] = True
+
+    return values, mask
+
+
+def build_inference_waypoints(
+    curr_state_tens,       # (B, H, obs_dim)
+    task_params_raw,       # (B, num_task_params) denormalized task params
+    dataset,
+    num_features,
+    window_size,
+    use_last_frame_wp=True,  # whether to add last-frame partial waypoint
+    remaining_steps=1,
+    arrival_ratio=0.85,
+):
+    """
+    Build complete waypoint specification for inference.
+    Combines a full keyframe at t=0 (from current state) with an optional
+    analytically-computed partial waypoint at the last frame (obj_delta_xy + delta_yaw).
+
+    Returns:
+        waypoint_values: (B, T, D) float tensor
+        waypoint_mask:   (B, T, D) bool tensor
+    """
+    B = curr_state_tens.shape[0]
+    D = num_features
+    T = window_size
+
+    # 1. Full keyframe at t=0 from current state
+    kf_vals, _ = build_first_keyframe_from_state(
+        curr_state_tens, dataset, num_features, window_size
+    )
+
+    values = kf_vals.clone()
+    mask = torch.zeros(B, T, D, dtype=torch.bool, device=curr_state_tens.device)
+    mask[:, 0, :] = True  # all features known at t=0
+
+    # 2. Last-frame partial waypoint (obj_delta_xy + delta_yaw)
+    if use_last_frame_wp and task_params_raw is not None:
+        wp_vals, wp_mask = build_last_frame_waypoints(
+            task_params_raw=task_params_raw,
+            window_size=window_size,
+            dataset=dataset,
+            feature_order=dataset.feature_order,
+            num_features=num_features,
+            remaining_steps=remaining_steps,
+            arrival_ratio=arrival_ratio,
+        )
+        # Merge: last-frame waypoint fills in only its marked positions
+        values = torch.where(wp_mask, wp_vals.to(values.device), values)
+        mask = mask | wp_mask.to(mask.device)
+
+    return values, mask
+
 
 def update_condition(dataset, robot_world_history, obj_world_history, final_obj_pos=None):
     """
@@ -74,13 +282,7 @@ def update_condition(dataset, robot_world_history, obj_world_history, final_obj_
     return next_state_tens, batched_anchor
 
 
-def run_visualization(stitched_trajs, xml_path, goal_vectors=None, final_obj_pos=None):
-    from utils.visualize.visualize import MjVisualizer
-    
-    vis = MjVisualizer(xml_path, close_on_enter=False)
-    print("Optimization Complete. Visualizing first sample...")
-    print("Controls: SPACE=Pause, ARROWS=Step, ESC=Exit")
-    
+def run_visualization(vis, stitched_trajs, goal_vectors=None, final_obj_pos=None, repeat=True):    
     # Use first sample (num_samples, T, D) -> (T, D)
     if stitched_trajs.ndim == 3:
         traj = stitched_trajs[0] 
@@ -90,9 +292,7 @@ def run_visualization(stitched_trajs, xml_path, goal_vectors=None, final_obj_pos
     T_steps = traj.shape[0]
     t = np.arange(T_steps) * 0.01
 
-    vis.visualize_trajectory(t=t, x_traj=traj, repeat=True, guidance_vec=goal_vectors, goal_pos=final_obj_pos)
-
-    vis.close()
+    vis.visualize_trajectory(t=t, x_traj=traj, repeat=repeat, guidance_vec=goal_vectors, goal_pos=final_obj_pos)
 
 def main():
     parser = argparse.ArgumentParser(description="Clean Inference & Stitching Pipeline")
@@ -111,11 +311,14 @@ def main():
     parser.add_argument("--action_horizon", type=int, default=None, help="Number of future steps to visualize/control (for dataset visualization)")
     parser.add_argument("--end_error_threshold", type=float, default=0.1, help="End error threshold for stitching")
     parser.add_argument("--goal_multiplier", type=float, default=1.0, help="Scaling factor for goal (for testing different r for same theta)")
+    parser.add_argument("--visualize_windows", action="store_true", help="Render and save each generated window as a video")
 
     # Guidance arguments
     parser.add_argument("--guidance_wt", type=float, default=0.0, help="Test-time gradient guidance strength")
     parser.add_argument("--guidance_goal", nargs="+", type=float, default=None, help="Target values for guidance (normalized)")
     parser.add_argument("--guidance_indices", nargs="+", type=int, default=None, help="Indices of the state vector to apply guidance on")
+    parser.add_argument("--last_frame_waypoint", action="store_true", help="Add partial waypoint at last frame (obj_delta_xy + delta_yaw)")
+    parser.add_argument("--arrival_ratio", type=float, default=0.85, help="Object arrives in this fraction of remaining time (0-1)")
     
     args = parser.parse_args()
 
@@ -140,6 +343,12 @@ def main():
         calculate_stats=calculate_stats, norm_path=norm_path,
         training_cfg={},
     )
+
+    from utils.visualize.visualize import MjVisualizer
+    xml_path = "mj_model.xml"
+    if not os.path.exists(xml_path):
+        xml_path = os.path.join(data_path, "mj_model.xml")
+    vis = MjVisualizer(xml_path, close_on_enter=False)
 
     # 3. Model
     diffuser = RobotDiffuser(
@@ -177,6 +386,11 @@ def main():
     stitched_segments = []
     unreconstructed_segments = []
     goal_vectors = []
+    # Analysis data: per-window normalized outputs and waypoints
+    analysis_normalized_windows = []
+    analysis_denormalized_windows = []
+    analysis_waypoint_values = []
+    analysis_waypoint_masks = []
 
     # Override task params if provided
     if args.task_params is not None:
@@ -212,16 +426,32 @@ def main():
 
         # A. Inference
         if not args.visualize_dataset:
-            tp_init = compute_task_params(
+            tp_init, actual_dist = compute_task_params(
                 current_robot_state=current_anchors['ref_quat'], 
                 current_obj_state=current_anchors['ref_obj_pos'], 
                 desired_obj_pos=current_anchors["final_obj_pos"],
                 normalize_goal_vec=data_cfg.get("normalize_goal_vec", False),
-                num_task_params=data_cfg["num_task_params"]
+                num_task_params=data_cfg["num_task_params"],
+                max_goal_dist=dataset.max_obj_displacement
             )
+            task_actual = tp_init.copy()
+            task_actual[..., 2] = actual_dist  
+            print(task_actual)
+
             task_params = dataset._normalize("task_params", tp_init)
             task_tens = task_params if isinstance(task_params, torch.Tensor) else torch.tensor(task_params, dtype=torch.float32)
 
+            # Build waypoints: full keyframe at t=0 + optional last-frame partial waypoint
+            wv, wm = None, None
+            if args.last_frame_waypoint:
+                remaining = max(args.stitch_steps - step, 1)
+                wv, wm = build_inference_waypoints(
+                    curr_state_tens, task_actual, dataset,
+                    data_cfg['num_features'], dataset.window_size,
+                    use_last_frame_wp=args.last_frame_waypoint,
+                    remaining_steps=remaining,
+                    arrival_ratio=args.arrival_ratio,
+                )
             normalized_sample = diffuser.getSample(
                 num_trajectories=args.num_samples,
                 state_cond=curr_state_tens.to(device),
@@ -230,9 +460,16 @@ def main():
                 cfg_w=args.cfg_w,
                 guidance_wt=args.guidance_wt,
                 guidance_goal=args.guidance_goal,
+                waypoint_values=wv,
+                waypoint_mask=wm,
             )
         else:
-            normalized_sample = fut_traj.unsqueeze(0).repeat(args.num_samples, 1, 1)
+            # Bypass generative model for visualization:
+            # Use original dataset future trajectory directly
+            normalized_sample = fut_traj.unsqueeze(0).repeat(args.num_samples, 1, 1).to(device)
+            # Create dummy empty waypoints for analysis compatibility
+            wv = torch.zeros_like(normalized_sample)
+            wm = torch.zeros_like(normalized_sample, dtype=torch.bool)
         
         # B. Denormalize
         denorm_btc = dataset.denormalize_global(normalized_sample)
@@ -240,6 +477,13 @@ def main():
 
         # Store unreconstructed segment for debugging   
         unreconstructed_segments.append(future_traj_np)
+
+        # Collect analysis data
+        analysis_normalized_windows.append(normalized_sample.cpu().numpy())
+        analysis_denormalized_windows.append(future_traj_np)
+        if wv is not None and wm is not None:
+            analysis_waypoint_values.append(wv.cpu().numpy())
+            analysis_waypoint_masks.append(wm.cpu().numpy())
 
         # C. Reconstruct World Frame
         anchor_arr = np.concatenate([
@@ -270,6 +514,17 @@ def main():
         
         goal_vec_global = (yaw_to_rot_matrix(yaw_from_quat(current_anchors['ref_quat'])) @ task_denorm_3d.cpu().numpy())[..., :data_cfg["num_task_params"], 0]
         goal_vectors.append(goal_vec_global.repeat(segment_world.shape[1], 0)[..., :2]) # (B, 3)
+
+        # Optionally visualize this window
+        visualize_every = 50
+        if args.visualize_windows and step % visualize_every == 0:
+            part_traj = np.concatenate(stitched_segments[-visualize_every:], axis=1) # Visualize last 5 segments
+            part_goal_vec = np.concatenate(goal_vectors[-visualize_every:], axis=0)
+            try:
+                # Use the interactive visualizer used at the end of stitching
+                run_visualization(vis, part_traj, part_goal_vec, anchor["final_obj_pos"], repeat=False)
+            except Exception as e:
+                print(f"Warning: interactive visualization failed for window {step}: {e}")
 
         # Desired Displacement (From Ground Truth Full Trajectory)                    
         err = np.linalg.norm(current_anchors["final_obj_pos"][..., :data_cfg["num_task_params"]] - segment_world[:, -1, 36 : 36 + data_cfg["num_task_params"]])
@@ -311,6 +566,22 @@ def main():
     os.makedirs(os.path.dirname(args.save_path), exist_ok=True)
     np.save(args.save_path, full_trajectory)
     print(f"Stitched trajectory saved to {args.save_path} (Shape: {full_trajectory.shape})")
+
+    # Save analysis data
+    analysis_path = args.save_path.replace('.npy', '_analysis.npz')
+    analysis_data = {
+        'trajectory': full_trajectory,                                          # (B, total_T, 43) world frame
+        'normalized_windows': np.array(analysis_normalized_windows),            # (num_windows, B, T, D) normalized
+        'denormalized_windows': np.array(analysis_denormalized_windows),        # (num_windows, B, T, D) denormalized features
+        'waypoint_values': np.array(analysis_waypoint_values),                  # (num_windows, B, T, D)
+        'waypoint_masks': np.array(analysis_waypoint_masks),                    # (num_windows, B, T, D) bool
+        'feature_order': np.array(dataset.feature_order),                       # feature names
+        'feature_dims': np.array([FEATURE_LAYOUT_NO_VEL[k] for k in dataset.feature_order]),  # dim per feature
+    }
+    if unreconstructed_trajectory is not None:
+        analysis_data['unreconstructed'] = unreconstructed_trajectory
+    np.savez(analysis_path, **analysis_data)
+    print(f"Analysis data saved to {analysis_path}")
     
     # Object indices: 36:38 (pos), 38:42 (quat)
     if full_trajectory.shape[-1] >= 38:
@@ -334,14 +605,12 @@ def main():
             pass
 
     # 7. Visualize
-    xml_path = "mj_model.xml" 
-    if not os.path.exists(xml_path):
-            xml_path = os.path.join(data_path, "mj_model.xml")
-            
     if os.path.exists(xml_path):
-        run_visualization(full_trajectory, xml_path, goal_vectors, anchor["final_obj_pos"])
+        run_visualization(vis, full_trajectory, goal_vectors, anchor["final_obj_pos"])
     else:
         print("Could not find mj_model.xml for visualization.")
+
+    vis.close()
 
 if __name__ == "__main__":
     main()

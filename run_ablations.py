@@ -3,61 +3,61 @@ import shutil
 import subprocess
 import time
 import sys
+import glob
 
 # =============================================================================
 # ABLATION STUDIES CONFIGURATION
 # =============================================================================
-# Define your planned ablations here.
-# format: ( "path/to/specific_config.yaml", "Description of what this ablation tests" )
+# Define the root folder containing your ablation configs.
+# The script will automatically find all .yaml files in this folder and its subfolders.
+ABLATIONS_FOLDER = "config/ablations/masking/"
 
-ABLATIONS = [
-    # (
-    #     "config/ablations/normalized_goal/config.yaml",
-    #     "normalized goal vector (ablation of normalization)"
-    # ),
+# The main configuration file that will be overwritten during training
+MAIN_CONFIG_FILE = "config/config.yaml"
 
-    (
-        "config/ablations/geom_loss/config.yaml",
-        "using geometric loss (ablation of loss function components)"
-    ),
-    (
-        "config/ablations/timesteps/config_5.yaml",
-        "using 5 timesteps instead of 10 (ablation of number of diffusion steps)"
-    ),
-
-]
 # =============================================================================
 # SCRIPT LOGIC
 # =============================================================================
 
 def main():
-    if not ABLATIONS:
-        print("Warning: No ablations defined in 'ABLATIONS' list inside run_ablations.py.")
-        print("Please edit the file and uncomment/add entries.")
+    if not os.path.isdir(ABLATIONS_FOLDER):
+        print(f"ERROR: The directory '{ABLATIONS_FOLDER}' does not exist.")
+        sys.exit(1)
+
+    # Recursively find all .yaml files in the ablations folder
+    search_pattern = os.path.join(ABLATIONS_FOLDER, "**/*.yaml")
+    ablation_files = glob.glob(search_pattern, recursive=True)
+    
+    # Sort them alphabetically so they run in a predictable order
+    ablation_files = sorted(ablation_files)
+
+    # Filter out the main config file just in case it is inside the search folder
+    ablation_files = [f for f in ablation_files if os.path.abspath(f) != os.path.abspath(MAIN_CONFIG_FILE)]
+
+    if not ablation_files:
+        print(f"Warning: No '.yaml' files found in '{ABLATIONS_FOLDER}'.")
         sys.exit(0)
 
     # 1. Backup Current Config
-    original_config = "config/config.yaml"
-    backup_config = "config/config.yaml.bak"
+    original_config = MAIN_CONFIG_FILE
+    backup_config = f"{MAIN_CONFIG_FILE}.bak"
     
     if os.path.exists(original_config):
         print(f"Backing up {original_config} -> {backup_config}")
         shutil.copy(original_config, backup_config)
 
+    total_start = time.time()
+
     try:
-        total_start = time.time()
-        
-        for i, (cfg_path, comment) in enumerate(ABLATIONS):
+        for i, cfg_path in enumerate(ablation_files):
+            # Extract folder/file name for a cleaner display comment
+            relative_name = os.path.relpath(cfg_path, ABLATIONS_FOLDER)
+            
             print("\n" + "#" * 80)
-            print(f"ABLATION {i+1}/{len(ABLATIONS)}")
-            print(f"Comment: {comment}")
+            print(f"ABLATION {i+1}/{len(ablation_files)}")
+            print(f"Target: {relative_name}")
             print(f"Source Config: {cfg_path}")
             print("#" * 80 + "\n")
-
-            if not os.path.exists(cfg_path):
-                print(f"ERROR: Config file not found at {cfg_path}")
-                print("Skipping...")
-                continue
 
             # 2. Overwrite Main Config
             print(f"Copying {cfg_path} to {original_config}...")
@@ -77,8 +77,7 @@ def main():
 
             except subprocess.CalledProcessError as e:
                 print(f"[FAILURE] Ablation {i+1} failed with exit code {e.returncode}.")
-                # Decide here if you want to break or continue. Usually continue for batch jobs.
-                # buffer time
+                # Buffer time before starting the next one if it fails
                 time.sleep(5)
 
     except KeyboardInterrupt:
@@ -91,8 +90,8 @@ def main():
             shutil.copy(backup_config, original_config)
             os.remove(backup_config)
 
-    total_time = time.time() - total_start
-    print(f"\nAll tasks finished. Total time: {total_time/3600:.2f} hours.")
+        total_time = time.time() - total_start
+        print(f"\nAll tasks finished. Total time: {total_time/3600:.2f} hours.")
 
 if __name__ == "__main__":
     main()

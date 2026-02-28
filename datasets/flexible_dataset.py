@@ -34,6 +34,7 @@ class FlexibleWindowDataset(Dataset):
         self.window_size = config.get("num_timesteps", 50) // config.get("downsample", 1)
         self.stride = config.get("stride", 1)
         self.downsample = config.get("downsample", 1)
+        self.start_timestep = config.get("start_timestep", 0)
         self.normalize_goal_vec = config.get("normalize_goal_vec", True)
         self.num_task_params = config.get("num_task_params", 2)
         self.normalization_type = config.get("normalization_type", "mean_std")  # 'mean_std' or 'min_max'
@@ -68,93 +69,175 @@ class FlexibleWindowDataset(Dataset):
         # ---- Normalization ----
         self.norm_path = norm_path
         self.stats = {}
+
+        self.max_obj_displacement = config.get("max_obj_displacement", None)
+
         if calculate_stats:
             self._calculate_stats()
         elif norm_path and os.path.exists(norm_path):
             self._load_stats()
+        
+        if self.max_obj_displacement is None:
+            self.max_obj_displacement = self.stats.get("max_task_params")[2]
+            print("Using max_obj_displacement =", self.max_obj_displacement)
 
 
-    def _standardize_buffer(self):
-        """Normalize buffer into {key: list_of_(T,D)_arrays}."""
-        buf = self._raw_buffer
-
-        if isinstance(buf, list):
-            if len(buf) == 0:
-                return {}
-            keys = buf[0].keys()
-            return {k: [item.get(k) for item in buf] for k in keys}
-
-        if isinstance(buf, dict):
-            standardized = {}
-            # Determine expected batch count from a temporal key
-            num_trajs = None
-            if 'joints' in buf.keys():
-                v = buf['joints']
-                if isinstance(v, (list, tuple)):
-                    num_trajs = len(v)
-                elif isinstance(v, np.ndarray) and v.ndim >= 3:
-                    num_trajs = v.shape[0]
-
-            for key, val in buf.items():
-                if isinstance(val, (list, tuple)):
-                    standardized[key] = list(val)
-                elif isinstance(val, np.ndarray):
-                    # Split along batch dim if first dim matches num_trajs
-                    if num_trajs is not None and val.shape[0] == num_trajs and val.ndim >= 2:
-                        standardized[key] = [val[i] for i in range(val.shape[0])]
-                    elif val.ndim >= 3:
-                        standardized[key] = [val[i] for i in range(val.shape[0])]
-                    else:
-                        standardized[key] = [val]
-                elif isinstance(val, torch.Tensor):
-                    val_np = val.cpu().numpy()
-                    if num_trajs is not None and val_np.shape[0] == num_trajs and val_np.ndim >= 2:
-                        standardized[key] = [val_np[i] for i in range(val_np.shape[0])]
-                    elif val_np.ndim >= 3:
-                        standardized[key] = [val_np[i] for i in range(val_np.shape[0])]
-                    else:
-                        standardized[key] = [val_np]
-                else:
-                    standardized[key] = [val]
-            return standardized
-
-        raise ValueError("BufferDataset expects a dict or list of dicts.")
-    
     def get_k(self, key):
-        """Helper to get mapped key from config."""
+        """Helper to get mapped key from config key_mapping."""
         return self.key_mapping.get(key, key)
+
+    def _convert_schema(self, raw_data):
+        """
+        Convert a single raw .npz dict to standardized keys.
+
+        Output temporal keys (shape ≥2D, will get batch dim added later):
+            base     - (..., T, 7)  pelvis xyz + quaternion
+            joints   - (..., T, 29) joint positions
+            obj      - (..., T, 7)  object xyz + quaternion
+            base_vel, joints_vel, obj_vel, ee_rel_pos  (optional)
+
+        Non-temporal keys passed through: fps
+
+        Schemas detected:
+            1. Already converted  — 'base' and 'joints' present
+            2. RL Rollout         — body_pos_w (or key-mapped, e.g. root_pos)
+            3. SBTO               — base_xyz_quat
+        """
+        keys = set(raw_data.keys())
+
+        # Convert any torch tensors to numpy
+        for k in list(raw_data.keys()):
+            if isinstance(raw_data[k], torch.Tensor):
+                raw_data[k] = raw_data[k].cpu().numpy()
+
+        # ---- Already in standardized format ----
+        if 'base' in keys and 'joints' in keys:
+            return {k: np.asarray(v) if isinstance(v, np.ndarray) else v
+                    for k, v in raw_data.items()}
+
+        processed = {}
+
+        # ---- RL Rollout schema (body_pos_w or key-mapped equivalent) ----
+        bp_key = 'body_pos_w' if 'body_pos_w' in keys else (
+            self.get_k('body_pos_w') if self.get_k('body_pos_w') in keys else None
+        )
+
+        if bp_key is not None:
+            bq_key = 'body_quat_w' if 'body_quat_w' in keys else self.get_k('body_quat_w')
+            jp_key = 'joint_pos'   if 'joint_pos'   in keys else self.get_k('joint_pos')
+            op_key = 'object_pos_w' if 'object_pos_w' in keys else self.get_k('object_pos_w')
+            oq_key = 'object_quat_w' if 'object_quat_w' in keys else self.get_k('object_quat_w')
+
+            bp = np.asarray(raw_data[bp_key], dtype=np.float64)
+            bq = np.asarray(raw_data[bq_key], dtype=np.float64)
+
+            # body_pos_w may be (N, T, K, 3) with K bodies — take pelvis (0)
+            if bp.ndim == 4:
+                bp = bp[:, :, 0, :]
+            if bq.ndim == 4:
+                bq = bq[:, :, 0, :]
+
+            processed['base'] = np.concatenate([bp, bq], axis=-1)
+            processed['joints'] = np.asarray(raw_data[jp_key], dtype=np.float64)
+
+            op = np.asarray(raw_data[op_key], dtype=np.float64)
+            oq = np.asarray(raw_data[oq_key], dtype=np.float64)
+            processed['obj'] = np.concatenate([op, oq], axis=-1)
+
+            # Velocity keys (RL / key-mapped RL)
+            vel_groups = [
+                ('root_lin_vel', 'root_ang_vel', 'base_vel'),
+                ('dof_vel', None, 'joints_vel'),
+                ('object_lin_vel', 'object_ang_vel', 'obj_vel'),
+            ]
+            for lin_k, ang_k, out_k in vel_groups:
+                if lin_k in keys:
+                    lv = np.asarray(raw_data[lin_k], dtype=np.float64)
+                    if ang_k and ang_k in keys:
+                        av = np.asarray(raw_data[ang_k], dtype=np.float64)
+                        processed[out_k] = np.concatenate([lv, av], axis=-1)
+                    else:
+                        processed[out_k] = lv
+
+            if 'ee_rel_pos' in keys:
+                processed['ee_rel_pos'] = np.asarray(raw_data['ee_rel_pos'], dtype=np.float64)
+
+        # ---- SBTO schema ----
+        elif 'base_xyz_quat' in keys:
+            processed['base'] = np.asarray(raw_data['base_xyz_quat'], dtype=np.float64)
+            processed['joints'] = np.asarray(raw_data['actuator_pos'], dtype=np.float64)
+
+            if 'obj_0_xyz_quat' in keys:
+                processed['obj'] = np.asarray(raw_data['obj_0_xyz_quat'], dtype=np.float64)
+
+            if 'base_linvel_angvel' in keys:
+                processed['base_vel'] = np.asarray(raw_data['base_linvel_angvel'], dtype=np.float64)
+            if 'actuator_vel' in keys:
+                processed['joints_vel'] = np.asarray(raw_data['actuator_vel'], dtype=np.float64)
+            if 'obj_0_linvel_angvel' in keys:
+                processed['obj_vel'] = np.asarray(raw_data['obj_0_linvel_angvel'], dtype=np.float64)
+            if 'ee_rel_pos' in keys:
+                processed['ee_rel_pos'] = np.asarray(raw_data['ee_rel_pos'], dtype=np.float64)
+
+        else:
+            print(f"Warning: Unrecognized buffer schema. Keys: {keys}")
+            return None
+
+        # Pass through non-temporal metadata
+        if 'fps' in raw_data:
+            processed['fps'] = raw_data['fps']
+
+        return processed
 
     def _preload_from_buffer(self):
         """
-        Process _raw_buffer (list of dicts from load_dataset.py) into ram_cache.
-        Each dict has keys like 'base', 'joints', 'obj' with shapes (N_i, T_i, D).
-        Each dict becomes one entry in ram_cache.
+        Process _raw_buffer into ram_cache.
 
-        If _task_params is provided, it should be a flat list/array of length
-        sum(N_i), one per trajectory across all files. goal_obj_world is computed
-        from task_params and stored as (N_i, 3) in each file dict.
+        Accepts:
+          - list of dicts  (from preload_dataset or list-of-traj buffers)
+          - single dict    (from RL buffer with batched arrays)
+
+        For each dict: detects schema via _convert_schema, ensures batch dim,
+        applies start_timestep / downsampling, computes goal_obj_world.
         """
         if not self._raw_buffer:
             return
 
+        start_ts = self.start_timestep
+        ds = self.downsample
+
+        # Ensure buffer is a list of dicts
+        buf = self._raw_buffer
+        if isinstance(buf, dict):
+            buf = [buf]
+
         total_trajs = 0
         tp_offset = 0  # running offset into the flat task_params list
 
-        for file_data in self._raw_buffer:
-            if not file_data:
+        for raw_data in buf:
+            if not raw_data:
                 continue
 
-            # Ensure batch dimension exists on temporal arrays
-            for k in list(file_data.keys()):
-                v = file_data[k]
-                if isinstance(v, np.ndarray) and k in (
-                    'base', 'joints', 'obj',
-                    'base_vel', 'joints_vel', 'obj_vel', 'ee_rel_pos',
-                ):
-                    if v.ndim == 2:  # (T, D) -> (1, T, D)
-                        file_data[k] = v[None]
+            # Schema detection & key conversion
+            processed = self._convert_schema(raw_data)
+            if not processed:
+                continue
 
-            N_i = file_data['base'].shape[0]
+            # Ensure batch dim on temporal arrays: (T, D) -> (1, T, D)
+            for k in list(processed.keys()):
+                v = processed[k]
+                if isinstance(v, np.ndarray) and k not in self._NON_TEMPORAL_KEYS:
+                    if v.ndim == 2:
+                        processed[k] = v[None]
+
+            # Apply start_timestep and downsampling
+            for k in list(processed.keys()):
+                if (k not in self._NON_TEMPORAL_KEYS
+                        and isinstance(processed[k], np.ndarray)
+                        and processed[k].ndim == 3):
+                    processed[k] = processed[k][:, start_ts::ds]
+
+            N_i = processed['base'].shape[0]
 
             # Compute goal_obj_world from task_params if provided
             if self._task_params is not None:
@@ -162,23 +245,22 @@ class FlexibleWindowDataset(Dataset):
                 for j in range(N_i):
                     goal_local = np.asarray(self._task_params[tp_offset + j], dtype=np.float64)
 
-                    # Initial pelvis pose & initial object pos (first frame)
-                    init_base = file_data['base'][j, 0, :]   # (7,) [x,y,z,qw,qx,qy,qz]
-                    init_obj  = file_data['obj'][j, 0, :3]    # (3,)
+                    init_base = processed['base'][j, 0, :]   # (7,) [x,y,z,qw,qx,qy,qz]
+                    init_obj  = processed['obj'][j, 0, :3]    # (3,)
 
                     init_yaw = yaw_from_quat(init_base[3:7])
-                    R_local_to_world = yaw_to_rot_matrix(init_yaw)
+                    R = yaw_to_rot_matrix(init_yaw)
 
                     goal_3d = np.zeros(3, dtype=np.float64)
                     n = min(len(goal_local), 3)
                     goal_3d[:n] = goal_local[:n]
 
-                    goal_world[j] = (R_local_to_world @ goal_3d[:, None])[:, 0] + init_obj
+                    goal_world[j] = (R @ goal_3d[:, None])[:, 0] + init_obj
 
-                file_data['goal_obj_world'] = goal_world  # (N_i, 3)
+                processed['goal_obj_world'] = goal_world  # (N_i, 3)
                 tp_offset += N_i
 
-            self.ram_cache.append(file_data)
+            self.ram_cache.append(processed)
             total_trajs += N_i
 
         print(f"Loaded {len(self.ram_cache)} files ({total_trajs} total trajectories) into RAM cache.")
@@ -219,7 +301,7 @@ class FlexibleWindowDataset(Dataset):
         print("Indexing dataset...")
         for i in range(len(self.ram_cache)):
             try:
-                data = self.ram_cache[i] if i < len(self.ram_cache) else self._load_and_process_file(self.file_paths[i])
+                data = self.ram_cache[i]
                 
                 # Identify Length & Batch
                 B, T = 1, 0
@@ -233,8 +315,8 @@ class FlexibleWindowDataset(Dataset):
                     print("Warning: 'joints' key not found in data. Skipping indexing for this file.")
                     continue 
                 
-                # Apply downsampling effectively reduces T
-                T_down = T // self.downsample
+                # Data is already downsampled in _preload_from_buffer
+                T_down = T
 
                 pad_start = self.history_size
                 pad_end = self.window_size - (T_down + pad_start) % self.window_size + self.history_size
@@ -252,7 +334,7 @@ class FlexibleWindowDataset(Dataset):
                             self.indices.append((i, b, s))
 
             except Exception as e:
-                print(f"Error indexing {self.file_paths[i]}: {e}")
+                print(f"Error indexing file {i}: {e}")
         print(f"Indexed {len(self.indices)} windows.")
 
     def _compute_transform(self, raw_traj, t_start):
@@ -317,14 +399,17 @@ class FlexibleWindowDataset(Dataset):
         if 'goal_obj_world' in raw_traj:
             goal_world = raw_traj['goal_obj_world']  # (3,)
             anchor["final_obj_pos"] = goal_world
-            features["task_params"] = self._compute_task_params(
+            features["task_params"], _ = compute_task_params(
                 current_robot_state=raw_traj['base'][read_start, 3:],
                 current_obj_state=raw_traj['obj'][read_start, :3],
                 desired_obj_pos=goal_world,
+                normalize_goal_vec=self.normalize_goal_vec,
+                num_task_params=self.num_task_params,
+                max_goal_dist=self.max_obj_displacement
             )
         else:
             anchor["final_obj_pos"] = raw_traj['obj'][-1, :3]
-            features["task_params"] = self._compute_task_params(raw_traj['base'], raw_traj['obj'], start_idx=read_start)
+            features["task_params"], _ = self._compute_task_params(raw_traj['base'], raw_traj['obj'], start_idx=read_start)
         
         # Add metadata to anchor
         if 'fps' in raw_traj:
@@ -340,6 +425,7 @@ class FlexibleWindowDataset(Dataset):
             desired_obj_pos=obj_traj[-1, :3],
             normalize_goal_vec=self.normalize_goal_vec,
             num_task_params=self.num_task_params,
+            max_goal_dist=self.max_obj_displacement
         )
 
     def _normalize(self, key, val):
@@ -536,7 +622,7 @@ class FlexibleWindowDataset(Dataset):
                 if 'task_params' in raw_traj:
                     tp = raw_traj['task_params']
                 else:
-                    tp = self._compute_task_params(raw_traj['base'], raw_traj['obj'], start_idx=read_start)
+                    tp, _ = self._compute_task_params(raw_traj['base'], raw_traj['obj'], start_idx=read_start)
                 batch_task_params.append(tp)
                 batch_data["base"].append(b_slice)
                 batch_data["joints"].append(j_slice)

@@ -177,8 +177,36 @@ class DFoTTrajectory(nn.Module):
             self.noise_level == "random_uniform"
         )
         
-        self.generator = None # Can be set externally if needed
+        # In-betweening (masked trajectory completion) config
+        self.inbetweening_cfg = training_config.get("inbetweening", {}) if training_config else {}
+        self.inbetweening_enabled = self.inbetweening_cfg.get("enabled", False)
+        if self.inbetweening_enabled:
+            print(f"In-betweening mode enabled: "
+                  f"keyframes={self.inbetweening_cfg.get('min_keyframes',2)}-{self.inbetweening_cfg.get('max_keyframes',4)}, "
+                  f"keep_first={self.inbetweening_cfg.get('always_keep_first', True)}, "
+                  f"keep_last={self.inbetweening_cfg.get('always_keep_last', False)}")
 
+        # Build feature index map from data config's feature_order
+        self.feature_index_map = {}
+        fidx = 0
+        for key in data_config.get("feature_order", []):
+            dim = FEATURE_LAYOUT_NO_VEL.get(key, 0)
+            if dim > 0:
+                self.feature_index_map[key] = slice(fidx, fidx + dim)
+                fidx += dim
+
+        # Build feature group slices for partial masking
+        partial_cfg = self.inbetweening_cfg.get("partial_masking", {})
+        self.feature_group_slices = {}
+        for group_name, keys in partial_cfg.get("feature_groups", {}).items():
+            slices = []
+            for key in keys:
+                if key in self.feature_index_map:
+                    slices.append(self.feature_index_map[key])
+            if slices:
+                self.feature_group_slices[group_name] = slices
+        self.group_keep_probs = partial_cfg.get("group_keep_prob", {})
+        self.waypoint_noise_fraction = self.inbetweening_cfg.get("waypoint_noise_fraction", 0.25)
 
 
     #### Training Utils ####
@@ -194,7 +222,6 @@ class DFoTTrajectory(nn.Module):
                     (torch.randint, 0, self.timesteps)
                 ),
                 device=xs.device,
-                generator=self.generator,
             )
 
             match self.noise_level:
@@ -220,7 +247,157 @@ class DFoTTrajectory(nn.Module):
             )
                 
             return noise_levels, masks
+
+    def _generate_inbetweening_mask(self, batch_size: int, n_tokens: int, device: torch.device) -> torch.Tensor:
+        """
+        Generate a binary mask for in-betweening training.
+        mask=1 means KEEP (keyframe), mask=0 means MASK (to be predicted).
+
+        Returns: (B, T) bool tensor
+        """
+        cfg = self.inbetweening_cfg
+        min_kf = cfg.get("min_keyframes", 2)
+        max_kf = cfg.get("max_keyframes", 4)
+        keep_first = cfg.get("always_keep_first", True)
+        keep_last = cfg.get("always_keep_last", False)
+
+        mask = torch.zeros(batch_size, n_tokens, dtype=torch.bool, device=device)
+
+        for b in range(batch_size):
+            # Determine how many keyframes this sample gets
+            n_kf = torch.randint(min_kf, max_kf + 1, (1,)).item()
+
+            # Collect forced indices
+            forced = []
+            if keep_first:
+                forced.append(0)
+            if keep_last:
+                forced.append(n_tokens - 1)
+
+            # Remaining keyframes chosen randomly from the rest
+            available = list(set(range(n_tokens)) - set(forced))
+            n_random = max(0, n_kf - len(forced))
+            n_random = min(n_random, len(available))
+
+            if n_random > 0:
+                perm = torch.randperm(len(available))
+                chosen = [available[perm[i].item()] for i in range(n_random)]
+            else:
+                chosen = []
+
+            all_kf = forced + chosen
+            mask[b, all_kf] = True
+
+        return mask
     
+    #### ============== ####
+
+    def _generate_waypoint_mask(self, B, T, D, device):
+        """
+        Generate a feature-level waypoint mask for inbetweening training.
+
+        For each sample, randomly selects keyframe time steps, then for each
+        keyframe decides whether it's "full" (all features known) or "partial"
+        (only certain feature groups known, chosen randomly per group).
+
+        Returns:
+            waypoint_mask: (B, T, D) bool — True = known/clean, False = to be predicted
+        """
+        cfg = self.inbetweening_cfg
+        partial_cfg = cfg.get("partial_masking", {})
+        partial_enabled = partial_cfg.get("enabled", False)
+        partial_prob = partial_cfg.get("prob", 0.5)
+
+        # Step 1: Frame-level keyframe selection
+        frame_mask = self._generate_inbetweening_mask(B, T, device)  # (B, T) bool
+
+        if not partial_enabled:
+            # All waypoints are full keyframes (all features known)
+            return frame_mask.unsqueeze(-1).expand(-1, -1, D).clone()
+
+        # Step 2: For each keyframe, decide full vs partial
+        is_partial = (torch.rand(B, T, device=device) < partial_prob) & frame_mask
+
+        # Force first/last to be full keyframes if configured
+        if cfg.get("always_keep_first", True):
+            is_partial[:, 0] = False
+        if cfg.get("always_keep_last", False) and T > 0:
+            is_partial[:, -1] = False
+
+        is_full = frame_mask & ~is_partial
+
+        # Step 3: Build feature mask
+        waypoint_mask = torch.zeros(B, T, D, dtype=torch.bool, device=device)
+
+        # Full keyframes: all features known
+        waypoint_mask = waypoint_mask | is_full.unsqueeze(-1)  # broadcast (B,T,1) -> (B,T,D)
+
+        # Partial keyframes: per-group random keep
+        if is_partial.any():
+            for group_name, slices in self.feature_group_slices.items():
+                keep_prob = self.group_keep_probs.get(group_name, 0.5)
+                keep_group = (torch.rand(B, T, device=device) < keep_prob) & is_partial
+                for s in slices:
+                    width = s.stop - s.start
+                    waypoint_mask[:, :, s] |= keep_group.unsqueeze(-1).expand(-1, -1, width)
+
+        return waypoint_mask
+
+    def _inject_waypoints(
+        self,
+        xs: torch.Tensor,
+        waypoint_values: torch.Tensor,
+        waypoint_mask: torch.Tensor,
+        noise_levels: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        """
+        Inject waypoint values into xs with noise-aware handling.
+
+        - Fully-known frames (all features marked): always inject clean values.
+        - Partially-known frames: if noise_levels is provided, inject q_sampled
+          values (RePaint-style) so partial waypoints stay consistent with the
+          current denoising noise level; otherwise inject clean values.
+
+        Args:
+            xs: (B, T, D) current noised/denoised predictions
+            waypoint_values: (B, T, D) clean target values
+            waypoint_mask: (B, T, D) bool — True = known feature
+            noise_levels: (B, T) int noise levels for RePaint injection, or None
+
+        Returns:
+            xs with waypoint features injected
+        """
+        if waypoint_values is None or waypoint_mask is None:
+            return xs
+
+        wm = waypoint_mask.to(xs.device)
+        wv = waypoint_values.to(xs.device, dtype=xs.dtype)
+
+        fully_known = wm.all(dim=-1)  # (B, T)
+
+        # Full keyframes: always inject clean values
+        xs = torch.where(fully_known.unsqueeze(-1) & wm, wv, xs)
+
+        # Partial waypoints
+        partially_known = wm.any(dim=-1) & ~fully_known  # (B, T)
+        if noise_levels is not None and partially_known.any():
+            # RePaint-style: noise known features to match current noise level
+            k_wp = torch.clamp(noise_levels, min=0)  # (B, T)
+            wp_noise = torch.randn_like(wv)
+            wp_noise = torch.clamp(wp_noise, -self.clip_noise, self.clip_noise)
+            noised_wv = self.diffusion_model.q_sample(x_start=wv, k=k_wp, noise=wp_noise)
+            # At fully-denoised steps (noise_level == -1), inject clean values
+            is_clean = (noise_levels == -1).unsqueeze(-1)  # (B, T, 1)
+            injection = torch.where(is_clean, wv, noised_wv)
+            xs = torch.where(
+                partially_known.unsqueeze(-1) & wm, injection, xs
+            )
+        else:
+            # No noise levels — inject clean for all remaining waypoints
+            xs = torch.where(wm & ~fully_known.unsqueeze(-1), wv, xs)
+
+        return xs
+
     #### ============== ####
 
     def _reweight_loss(self, loss, weight=None):
@@ -300,29 +477,77 @@ class DFoTTrajectory(nn.Module):
             # Concatenate along feature dimension
             ext_cond = torch.cat(cond_list_broadcast, dim=-1)
 
-        # Generate noise levels if not provided
+        # --- Generate noise levels ---
+        B, T, D = x.shape
         if timesteps is None:
-            # Generate noise levels
-            noise_levels, masks = self._get_training_noise_levels(x, masks)
-            k = noise_levels
+            k, masks = self._get_training_noise_levels(x, masks)
         else:
             k = timesteps
-        
-        model_pred, model_out, loss = self.diffusion_model(x, ext_cond, k)
-        
-        # Reweight loss using masks
-        loss = self._reweight_loss(loss, masks)
-        
-        output_dict = {
-            "loss": loss,
-            "xs_pred": model_pred,
-            "xs": model_out
-        }
-        return output_dict
 
-    def sample(self, num_trajectories, model_cond=None, cfg_w=0.0, guidance_wt=1.0, guidance_goal=None, inpaint=False, no_state_cond=False):
+        # --- Waypoint masking (inbetweening) ---
+        waypoint_mask = None  # (B, T, D) bool or None
+        if self.training and self.inbetweening_enabled:
+            waypoint_mask = self._generate_waypoint_mask(B, T, D, x.device)
+            fully_known = waypoint_mask.all(dim=-1)  # (B, T)
+            partially_known = waypoint_mask.any(dim=-1) & ~fully_known  # (B, T)
+
+            # Fully-known frames → noise_level = 0 (clean signal to model)
+            k = torch.where(fully_known, torch.zeros_like(k), k)
+
+            # Partially-known frames → intermediate noise level
+            if partially_known.any():
+                max_wp_k = max(int(self.waypoint_noise_fraction * self.timesteps), 1)
+                wp_k = torch.randint(0, max_wp_k, k.shape, device=k.device)
+                k = torch.where(partially_known, wp_k, k)
+
+        # --- Forward diffusion: q_sample ---
+        noise = torch.randn_like(x)
+        noise = torch.clamp(noise, -self.clip_noise, self.clip_noise)
+        noised_x = self.diffusion_model.q_sample(x_start=x, k=k, noise=noise)
+
+        # Inject known features into noised input
+        if waypoint_mask is not None:
+            noised_x = self._inject_waypoints(noised_x, x, waypoint_mask)
+
+        # --- Model prediction ---
+        model_pred = self.diffusion_model.model_predictions(
+            x=noised_x, k=k, external_cond=ext_cond, external_cond_mask=None
+        )
+        x_pred = model_pred.pred_x_start
+
+        # --- Loss ---
+        if self.diffusion_model.objective == "pred_noise":
+            target = noise
+        elif self.diffusion_model.objective == "pred_x0":
+            target = x
+        elif self.diffusion_model.objective == "pred_v":
+            target = self.diffusion_model.predict_v(x, k, noise)
+        else:
+            raise ValueError(f"Unknown objective: {self.diffusion_model.objective}")
+
+        loss = F.mse_loss(model_pred.model_out, target.detach(), reduction="none")
+
+        # Diffusion loss weighting (min-SNR, etc.)
+        loss_weight = self.diffusion_model.compute_loss_weights(
+            k, self.diffusion_model.loss_weighting.strategy
+        )
+        loss_weight = self.diffusion_model.add_shape_channels(loss_weight)
+        loss = loss * loss_weight
+
+        # # Zero out loss on known/pinned features
+        # if waypoint_mask is not None:
+        #     loss = loss * (~waypoint_mask).float()
+
+        # Apply frame-level validity masks
+        loss = self._reweight_loss(loss, masks)
+
+        return {"loss": loss, "xs_pred": x_pred, "xs": x}
+
+    def sample(self, num_trajectories, model_cond=None, cfg_w=0.0, guidance_wt=1.0, guidance_goal=None, inpaint=False, no_state_cond=False, waypoint_values=None, waypoint_mask=None):
         """
-        Sampling method.
+        Sampling method. Supports optional feature-level waypoint injection for
+        guided generation. When waypoint_values/waypoint_mask are provided,
+        known features are injected at each denoising step.
         """
         state_cond_input = None
         task_cond = None
@@ -382,15 +607,18 @@ class DFoTTrajectory(nn.Module):
             # Concatenate all conditions along feature dimension
             conditions = torch.cat(cond_list_broadcast, dim=-1)
 
+        # ---- Iterative diffusion sampling with optional waypoint injection ----
         xs_pred, _ = self._sample_sequence(
             batch_size=num_trajectories,
-            conditions=conditions, # External conditions
+            conditions=conditions,
             task_cond=task_cond,
             guidance_wt=guidance_wt,
             guidance_goal=guidance_goal,
-            guidance_fn=guidance_goal_mse if guidance_wt>0 else None,
+            guidance_fn=guidance_goal_mse if (guidance_wt > 0 and guidance_goal is not None) else None,
             inpaint=inpaint,
             cfg_w=cfg_w,
+            waypoint_values=waypoint_values,
+            waypoint_mask=waypoint_mask,
         )
         
         # Return (B, T, C)
@@ -461,6 +689,8 @@ class DFoTTrajectory(nn.Module):
         pbar: Optional[tqdm] = None,
         inpaint: bool = False,
         cfg_w: float = 1.0,
+        waypoint_values: Optional[torch.Tensor] = None,
+        waypoint_mask: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
         
         x_shape = self.x_shape
@@ -475,9 +705,11 @@ class DFoTTrajectory(nn.Module):
         xs_pred = torch.randn(
             (batch_size, horizon, *x_shape),
             device=self.diffusion_model.parameters().__next__().device,
-            generator=self.generator,
         )
         xs_pred = torch.clamp(xs_pred, -self.clip_noise, self.clip_noise)
+
+        # Inject waypoint values into initial noise (feature-level mask)
+        xs_pred = self._inject_waypoints(xs_pred, waypoint_values, waypoint_mask)
 
         # create empty context and zero context mask
         context_mask = torch.zeros(
@@ -539,6 +771,12 @@ class DFoTTrajectory(nn.Module):
                 cfg_w=cfg_w,
             )
 
+            # Re-inject waypoint values (RePaint-style for partial waypoints)
+            xs_pred = self._inject_waypoints(
+                xs_pred, waypoint_values, waypoint_mask,
+                noise_levels=to_noise_levels,
+            )
+
             if task_cond is not None:
                 if task_cond.ndim == 1:
                     # (D) -> (1, D)
@@ -550,11 +788,11 @@ class DFoTTrajectory(nn.Module):
                 
                 if inpaint:
                     f_map = get_feature_indices(FEATURE_LAYOUT_NO_VEL)
-                    xs_pred[..., 0, f_map['joints']] = self.state_cond[..., :29]
-                    xs_pred[..., 0, f_map['body_z']] = self.state_cond[..., 29:30]
-                    xs_pred[..., 0, f_map['body_rot6d']] = self.state_cond[..., 30:36]
-                    xs_pred[..., 0, f_map['obj_rel_pos']] = self.state_cond[..., 36:39]
-                    xs_pred[..., 0, f_map['obj_rel_rot6d']] = self.state_cond[..., 39:45]
+                    xs_pred[..., 0, f_map['joints']] = self.state_cond[..., 0, :29]
+                    xs_pred[..., 0, f_map['body_z']] = self.state_cond[..., 0, 29:30]
+                    xs_pred[..., 0, f_map['body_rot6d']] = self.state_cond[..., 0, 30:36]
+                    xs_pred[..., 0, f_map['obj_rel_pos']] = self.state_cond[..., 0, 36:39]
+                    xs_pred[..., 0, f_map['obj_rel_rot6d']] = self.state_cond[..., 0, 39:45]
             
             pbar.update(1)
 

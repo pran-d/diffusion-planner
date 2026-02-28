@@ -9,6 +9,7 @@ from config.configure import load_config, get_data_path, get_norm_path
 from datasets.flexible_dataset import FlexibleWindowDataset
 from utils.visualize.visualize import MjVisualizer
 from utils.math.sbto_utils import batch_rotation, quat_to_rot
+from utils.data.load_dataset import preload_dataset
 
 def load_env_and_data():
     # Use config from file
@@ -19,11 +20,13 @@ def load_env_and_data():
     
     print("Loading dataset...")
     # Initialize dataset
+    data_buffer = preload_dataset(data_cfg, data_path)
     dataset = FlexibleWindowDataset(
-        data_root=data_path, 
+        data_buffer=data_buffer, 
         config=data_cfg, 
         norm_path=norm_path,
-        calculate_stats=False
+        calculate_stats=False,
+        training_cfg={}
     )
     return data_cfg, dataset
 

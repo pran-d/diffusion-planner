@@ -368,8 +368,8 @@ for epoch in range(starting_epoch, num_epochs):
     # Early Stopping Check
     # ===============================
     patience = 100
-    target_loss = 0.002  # Threshold for "low loss" (tune based on your problem)
-    stagnation_std = 8e-5  # Threshold for "roughly stagnant" (tune if needed)
+    target_loss = 0.005  # Threshold for "low loss" (tune based on your problem)
+    stagnation_std = 3e-5  # Threshold for "roughly stagnant" (tune if needed)
 
     if len(epoch_losses_history) >= patience:
         last_50_losses = epoch_losses_history[-patience:]
@@ -389,7 +389,7 @@ for epoch in range(starting_epoch, num_epochs):
                 "scaler": scaler.state_dict(),
                 "scheduler": scheduler.state_dict()
             }
-            torch.save(checkpoint, f"{save_dir}/model_{epoch}_early_stop.pth")
+            torch.save(checkpoint, f"{save_dir}/model_{epoch}.pth")
             break
     
     # ===============================

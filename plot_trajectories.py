@@ -9,8 +9,9 @@ sys.path.append(os.getcwd())
 from tqdm import tqdm
 
 from config.configure import load_config, get_data_path, get_norm_path
-from datasets.flexible_dataset import FlexibleWindowDataset
+from datasets import BufferDataset
 from utils.math.math_tools import yaw_from_quat, yaw_to_rot_matrix
+from utils.data.load_dataset import preload_dataset
 
 def load_dataset():
     # Load config file relative to here? Or root. Assuming run from root.
@@ -24,11 +25,11 @@ def load_dataset():
     
     print("Loading dataset...")
     # Initialize dataset
-    dataset = FlexibleWindowDataset(
-        data_root=data_path, 
-        config=data_cfg, 
-        norm_path=norm_path,
-        calculate_stats=False
+    data_buffer = preload_dataset(data_cfg, data_path)
+    dataset = BufferDataset(
+        data_buffer=data_buffer, config=data_cfg, task_params=None,
+        calculate_stats=False, norm_path=norm_path,
+        training_cfg=training_cfg,
     )
     return dataset
 
@@ -108,11 +109,12 @@ def main():
             # But we need to bypass task_list logic
             data_cfg_copy = dict(data_cfg)
             data_cfg_copy.pop("task_list_path", None)  # Don't use task list for explicit paths
-            ds = FlexibleWindowDataset(
-                data_root=dp,
+            data_buf = preload_dataset(data_cfg_copy, dp)
+            ds = BufferDataset(
+                data_buffer=data_buf,
                 config=data_cfg_copy,
                 norm_path=norm_path,
-                calculate_stats=False
+                calculate_stats=False,
             )
             datasets_and_labels.append((ds, label))
     else:
@@ -147,13 +149,6 @@ def _get_unique_trajs_and_indices(dataset, args):
     return unique_trajs, idxs
 
 
-def _get_file_label(dataset, file_idx):
-    """Get a human-readable label from the file path's parent folder."""
-    fpath = dataset.file_paths[file_idx]
-    # Use the parent directory name as the label
-    return os.path.basename(os.path.dirname(fpath))
-
-
 def _plot_obj_disp(args, datasets_and_labels):
     """Plot object displacement yaw-rotated to initial pelvis frame."""
     plt.figure(figsize=(10, 10))
@@ -181,7 +176,7 @@ def _plot_obj_disp(args, datasets_and_labels):
             if len(datasets_and_labels) > 1:
                 file_label = ds_label
             else:
-                file_label = _get_file_label(dataset, f_idx) or ds_label
+                file_label = f"file_{f_idx}"
             
             color = color_cycle[color_idx % len(color_cycle)]
             

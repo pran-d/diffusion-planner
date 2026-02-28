@@ -58,7 +58,7 @@ def compute_dataset_weights(dataset, sigma=0.2):
         if 'task_params' in raw:
              tp_raw = raw['task_params']
         elif 'obj' in raw and 'base' in raw:
-             tp_raw = dataset._compute_task_params(raw['base'], raw['obj'])
+             tp_raw, _ = dataset._compute_task_params(raw['base'], raw['obj'])
         else:
              print(f"Warning: No object data or task params found for {f},{b}")
              continue
@@ -618,12 +618,13 @@ class MotionGenerator:
         with torch.no_grad():
             for step in range(stitch_steps):
                 # A. Compute per-step task params (world-frame goal → local displacement)
-                task_cond_np = compute_task_params(
+                task_cond_np, _ = compute_task_params(
                     current_robot_state=current_anchors['ref_quat'],
                     current_obj_state=current_anchors['ref_obj_pos'],
                     desired_obj_pos=goal_world,
                     normalize_goal_vec=self.data_cfg.get("normalize_goal_vec", True),
                     num_task_params=self.data_cfg.get("num_task_params", 3),
+                    max_goal_dist=self.dataset.max_obj_displacement,
                 )
                 task_cond = self.dataset._normalize(
                     'task_params',
