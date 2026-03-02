@@ -7,7 +7,7 @@ data:
   task_list_path: "test_datasets/chosen_tasks_test.yml"
   normalization_type: "min_max"
   dataset_class: "flexible"
-  batch_size: 1024
+  batch_size: 2048
   num_features: 50
   num_task_params: 3
   num_observations: 45
@@ -52,11 +52,11 @@ model:
 training:
   save_dir: "./runs/ablations/masking/"
   log_dir: "./logs/ablations/masking/"
-  suffix: "_keep_full_3"
+  suffix: "_increased_noise"
   num_epochs: 500
   balance_task_density: False
   learning_rate: 0.0005
-  save_every: 100
+  save_every: 50
   condition_dropout_prob: 
     state: 0.1
     task: 0.2
@@ -67,19 +67,14 @@ training:
     body_rot6d: 0.005
     obj_rel_pos: 0.005
     obj_rel_rot6d: 0.005
-    # joint_vel: 0.2
-    # body_lin_vel: 0.1
-    # body_ang_vel: 0.1
-    # obj_lin_vel: 0.1
-    # obj_ang_vel: 0.1
-    task_params: 0.025
-    task_magnitude: 0.0
+    task_params: 0.0
+    task_magnitude: 0.025
 
   # In-betweening (waypoint-masked trajectory completion)
   inbetweening:
-    enabled: True
+    enabled: False
     min_keyframes: 1        # minimum number of unmasked keyframes per window
-    max_keyframes: 3        # maximum number of unmasked keyframes per window
+    max_keyframes: 2        # maximum number of unmasked keyframes per window
     always_keep_first: True # always keep t=0 as a full keyframe
     always_keep_last: False # always keep t=T-1 as a keyframe
     waypoint_noise_fraction: 0.75  # max noise level for partial waypoint frames (fraction of total timesteps)

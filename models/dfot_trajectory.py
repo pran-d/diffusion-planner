@@ -184,7 +184,7 @@ class DFoTTrajectory(nn.Module):
             print(f"In-betweening mode enabled: "
                   f"keyframes={self.inbetweening_cfg.get('min_keyframes',2)}-{self.inbetweening_cfg.get('max_keyframes',4)}, "
                   f"keep_first={self.inbetweening_cfg.get('always_keep_first', True)}, "
-                  f"keep_last={self.inbetweening_cfg.get('always_keep_last', False)}")
+                  f"keep_last={self.inbetweening_cfg.get('keep_last_partial', False)}")
 
         # Build feature index map from data config's feature_order
         self.feature_index_map = {}
@@ -207,6 +207,24 @@ class DFoTTrajectory(nn.Module):
                 self.feature_group_slices[group_name] = slices
         self.group_keep_probs = partial_cfg.get("group_keep_prob", {})
         self.waypoint_noise_fraction = self.inbetweening_cfg.get("waypoint_noise_fraction", 0.25)
+
+        # Waypoint indicator embedding: projects per-feature binary mask (D) into
+        # the backbone's hidden space so the model knows which features are constrained.
+        # Added to token embeddings after input_embedder + pos_emb, before transformer blocks.
+        hidden = model_config.get("hidden_size", 256)
+
+        if self.inbetweening_enabled:
+            self.waypoint_indicator_proj = nn.Sequential(
+                nn.Linear(data_config['num_features'], hidden),
+                nn.SiLU(),
+                nn.Linear(hidden, hidden),
+            )
+            # Zero-init the last layer so the indicator is a no-op at the start of training
+            nn.init.zeros_(self.waypoint_indicator_proj[-1].weight)
+            nn.init.zeros_(self.waypoint_indicator_proj[-1].bias)
+
+            # RePaint resampling config (inference-time back-and-forth loops)
+            self.resample_steps = self.inbetweening_cfg.get("resample_steps", 0)
 
 
     #### Training Utils ####
@@ -259,7 +277,7 @@ class DFoTTrajectory(nn.Module):
         min_kf = cfg.get("min_keyframes", 2)
         max_kf = cfg.get("max_keyframes", 4)
         keep_first = cfg.get("always_keep_first", True)
-        keep_last = cfg.get("always_keep_last", False)
+        keep_last = cfg.get("keep_last_partial", False)
 
         mask = torch.zeros(batch_size, n_tokens, dtype=torch.bool, device=device)
 
@@ -267,26 +285,26 @@ class DFoTTrajectory(nn.Module):
             # Determine how many keyframes this sample gets
             n_kf = torch.randint(min_kf, max_kf + 1, (1,)).item()
 
-            # Collect forced indices
             forced = []
-            if keep_first:
-                forced.append(0)
-            if keep_last:
-                forced.append(n_tokens - 1)
+            if n_kf > 0:
+                if keep_first:
+                    forced.append(0)
+                if n_kf > 1 and keep_last:
+                    forced.append(n_tokens - 1)
 
-            # Remaining keyframes chosen randomly from the rest
-            available = list(set(range(n_tokens)) - set(forced))
-            n_random = max(0, n_kf - len(forced))
-            n_random = min(n_random, len(available))
+                # Remaining keyframes chosen randomly from the rest
+                available = list(set(range(n_tokens)) - set(forced))
+                n_random = max(0, n_kf - len(forced))
+                n_random = min(n_random, len(available))
 
-            if n_random > 0:
-                perm = torch.randperm(len(available))
-                chosen = [available[perm[i].item()] for i in range(n_random)]
-            else:
-                chosen = []
+                if n_random > 0:
+                    perm = torch.randperm(len(available))
+                    chosen = [available[perm[i].item()] for i in range(n_random)]
+                else:
+                    chosen = []
 
-            all_kf = forced + chosen
-            mask[b, all_kf] = True
+                all_kf = forced + chosen
+                mask[b, all_kf] = True
 
         return mask
     
@@ -321,8 +339,8 @@ class DFoTTrajectory(nn.Module):
         # Force first/last to be full keyframes if configured
         if cfg.get("always_keep_first", True):
             is_partial[:, 0] = False
-        if cfg.get("always_keep_last", False) and T > 0:
-            is_partial[:, -1] = False
+        if cfg.get("keep_last_partial", False) and T > 0:
+            is_partial[:, -1] = True
 
         is_full = frame_mask & ~is_partial
 
@@ -397,6 +415,123 @@ class DFoTTrajectory(nn.Module):
             xs = torch.where(wm & ~fully_known.unsqueeze(-1), wv, xs)
 
         return xs
+
+    def _model_predictions_with_indicator(
+        self, x, k, external_cond=None, external_cond_mask=None,
+        waypoint_mask=None,
+    ):
+        """
+        Run model predictions while injecting the waypoint indicator embedding
+        into the backbone's hidden representation.
+        """
+        from diffusion_forcing_transformer.discrete_diffusion import ModelPrediction
+
+        backbone = self.diffusion_model.model  # DiT1D
+
+        # 1. Input embedding + positional embedding (standard DiT1D path)
+        h = backbone.input_embedder(x)          # (B, T, hidden)
+        h = backbone.pos_emb(h)
+
+        # 2. Inject waypoint indicator
+        if waypoint_mask is not None:
+            # waypoint_mask: (B, T, D) bool -> float -> project to hidden
+            indicator = self.waypoint_indicator_proj(waypoint_mask.float().to(x.device))  # (B, T, hidden)
+            h = h + indicator
+
+        # 3. Condition embedding (same as DiT1D.forward)
+        c = backbone.noise_level_pos_embedding(k)
+        if external_cond is not None:
+            c = c + backbone.external_cond_embedding(external_cond, external_cond_mask)
+
+        # 4. Transformer blocks
+        for block in backbone.blocks:
+            h = backbone._checkpoint(block, h, c)
+
+        # 5. Final layer
+        model_output = backbone.final_layer(h, c)
+
+        # 6. Convert to predictions (same logic as DiscreteDiffusion.model_predictions)
+        dm = self.diffusion_model
+        if dm.objective == "pred_noise":
+            pred_noise = torch.clamp(model_output, -dm.clip_noise, dm.clip_noise)
+            x_start = dm.predict_start_from_noise(x, k, pred_noise)
+        elif dm.objective == "pred_x0":
+            x_start = model_output
+            pred_noise = dm.predict_noise_from_start(x, k, x_start)
+        elif dm.objective == "pred_v":
+            v = model_output
+            x_start = dm.predict_start_from_v(x, k, v)
+            pred_noise = dm.predict_noise_from_v(x, k, v)
+        else:
+            raise ValueError(f"Unknown objective: {dm.objective}")
+
+        return ModelPrediction(pred_noise, x_start, model_output)
+
+    def _sample_step_with_indicator(
+        self, x, curr_noise_level, next_noise_level, external_cond,
+        external_cond_mask=None, guidance_fn=None, guidance_goal=None,
+        guidance_wt=1.0, cfg_w=1.0, waypoint_mask=None,
+    ):
+        """
+        DDIM sample step that uses the waypoint indicator embedding.
+        Mirrors DiscreteDiffusion.ddim_sample_step but with the indicator injected.
+        """
+        dm = self.diffusion_model
+        clipped_curr = torch.clamp(curr_noise_level, min=0)
+
+        alpha = dm.alphas_cumprod[clipped_curr]
+        alpha_next = torch.where(
+            next_noise_level < 0,
+            torch.ones_like(next_noise_level),
+            dm.alphas_cumprod[next_noise_level],
+        )
+        sigma = torch.where(
+            next_noise_level < 0,
+            torch.zeros_like(next_noise_level),
+            dm.ddim_sampling_eta
+            * ((1 - alpha / alpha_next) * (1 - alpha_next) / (1 - alpha)).sqrt(),
+        )
+        c_coeff = (1 - alpha_next - sigma**2).sqrt()
+
+        alpha = dm.add_shape_channels(alpha)
+        alpha_next = dm.add_shape_channels(alpha_next)
+        c_coeff = dm.add_shape_channels(c_coeff)
+        sigma = dm.add_shape_channels(sigma)
+
+        # Conditional prediction (with indicator)
+        pred_cond = self._model_predictions_with_indicator(
+            x, clipped_curr, external_cond, external_cond_mask=None,
+            waypoint_mask=waypoint_mask,
+        )
+
+        # Unconditional prediction (with indicator but masked external cond)
+        masked_ext = external_cond_mask * external_cond if external_cond is not None else None
+        pred_uncond = self._model_predictions_with_indicator(
+            x, clipped_curr, masked_ext, external_cond_mask=None,
+            waypoint_mask=waypoint_mask,
+        )
+
+        # CFG
+        x_start = pred_uncond.pred_x_start + cfg_w * (
+            pred_cond.pred_x_start - pred_uncond.pred_x_start
+        )
+        pred_noise = pred_uncond.pred_noise + cfg_w * (
+            pred_cond.pred_noise - pred_uncond.pred_noise
+        )
+
+        if cfg_w > 1.0:
+            s = torch.quantile(torch.abs(x_start).flatten(1), 0.995, dim=1)
+            s = torch.maximum(s, torch.ones_like(s)).view(-1, 1, 1)
+            x_start = torch.clamp(x_start, -s, s) / s
+
+        noise = torch.randn_like(x)
+        noise = torch.clamp(noise, -dm.clip_noise, dm.clip_noise)
+        x_pred = x_start * alpha_next.sqrt() + pred_noise * c_coeff + sigma * noise
+
+        # Only update frames where noise level decreases
+        mask = curr_noise_level == next_noise_level
+        x_pred = torch.where(dm.add_shape_channels(mask), x, x_pred)
+        return x_pred
 
     #### ============== ####
 
@@ -509,10 +644,19 @@ class DFoTTrajectory(nn.Module):
         if waypoint_mask is not None:
             noised_x = self._inject_waypoints(noised_x, x, waypoint_mask)
 
-        # --- Model prediction ---
-        model_pred = self.diffusion_model.model_predictions(
-            x=noised_x, k=k, external_cond=ext_cond, external_cond_mask=None
-        )
+        # --- Waypoint indicator: inject into backbone hidden space ---
+        # We hook into the DiT1D forward: apply input_embedder + pos_emb, add
+        # indicator embedding, then run transformer blocks + final_layer.
+        # This replaces the standard model_predictions call when waypoints are active.
+        if waypoint_mask is not None and waypoint_mask.any():
+            model_pred = self._model_predictions_with_indicator(
+                noised_x, k, ext_cond, external_cond_mask=None,
+                waypoint_mask=waypoint_mask,
+            )
+        else:
+            model_pred = self.diffusion_model.model_predictions(
+                x=noised_x, k=k, external_cond=ext_cond, external_cond_mask=None
+            )
         x_pred = model_pred.pred_x_start
 
         # --- Loss ---
@@ -534,9 +678,12 @@ class DFoTTrajectory(nn.Module):
         loss_weight = self.diffusion_model.add_shape_channels(loss_weight)
         loss = loss * loss_weight
 
-        # # Zero out loss on known/pinned features
-        # if waypoint_mask is not None:
-        #     loss = loss * (~waypoint_mask).float()
+        # Zero out loss on known/pinned features so the model isn't
+        # penalised for predicting clean data it was given (esp. k=0 frames
+        # where the v-prediction target is pure noise → random loss).
+        fully_known = waypoint_mask.all(dim=-1)  # (B, T)
+        if fully_known.any():
+            loss = loss * (~fully_known).float().unsqueeze(-1)  
 
         # Apply frame-level validity masks
         loss = self._reweight_loss(loss, masks)
@@ -709,7 +856,17 @@ class DFoTTrajectory(nn.Module):
         xs_pred = torch.clamp(xs_pred, -self.clip_noise, self.clip_noise)
 
         # Inject waypoint values into initial noise (feature-level mask)
-        xs_pred = self._inject_waypoints(xs_pred, waypoint_values, waypoint_mask)
+        if waypoint_mask is not None and waypoint_mask.any():
+            # Use the first row of the scheduling matrix (max noise) so partial
+            # waypoints are noised to match the starting noise level (not clean).
+            init_sched = self._generate_scheduling_matrix(
+                horizon - padding, padding,
+            ).to(xs_pred.device)
+            init_noise_levels = repeat(init_sched[0], "t -> b t", b=batch_size)
+            xs_pred = self._inject_waypoints(
+                xs_pred, waypoint_values, waypoint_mask,
+                noise_levels=init_noise_levels,
+            )
 
         # create empty context and zero context mask
         context_mask = torch.zeros(
@@ -759,40 +916,73 @@ class DFoTTrajectory(nn.Module):
 
             external_conditions_mask[..., -self.task_dim:] = 1.0
 
-            xs_pred = self.diffusion_model.sample_step(
-                xs_pred,
-                from_noise_levels,
-                to_noise_levels,
-                conditions,
-                external_conditions_mask,
-                guidance_fn=guidance_fn,
-                guidance_goal=guidance_goal,
-                guidance_wt=guidance_wt,
-                cfg_w=cfg_w,
-            )
+            # Choose indicator-aware or standard sample step
+            # Must match training condition: use indicator whenever waypoint_mask is present
+            use_indicator = waypoint_mask is not None and waypoint_mask.any()
+
+            def _do_sample_step(x_in, from_k, to_k):
+                if use_indicator:
+                    return self._sample_step_with_indicator(
+                        x_in, from_k, to_k, conditions,
+                        external_cond_mask=external_conditions_mask,
+                        guidance_fn=guidance_fn, guidance_goal=guidance_goal,
+                        guidance_wt=guidance_wt, cfg_w=cfg_w,
+                        waypoint_mask=waypoint_mask,
+                    )
+                else:
+                    return self.diffusion_model.sample_step(
+                        x_in, from_k, to_k, conditions,
+                        external_conditions_mask,
+                        guidance_fn=guidance_fn, guidance_goal=guidance_goal,
+                        guidance_wt=guidance_wt, cfg_w=cfg_w,
+                    )
+
+            xs_pred = _do_sample_step(xs_pred, from_noise_levels, to_noise_levels)
 
             # Re-inject waypoint values (RePaint-style for partial waypoints)
-            xs_pred = self._inject_waypoints(
-                xs_pred, waypoint_values, waypoint_mask,
-                noise_levels=to_noise_levels,
-            )
+            if waypoint_mask is not None and waypoint_mask.any():
+                xs_pred = self._inject_waypoints(
+                    xs_pred, waypoint_values, waypoint_mask,
+                    noise_levels=to_noise_levels,
+                )
 
-            if task_cond is not None:
-                if task_cond.ndim == 1:
-                    # (D) -> (1, D)
-                    tc = task_cond.unsqueeze(0)
-                else:
-                    tc = task_cond
-
-                tc = tc.to(xs_pred.device, dtype=xs_pred.dtype)
+                # --- RePaint resampling: time-travel back-and-forth ---
+                # Re-noise to from_noise_levels, re-denoise to to_noise_levels,
+                # re-inject waypoints. Repeat to harmonize constrained features
+                # with unconstrained ones.
+                resample_n = self.resample_steps if use_indicator else 0
+                # Only resample while we are still at meaningful noise levels
+                still_noisy = (from_noise_levels.max() > 0).item()
+                if resample_n > 0 and still_noisy:
+                    for i in range(resample_n):
+                        # 1. Re-noise back to from_noise_levels
+                        re_noise = torch.randn_like(xs_pred)
+                        re_noise = torch.clamp(re_noise, -self.clip_noise, self.clip_noise)
+                        clamped_from = torch.clamp(from_noise_levels, min=0)
+                        xs_pred = self.diffusion_model.q_sample(
+                            x_start=xs_pred, k=clamped_from, noise=re_noise
+                        )
+                        # 2. Re-inject waypoints at from_noise_level
+                        xs_pred = self._inject_waypoints(
+                            xs_pred, waypoint_values, waypoint_mask,
+                            noise_levels=from_noise_levels,
+                        )
+                        # 3. Re-denoise
+                        xs_pred = _do_sample_step(xs_pred, from_noise_levels, to_noise_levels)
+                        # 4. Re-inject waypoints at to_noise_level
+                        if i != resample_n - 1:  # no need to re-inject on last iteration
+                            xs_pred = self._inject_waypoints(
+                                xs_pred, waypoint_values, waypoint_mask,
+                                noise_levels=to_noise_levels,
+                            )
                 
-                if inpaint:
-                    f_map = get_feature_indices(FEATURE_LAYOUT_NO_VEL)
-                    xs_pred[..., 0, f_map['joints']] = self.state_cond[..., 0, :29]
-                    xs_pred[..., 0, f_map['body_z']] = self.state_cond[..., 0, 29:30]
-                    xs_pred[..., 0, f_map['body_rot6d']] = self.state_cond[..., 0, 30:36]
-                    xs_pred[..., 0, f_map['obj_rel_pos']] = self.state_cond[..., 0, 36:39]
-                    xs_pred[..., 0, f_map['obj_rel_rot6d']] = self.state_cond[..., 0, 39:45]
+            if inpaint:
+                f_map = get_feature_indices(FEATURE_LAYOUT_NO_VEL)
+                xs_pred[..., 0, f_map['joints']] = self.state_cond[..., 0, :29]
+                xs_pred[..., 0, f_map['body_z']] = self.state_cond[..., 0, 29:30]
+                xs_pred[..., 0, f_map['body_rot6d']] = self.state_cond[..., 0, 30:36]
+                xs_pred[..., 0, f_map['obj_rel_pos']] = self.state_cond[..., 0, 36:39]
+                xs_pred[..., 0, f_map['obj_rel_rot6d']] = self.state_cond[..., 0, 39:45]
             
             pbar.update(1)
 

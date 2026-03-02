@@ -44,7 +44,7 @@ model:
   task_condition: True
   external_cond_dropout: 0.05
   hidden_size: 256
-  depth: 6
+  depth: 12
   num_heads: 4
   mlp_ratio: 4.0
   pos_emb_type: "sinusoidal_1d"
@@ -52,7 +52,7 @@ model:
 training:
   save_dir: "./runs/ablations/masking/"
   log_dir: "./logs/ablations/masking/"
-  suffix: "_keep_partial3_dropall"
+  suffix: "_keep_partial3_keepall"
   num_epochs: 500
   balance_task_density: False
   learning_rate: 0.0005
@@ -64,11 +64,11 @@ training:
   add_goal_noise: True
   state_conditioning_noise_level:
     joints: 0.025
-    body_rot6d: 0.01
-    obj_rel_pos: 0.01
-    obj_rel_rot6d: 0.01
-    task_params: 0.01
-    task_magnitude: 0.01
+    body_rot6d: 0.005
+    obj_rel_pos: 0.005
+    obj_rel_rot6d: 0.005
+    task_params: 0.0
+    task_magnitude: 0.025
 
   # In-betweening (waypoint-masked trajectory completion)
   inbetweening:

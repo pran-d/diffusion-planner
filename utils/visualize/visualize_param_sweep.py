@@ -12,6 +12,7 @@ from models.model import RobotDiffuser
 from datasets.flexible_dataset import FlexibleWindowDataset, yaw_to_rot_matrix, yaw_from_quat
 from utils.data.load_dataset import preload_dataset
 from utils.math.sbto_utils import reconstruct_sbto_trajectory, compute_task_params
+from inference import build_inference_waypoints
 
 def update_condition(dataset, robot_world_history, obj_world_history, final_obj_pos=None):
     """
@@ -108,6 +109,12 @@ def parse_args():
                         help="Single goal multiplier (scales displacement magnitude, keeps direction)")
     parser.add_argument("--goal_multipliers", nargs="+", type=float, default=None,
                         help="Sweep over multiple goal multipliers (e.g. --goal_multipliers 0.5 1.0 1.5 2.0)")
+
+    # Waypoint arguments
+    parser.add_argument("--last_frame_waypoint", action="store_true",
+                        help="Add partial waypoint at last frame (obj_delta_xy) when inbetweening is enabled")
+    parser.add_argument("--arrival_ratio", type=float, default=0.85,
+                        help="Object arrives in this fraction of remaining time (0-1)")
     
     return parser.parse_args()
 
@@ -122,9 +129,6 @@ def run_evaluation_batch(
     """
     num_samples = len(initial_states) if initial_states is not None else len(norm_task_params)
     
-    all_obj_traj_w = []
-    all_gen_params = []
-    
     # Track current anchors which update over time
     current_anchors = {
         k: v.copy() for k, v in anchors_dict.items()
@@ -132,7 +136,6 @@ def run_evaluation_batch(
     
     # We maintain current state tensor if using state cond
     curr_state_tens = initial_states.to(device) if initial_states is not None else None
-    task_tens = norm_task_params.to(device)
 
     if stitch_steps_list is not None:
         max_stitch_steps = max(stitch_steps_list)
@@ -153,26 +156,44 @@ def run_evaluation_batch(
 
     generated_segments = []
 
+    # Check if waypoints should be used
+    use_waypoints = (
+        getattr(args, 'last_frame_waypoint', False)
+        and hasattr(diffuser, 'model')
+        and getattr(diffuser.model, 'inbetweening_enabled', False)
+    )
+    arrival_ratio = getattr(args, 'arrival_ratio', 0.85)
+    num_features = dataset.num_features
+    window_size = dataset.window_size
+
     for step in range(max_stitch_steps):
         # --------------------------------------------------------
         # Dynamic Task Re-Targeting (Closed Loop Control)
         # --------------------------------------------------------
         new_task_list = []
+        raw_task_list = []  # unclipped task params for waypoint building
         for bi in range(num_samples):
             c_quat = current_anchors['ref_quat'][bi]
             c_obj = current_anchors['ref_obj_pos'][bi]
             c_goal = current_anchors['final_obj_pos'][bi]
             
-            tp, _ = compute_task_params(
+            tp, actual_dist = compute_task_params(
                 c_quat, c_obj, c_goal,
                 normalize_goal_vec=dataset.normalize_goal_vec,       
                 num_task_params=dataset.num_task_params,
                 max_goal_dist=dataset.max_obj_displacement,
             ) # (2,) or (3,) depending on impl
             new_task_list.append(tp)
+
+            # Keep a copy with actual (unclipped) distance for waypoint building
+            tp_raw = tp.copy()
+            if tp_raw.shape[-1] >= 3:
+                tp_raw[..., 2] = actual_dist.item() if hasattr(actual_dist, 'item') else float(actual_dist)
+            raw_task_list.append(tp_raw)
         
         new_task_arr = np.stack(new_task_list)
         new_task_tens = torch.from_numpy(new_task_arr).float()
+        raw_task_arr = np.stack(raw_task_list)
         
         # Normalize
         gt_task_tens = dataset._normalize("task_params", new_task_tens).to(device)
@@ -192,6 +213,23 @@ def run_evaluation_batch(
             
             batch_state = curr_state_tens[b_start:b_end] if curr_state_tens is not None else None
             batch_task = gt_task_tens[b_start:b_end]
+
+            # Build waypoints for this batch slice
+            wv, wm = None, None
+            if use_waypoints and batch_state is not None:
+                remaining = max(max_stitch_steps - step, 1)
+                batch_raw_task = torch.from_numpy(raw_task_arr[b_start:b_end]).float()
+                wv, wm = build_inference_waypoints(
+                    batch_state.to(),
+                    batch_raw_task,
+                    dataset,
+                    num_features,
+                    window_size,
+                    use_last_frame_wp=True,
+                    stitch_steps=max_stitch_steps,
+                    remaining_steps=remaining,
+                    arrival_ratio=arrival_ratio,
+                )
             
             sample = diffuser.getSample(
                 num_trajectories=bs,
@@ -201,6 +239,8 @@ def run_evaluation_batch(
                 cfg_w=args.cfg_w,
                 guidance_wt=args.guidance_wt,
                 no_state_cond=not use_state_cond,
+                waypoint_values=wv,
+                waypoint_mask=wm,
             )
             
             # Denormalize
@@ -533,7 +573,7 @@ def main():
     # Goal Multiplier Sweep
     # --------------------------------------------------------
     if args.goal_multipliers is not None and args.num_dataset_tasks > 0:
-        multipliers = sorted(set(args.goal_multipliers) | {1.0})  # always include original
+        multipliers = sorted(set(args.goal_multipliers))  # always include original
         print(f"\nGoal Multiplier Sweep: {multipliers}")
         print(f"Using {args.num_dataset_tasks} dataset tasks as base directions.")
 

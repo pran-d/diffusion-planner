@@ -49,11 +49,10 @@ FEATURE_LAYOUT = {
 }
 
 FEATURE_GROUPS = {
-    "locomotion": ["delta_xy", "delta_yaw"],
-    "object_pos": ["obj_delta_xy", "obj_rel_pos"],
-    "pose_summary": ["body_z", "body_rot6d"],
-    "object_rot": ["obj_rel_rot6d"],
-    "joints_summary": ["joints"],
+    "locomotion": ["obj_delta_xy"],
+    "robot_pos": ["delta_xy", "delta_yaw", "body_z"],
+    "object_pos": ["obj_rel_rot6d", "obj_rel_pos"],
+    "pose_summary": ["joints", "body_rot6d"],
 }
 
 WORLD_FRAME_LAYOUT = {

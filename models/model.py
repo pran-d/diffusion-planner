@@ -55,23 +55,24 @@ class RobotDiffuser():
             path=self.save_dir+f"model_{policy_num}.pth"
         print(f"Loading model weights from {path}... \n")
         weights = torch.load(path, map_location=self.device)
-        if "model" in weights:
-            self.model.load_state_dict(weights["model"])
-            return weights
-        else:
-            self.model.load_state_dict(weights)
-            return None
+        state = weights["model"] if "model" in weights else weights
+        missing, unexpected = self.model.load_state_dict(state, strict=False)
+        if missing:
+            print(f"  [Warning] Missing keys (will use init values): {missing}")
+        if unexpected:
+            print(f"  [Warning] Unexpected keys (ignored): {unexpected}")
+        return weights if "model" in weights else None
 
     def load_weights_from_file(self, path):
-        """
-        Load weights from a specific file path.
-        """
+        """Load weights from a specific file path."""
         print(f"Loading model weights from {path}... \n")
         weights = torch.load(path, map_location=self.device)
-        if "model" in weights:
-            self.model.load_state_dict(weights["model"])
-        else:
-            self.model.load_state_dict(weights)
+        state = weights["model"] if "model" in weights else weights
+        missing, unexpected = self.model.load_state_dict(state, strict=False)
+        if missing:
+            print(f"  [Warning] Missing keys (will use init values): {missing}")
+        if unexpected:
+            print(f"  [Warning] Unexpected keys (ignored): {unexpected}")
 
     def getSample(self, num_trajectories=1, state_cond=None, goal_cond=None, deterministic=False, cfg_w=1.0, guidance_wt=0.0, guidance_goal=None, no_state_cond=False, waypoint_values=None, waypoint_mask=None):
         """

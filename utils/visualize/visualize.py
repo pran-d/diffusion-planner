@@ -37,10 +37,11 @@ class MjVisualizer():
             elif keycode == 262:
                 self.step_request["delta"] = 1
                 self.paused["active"] = True
-            # Enter
-            elif keycode == 257:
+            # Escape
+            elif keycode == 256:
                 self.exit_request["active"] = True
-            elif keycode == 67:  # 'C' for clean
+            # 'C' for clean
+            elif keycode == 67:  
                 self.clean_request["active"] = True
 
         self.viewer = mujoco.viewer.launch_passive(self.mj_model, self.mj_data, key_callback=key_callback)

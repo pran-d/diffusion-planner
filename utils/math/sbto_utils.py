@@ -809,15 +809,15 @@ def compute_task_params(current_robot_state, current_obj_state, desired_obj_pos,
         np.ndarray: Shape (num_task_params,) [delta_x_local, delta_y_local, ...] normalized if needed.
     """
     # 1. Extract Positions
-    curr_obj_pos = current_obj_state[:3]
-    goal_obj_pos = desired_obj_pos[:3]
+    curr_obj_pos = current_obj_state[..., :3]
+    goal_obj_pos = desired_obj_pos[..., :3]
     
     # 2. Calculate World Displacement
     world_delta = goal_obj_pos - curr_obj_pos
     
     # 3. Extract Robot Yaw
     if len(current_robot_state) >= 7:
-        quat = current_robot_state[3:7]
+        quat = current_robot_state[..., 3:7]
     else:
         quat = current_robot_state
     R_ref_inv = yaw_to_rot_matrix(-yaw_from_quat(quat))
@@ -832,7 +832,7 @@ def compute_task_params(current_robot_state, current_obj_state, desired_obj_pos,
             local_delta = local_delta / local_delta_norm
         else:
             local_delta = np.zeros_like(local_delta)
-            local_delta_norm = 0.0
+            local_delta_norm = np.zeros_like(local_delta_norm)
         if max_goal_dist is not None:
             local_delta_norm_clipped = np.clip(local_delta_norm, min=0.0, max=max_goal_dist)
         local_delta = np.concatenate([local_delta, np.atleast_1d(local_delta_norm_clipped)], axis=-1)

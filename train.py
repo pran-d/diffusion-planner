@@ -1,3 +1,5 @@
+import argparse
+
 from matplotlib.pylab import cond, sample
 import torch
 import numpy as np
@@ -105,6 +107,12 @@ def compute_dataset_weights(dataset, sigma=0.2):
 # ===============================
 # Setup
 # ===============================
+parser = argparse.ArgumentParser(description="Clean Inference & Stitching Pipeline")
+parser.add_argument("--resume", type=int, default=None, help="Resume from checkpoint epoch (int)")
+parser.add_argument("--save_every", type=int, default=50, help="Save checkpoint every N epochs")
+
+args = parser.parse_args()
+
 with open("config/config.yaml", 'r') as file:
     config = yaml.safe_load(file)
 
@@ -118,8 +126,7 @@ norm_path = get_norm_path(model_cfg, training_cfg, data_cfg)
 
 # Preserve resume parameters from the current config
 calculate_stats = True
-if config.get("resume", False):        
-    resume_checkpoint = config.get("resume_checkpoint", 0)
+if args.resume is not None:
     if norm_path and os.path.exists(norm_path):
         print(f"Found existing normalization stats at {norm_path}, loading...")
         calculate_stats=False
@@ -170,8 +177,8 @@ ema = EMAModel(
 )
 
 starting_epoch = 0
-if config.get("resume", False):
-    starting_epoch = resume_checkpoint
+if args.resume is not None:
+    starting_epoch = args.resume
     checkpoint = diffuser.loadWeights(starting_epoch)
     if checkpoint is not None:
         if "optimizer" in checkpoint:
@@ -369,7 +376,7 @@ for epoch in range(starting_epoch, num_epochs):
     # ===============================
     patience = 100
     target_loss = 0.005  # Threshold for "low loss" (tune based on your problem)
-    stagnation_std = 3e-5  # Threshold for "roughly stagnant" (tune if needed)
+    stagnation_std = 1e-5  # Threshold for "roughly stagnant" (tune if needed)
 
     if len(epoch_losses_history) >= patience:
         last_50_losses = epoch_losses_history[-patience:]
@@ -395,7 +402,9 @@ for epoch in range(starting_epoch, num_epochs):
     # ===============================
     # Regular Checkpoint Saving
     # ===============================
-    if epoch % training_cfg.get("save_every", 50) == 0 or epoch == num_epochs - 1:
+    if args.save_every is None:
+        args.save_every = training_cfg.get("save_every", 50) 
+    if epoch % args.save_every == 0 or epoch == num_epochs - 1:
         checkpoint = {
             "model": diffuser.model.state_dict(),
             "optimizer": optimizer.state_dict(),

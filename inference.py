@@ -60,7 +60,8 @@ def build_first_keyframe_from_state(curr_state_tens, dataset, num_features, wind
     # At t=0 deltas are zero — normalize them
     prefix_dim = D - obs_dim  # typically 5 (delta_xy=2, delta_yaw=1, obj_delta_xy=2)
 
-    # Normalize each delta component
+    # Normalize each delta component (must go through dataset normalization
+    # so that zero deltas map to the correct normalized value)
     prefix_parts = []
     cumulative = 0
     for key in dataset.feature_order:
@@ -69,21 +70,23 @@ def build_first_keyframe_from_state(curr_state_tens, dataset, num_features, wind
         }
         if key in key_dim_map:
             kd = key_dim_map[key]
-            part = dataset._normalize(key, torch.zeros(1, kd))
-            prefix_parts.append(part.squeeze(0))
+            part = dataset._normalize(key, torch.zeros(1, kd, device=curr_state_tens.device))
+            if isinstance(part, torch.Tensor):
+                part = part.squeeze(0)
+            else:
+                part = torch.tensor(part, dtype=torch.float32, device=curr_state_tens.device).squeeze(0)
+            prefix_parts.append(part)
             cumulative += kd
         if cumulative >= prefix_dim:
             break
 
     if prefix_parts:
-        normalized_prefix = torch.cat(prefix_parts)  # (prefix_dim,)
-    else:
-        normalized_prefix = torch.zeros(prefix_dim)
+        prefix = torch.cat(prefix_parts)  # (prefix_dim,)
 
     # Build first frame: [normalized_deltas=0, observation_features]
     obs_frame = curr_state_tens[:, -1, :]  # (B, obs_dim) — latest observation frame
     first_frame = torch.cat([
-        normalized_prefix.unsqueeze(0).expand(B, -1),
+        prefix.unsqueeze(0).expand(B, -1),
         obs_frame
     ], dim=-1)  # (B, D)
 
@@ -104,20 +107,15 @@ def build_last_frame_waypoints(
     dataset,             # for normalization
     feature_order,       # list of feature keys
     num_features,        # D
-    remaining_steps=1,   # how many windows remain to reach goal
-    arrival_ratio=0.85,  # finish in this fraction of remaining time
+    total_steps,         # The initial total number of windows/steps for this task
+    remaining_steps,     # how many windows remain to reach goal
+    arrival_ratio=0.85,  # finish in this fraction of total time
+    t_accel=0.3,         # fraction of time spent accelerating
+    t_decel=0.3          # fraction of time spent decelerating
 ):
     """
-    Build a partial waypoint at the last frame (t=T-1) of the window.
-
-    Sets:
-    - obj_delta_xy: constant-velocity object displacement to reach goal,
-      arriving in `arrival_ratio` fraction of the remaining time.
-- delta_yaw: robot faces along the goal direction.
-
-    Returns:
-        waypoint_values: (B, T, D) float tensor — values at waypoint positions
-        waypoint_mask:   (B, T, D) bool tensor — True = known feature
+    Build a partial waypoint at the last frame (t=T-1) of the window using 
+    an inlined trapezoidal velocity profile.
     """
     if isinstance(task_params_raw, np.ndarray):
         task_params_raw = torch.from_numpy(task_params_raw).float()
@@ -133,23 +131,64 @@ def build_last_frame_waypoints(
 
     # Parse task params: [dir_x, dir_y, distance] or [delta_x, delta_y]
     if task_params_raw.shape[-1] >= 3:
-        direction = task_params_raw[:, :2]   # (B, 2)
-        distance = task_params_raw[:, 2:3]   # (B, 1)
-        total_remaining_delta = direction * distance  # (B, 2)
+        direction = task_params_raw[:, :2]   
+        distance = task_params_raw[:, 2:3]   
+        total_remaining_delta = direction * distance  
     else:
-        total_remaining_delta = task_params_raw[:, :2]  # (B, 2)
+        total_remaining_delta = task_params_raw[:, :2]  
 
-    # Per-window object displacement (arrive early)
-    effective_remaining = max(remaining_steps * arrival_ratio, 1.0)
-    per_window_delta = total_remaining_delta / effective_remaining  # (B, 2)
+    # --- INLINED TRAPEZOIDAL DISPLACEMENT LOGIC ---
+    effective_total_steps = max(total_steps * arrival_ratio, 1.0)
+    current_step = total_steps - remaining_steps
+    
+    tau_start = current_step / effective_total_steps
+    tau_end = (current_step + 1) / effective_total_steps
 
-    # Robot yaw: face along goal direction
-    goal_yaw = torch.atan2(task_params_raw[:, 1], task_params_raw[:, 0])  # (B,)
+    # Fallback to triangular if accel + decel > 1.0
+    if t_accel + t_decel > 1.0: 
+        t_accel, t_decel = 0.5, 0.5
+        
+    # Precompute curve constants
+    v_max = 1.0 / (1.0 - 0.5 * t_accel - 0.5 * t_decel)
+    p_ta = 0.5 * v_max * t_accel
+    p_td_start = p_ta + v_max * (1.0 - t_accel - t_decel)
+    
+    # Evaluate progress at tau_start and tau_end
+    progress = []
+    for tau in (tau_start, tau_end):
+        tau = max(0.0, min(1.0, tau))
+        if tau <= t_accel:
+            # Acceleration phase
+            s = 0.5 * (v_max / t_accel) * (tau ** 2) if t_accel > 0 else 0.0
+        elif tau <= 1.0 - t_decel:
+            # Cruise phase
+            s = p_ta + v_max * (tau - t_accel)
+        else:
+            # Deceleration phase
+            tau_prime = tau - (1.0 - t_decel)
+            if t_decel > 0:
+                s = p_td_start + v_max * tau_prime - 0.5 * (v_max / t_decel) * (tau_prime ** 2)
+            else:
+                s = p_td_start + v_max * tau_prime
+        progress.append(s)
+
+    s_start, s_end = progress
+    
+    # What fraction of the *remaining* distance should we cover in this window?
+    if s_start >= 1.0:
+        step_fraction = 0.0 # Already arrived
+    else:
+        step_fraction = (s_end - s_start) / (1.0 - s_start)
+        
+    per_window_delta = total_remaining_delta * step_fraction  # (B, 2)
+    # ----------------------------------------------
 
     # Build feature index map
     feature_idx = {}
     idx = 0
+    # Assuming FEATURE_LAYOUT_NO_VEL is imported/available in your scope
     for key in feature_order:
+        from utils.math.sbto_utils import FEATURE_LAYOUT_NO_VEL # Adjust import if needed
         dim = FEATURE_LAYOUT_NO_VEL.get(key, 0)
         if dim > 0:
             feature_idx[key] = slice(idx, idx + dim)
@@ -175,6 +214,7 @@ def build_inference_waypoints(
     num_features,
     window_size,
     use_last_frame_wp=True,  # whether to add last-frame partial waypoint
+    stitch_steps=1,
     remaining_steps=1,
     arrival_ratio=0.85,
 ):
@@ -208,11 +248,12 @@ def build_inference_waypoints(
             dataset=dataset,
             feature_order=dataset.feature_order,
             num_features=num_features,
+            total_steps=stitch_steps,
             remaining_steps=remaining_steps,
             arrival_ratio=arrival_ratio,
         )
         # Merge: last-frame waypoint fills in only its marked positions
-        values = torch.where(wp_mask, wp_vals.to(values.device), values)
+        values = torch.where(wp_mask.to(values.device), wp_vals.to(values.device), values)
         mask = mask | wp_mask.to(mask.device)
 
     return values, mask
@@ -395,19 +436,6 @@ def main():
     # Override task params if provided
     if args.task_params is not None:
         anchor["final_obj_pos"][..., :2] = args.task_params
-            
-    if args.goal_multiplier != 1.0:
-        print(f"Scaling goal by multiplier {args.goal_multiplier}")
-        anchor["final_obj_pos"][..., :2] = anchor["ref_obj_pos"][..., :2] + args.goal_multiplier * (anchor["final_obj_pos"] - anchor["ref_obj_pos"])[..., :2]
-
-    print(f"Using final box pos: {anchor['final_obj_pos']} for computing task parameters.")
-
-    current_anchors = {
-        'ref_pos': np.tile(anchor['ref_pos'][None], (args.num_samples, 1)),
-        'ref_quat': np.tile(anchor['ref_quat'][None], (args.num_samples, 1)),
-        'ref_obj_pos': np.tile(anchor['ref_obj_pos'][None], (args.num_samples, 1)),
-        'final_obj_pos': np.tile(anchor['final_obj_pos'][None], (args.num_samples, 1)),
-    }
 
     curr_state_tens = curr_state.unsqueeze(0).repeat(args.num_samples, 1, 1)
     task_tens = task_params.repeat(args.num_samples, 1)
@@ -419,6 +447,20 @@ def main():
     if args.action_horizon is not None:
         args.stitch_steps *= (data_cfg["num_timesteps"] // args.action_horizon)
         print(f"Adjusting stitch_steps to {args.stitch_steps} based on action horizon")
+
+    if args.goal_multiplier != 1.0:
+        print(f"Scaling goal by multiplier {args.goal_multiplier}")
+        anchor["final_obj_pos"][..., :2] = anchor["ref_obj_pos"][..., :2] + args.goal_multiplier * (anchor["final_obj_pos"] - anchor["ref_obj_pos"])[..., :2]
+        args.stitch_steps = max(1, int(args.stitch_steps * abs(args.goal_multiplier)))
+
+    print(f"Using final box pos: {anchor['final_obj_pos']} for computing task parameters.")
+
+    current_anchors = {
+        'ref_pos': np.tile(anchor['ref_pos'][None], (args.num_samples, 1)),
+        'ref_quat': np.tile(anchor['ref_quat'][None], (args.num_samples, 1)),
+        'ref_obj_pos': np.tile(anchor['ref_obj_pos'][None], (args.num_samples, 1)),
+        'final_obj_pos': np.tile(anchor['final_obj_pos'][None], (args.num_samples, 1)),
+    }
 
     # 5. Autoregressive Loop
     for step in range(args.stitch_steps):
@@ -443,12 +485,13 @@ def main():
 
             # Build waypoints: full keyframe at t=0 + optional last-frame partial waypoint
             wv, wm = None, None
-            if args.last_frame_waypoint:
+            if diffuser.model.inbetweening_enabled:
                 remaining = max(args.stitch_steps - step, 1)
                 wv, wm = build_inference_waypoints(
                     curr_state_tens, task_actual, dataset,
                     data_cfg['num_features'], dataset.window_size,
                     use_last_frame_wp=args.last_frame_waypoint,
+                    stitch_steps=args.stitch_steps,
                     remaining_steps=remaining,
                     arrival_ratio=args.arrival_ratio,
                 )
