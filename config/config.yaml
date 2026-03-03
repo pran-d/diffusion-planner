@@ -1,10 +1,8 @@
 auto_conf: False
 
 data:
-  dir_path: "/home/pranish/pranav/diffusion-mp/simple_diffusion/"
-  # train_path: "test_datasets/pick_place"
-  train_path: "test_datasets/trial/cleanup"
-  task_list_path: "test_datasets/chosen_tasks_test.yml"
+  dir_path: "/home/kanish/workspace/mjlab2/motions/output/Merged_and_cleaned/"
+  train_path: "84_from_shafeef/final_trajs"
   normalization_type: "min_max"
   dataset_class: "flexible"
   batch_size: 1024
@@ -48,18 +46,16 @@ model:
   depth: 8
   num_heads: 4
   mlp_ratio: 4.0
-  pos_emb_type: "sinusoidal_1d"
+  pos_emb_type: "learned_1d"
 
 training:
-  save_dir: "./runs/ablations/masking/"
-  log_dir: "./logs/ablations/masking/"
-  # suffix: ""
-  # suffix: "_partial_keepall"
-  suffix: "_partial_masking_abs_z"
-  num_epochs: 750
+  save_dir: "/home/kanish/workspace/mjlab2/logs/rsl_rl/g1_object_tracking/"
+  log_dir: "/home/kanish/workspace/mjlab2/logs/rsl_rl/g1_object_tracking/data/"
+  suffix: "_trajectory_goal"
+  num_epochs: 5000
   balance_task_density: False
   learning_rate: 0.0005
-  save_every: 50
+  save_every: 10
   condition_dropout_prob: 
     state: 0.1
     task: 0.2

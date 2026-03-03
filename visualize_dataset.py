@@ -4,16 +4,18 @@ import time
 import numpy as np
 import torch
 import os
+import mujoco
 
 from config.configure import load_config, get_data_path, get_norm_path
-from datasets.flexible_dataset import FlexibleWindowDataset
+from datasets import BufferDataset
 from utils.visualize.visualize import MjVisualizer
+from utils.data.load_dataset import preload_dataset
 from utils.math.sbto_utils import batch_rotation, quat_to_rot
 from utils.data.load_dataset import preload_dataset
 
 def load_env_and_data():
     # Use config from file
-    model_cfg, data_cfg, training_cfg, noise_cfg = load_config("config/config.yaml")
+    model_cfg, data_cfg, training_cfg, noise_cfg = load_config("src/mjlab/scripts/diffusion_planner/config/config.yaml")
 
     data_path = get_data_path(data_cfg)
     norm_path = get_norm_path(model_cfg, training_cfg, data_cfg)
@@ -38,6 +40,7 @@ def main():
     parser.add_argument("--batch_idx", type=int, default=0, help="Batch index within file")
     parser.add_argument("--start_time", type=float, default=0.0, help="Start time in seconds for visualization")
     parser.add_argument("--show_ee", action="store_true", help="Visualize computed EE paths")
+    parser.add_argument("--show_keypoints", action="store_true", help="Show body keypoint spheres (like play.py)")
     args = parser.parse_args()
 
     data_cfg, dataset = load_env_and_data()
@@ -49,13 +52,16 @@ def main():
     
     print(f"Found {len(unique_trajs)} unique trajectories in dataset.")
 
-    # Pre-load all trajectories for overlay
+    # Identical setup as overlay mode, but we ONLY visualize the first one with the overlay enabled.
+    # The overlay now contains ALL unique trajectories.
+    
+    print("Pre-loading ALL trajectories for overlay...")
     all_trajs_data = []
     all_obj_paths = []
 
 
     # Initialize Visualizer
-    xml_path = "./mj_model.xml"
+    xml_path = "src/mjlab/scripts/diffusion_planner/mj_model.xml"
     if not os.path.exists(xml_path):
          print(f"Warning: {xml_path} not found. Visualization might fail.")
     
@@ -177,12 +183,30 @@ def main():
         # If it IS blocking, we wait for window close.
         # Let's try running it.
         
+        # Body keypoint indices (14 tracked bodies, matching play.py)
+        # These are MuJoCo body IDs in mj_model.xml (1-indexed, 0=world)
+        body_kp_indices = None
+        if args.show_keypoints:
+            _TRACKED_BODY_NAMES = [
+                "pelvis", "left_hip_roll_link", "left_knee_link",
+                "left_ankle_roll_link", "right_hip_roll_link", "right_knee_link",
+                "right_ankle_roll_link", "torso_link", "left_shoulder_roll_link",
+                "left_elbow_link", "left_wrist_yaw_link", "right_shoulder_roll_link",
+                "right_elbow_link", "right_wrist_yaw_link",
+            ]
+            body_kp_indices = []
+            for name in _TRACKED_BODY_NAMES:
+                bid = mujoco.mj_name2id(visualizer.mj_model, mujoco.mjtObj.mjOBJ_BODY, name)
+                if bid >= 0:
+                    body_kp_indices.append(bid)
+
         visualizer.visualize_trajectory(
             t, 
             full_state, 
             repeat=True, 
             overlay_paths=current_overlay if args.overlay else None,
-            markers=ee_global_paths if args.show_ee and 'ee_rel_pos' in raw_traj else None
+            markers=ee_global_paths if args.show_ee and 'ee_rel_pos' in raw_traj else None,
+            body_keypoint_indices=body_kp_indices,
         )
 
 if __name__ == "__main__":
