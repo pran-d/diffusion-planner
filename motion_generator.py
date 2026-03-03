@@ -1,3 +1,4 @@
+import gc
 import torch
 import numpy as np
 import yaml
@@ -19,6 +20,7 @@ from models.model import RobotDiffuser
 from datasets.flexible_dataset import FlexibleWindowDataset
 from utils.math.sbto_utils import reconstruct_sbto_trajectory, compute_task_params
 from utils.math.math_tools import yaw_from_quat, yaw_to_rot_matrix
+from inference import build_inference_waypoints
 
 
 def compute_dataset_weights(dataset, sigma=0.2):
@@ -115,16 +117,6 @@ def compute_dataset_weights(dataset, sigma=0.2):
         
     return torch.tensor(sample_weights).double()
 
-
-def apply_condition_dropout(cond, dropout_prob: float):
-    if cond is None or dropout_prob <= 0.0:
-        return cond
-    if not torch.is_tensor(cond):
-        cond = torch.as_tensor(cond)
-    if torch.rand(1).item() < dropout_prob:
-        return torch.zeros_like(cond)
-    return cond
-
 class MotionGenerator:
     def __init__(self, config_path: str = "config/config.yaml", device: str = None):
         self.config_path = config_path
@@ -180,7 +172,9 @@ class MotionGenerator:
         task_params: Optional[List[Dict]] = None,
         epochs: int = None, 
         save_path: str = None,
-        checkpoint: Optional[str] = None):
+        checkpoint: Optional[str] = None,
+        calc_stats: bool = True,
+    ):
 
         """
         Train the model.
@@ -192,7 +186,8 @@ class MotionGenerator:
             save_path: Path to save model checkpoints. Overrides config if provided.
             checkpoint: Optional path to a checkpoint to resume from.
         """
-        
+        self.diffuser.model.train()  # Ensure model is in training mode
+
         if epochs is None:
             epochs = self.training_cfg.get("num_epochs", 100)
         
@@ -202,16 +197,23 @@ class MotionGenerator:
         if isinstance(data_source, str):
             raise ValueError("MotionGenerator.fit no longer supports file paths. Please load data into a buffer first.")
         
-        
         # If epochs is 0, we assume inference mode and load stats.
-        calc_stats = True
+        calc_stats = calc_stats
         if epochs == 0:
-             if norm_path and os.path.exists(norm_path):
-                 print(f"Epochs=0 detected. Loading normalization stats from {norm_path} instead of recalculating.")
-                 calc_stats = False
-             else:
-                 print("Epochs=0 but no stats found at {norm_path}. Recalculating stats from data_source.")
-        
+            if norm_path and os.path.exists(norm_path):
+                print(f"Epochs=0 detected. Loading normalization stats from {norm_path} instead of recalculating.")
+                calc_stats = False
+            else:
+                print(f"Epochs=0 but no stats found at {norm_path}. Recalculating stats from data_source.")
+
+        # --- Free previous dataset to avoid memory accumulation ---
+        if self.dataset is not None:
+            del self.dataset
+            self.dataset = None
+            gc.collect()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+
         self.dataset = FlexibleWindowDataset(
             data_buffer=data_source,
             task_params=task_params,
@@ -220,6 +222,7 @@ class MotionGenerator:
             norm_path=norm_path,
             training_cfg=self.training_cfg,
         )
+
         # Task Density Balancing
         sampler = None
         shuffle = True
@@ -237,10 +240,10 @@ class MotionGenerator:
         train_dataloader = DataLoader(
             self.dataset, 
             batch_size=self.data_cfg["batch_size"], 
-            num_workers=0,
+            num_workers=2,
             shuffle=shuffle,
             sampler=sampler,
-            pin_memory=False
+            pin_memory=True,
         )
 
         # Optimizer & Scheduler
@@ -255,7 +258,7 @@ class MotionGenerator:
 
         if checkpoint:
             if os.path.exists(checkpoint):
-                # print(f"Loading diffusion weights from {checkpoint}...")
+                print(f"Loading diffusion weights from {checkpoint}...")
                 ckpt = self.diffuser.loadWeights(checkpoint)
                 if "optimizer" in ckpt:
                     optimizer.load_state_dict(ckpt["optimizer"])
@@ -307,12 +310,10 @@ class MotionGenerator:
                 idx = 1
                 if state_condition:
                     state_cond = batch_data[idx].to(self.device)
-                    state_cond = apply_condition_dropout(state_cond, dropout_probs.get("state", 0.0))
                     idx += 1
                 
                 if task_condition:
                     task_cond = batch_data[idx].to(self.device)
-                    task_cond = apply_condition_dropout(task_cond, dropout_probs.get("task", 0.0))
                     idx += 1
                 
                 # Construct cond (matches train.py)
@@ -375,6 +376,17 @@ class MotionGenerator:
                     "scheduler": scheduler.state_dict()
                 }
                 torch.save(checkpoint, fpath)
+                last_ckpt_path = fpath
+
+        # --- Cleanup training objects to release GPU/CPU memory ---
+        # Note: optimizer, scheduler, scaler are kept on self for reuse across fit() calls
+        del train_dataloader
+        if sampler is not None:
+            del sampler
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+        return last_ckpt_path if epochs > 0 else checkpoint
 
     def _interpolate_trajectory(self, trajectory):
         """
@@ -421,15 +433,18 @@ class MotionGenerator:
                 # R.from_quat usually handles, but let's be safe.
                 # Only if the quat slice is valid
                 if sl.stop <= D:
-                     q_vals = trajectory[b, :, sl]
-                     rot = R.from_quat(q_vals)
+                     # Trajectory stores quats as (w,x,y,z) but scipy expects (x,y,z,w)
+                     q_wxyz = trajectory[b, :, sl]
+                     q_xyzw = np.roll(q_wxyz, -1, axis=-1)
+                     rot = R.from_quat(q_xyzw)
                      slerp = Slerp(original_times, rot)
                      
                      # Clamp times for Slerp to avoid extrapolation error (equivalent to nearest)
                      clamped_times = np.clip(target_times, original_times[0], original_times[-1])
                      
-                     interp_q = slerp(clamped_times).as_quat()
-                     interpolated[b, :, sl] = interp_q
+                     interp_q_xyzw = slerp(clamped_times).as_quat()
+                     # Convert back to (w,x,y,z) for trajectory storage
+                     interpolated[b, :, sl] = np.roll(interp_q_xyzw, 1, axis=-1)
         
         return interpolated
 
@@ -525,10 +540,17 @@ class MotionGenerator:
                             target_traj_length: int = None,
                             stitch_steps: int = None, 
                             num_samples: int = 1,
-                            cfg_w: float = 1.25,
+                            cfg_w: float = 1.0,
                             end_error_threshold: float = 0.1,
-                            enable_goal_stop: bool = True,
-                            enable_physics_stop: bool = True):
+                            enable_goal_stop: bool = False,
+                            enable_physics_stop: bool = False,
+                            use_last_frame_wp: bool = True,
+                            arrival_ratio: float = 0.85,
+                            lift_height: float = 0.5,
+                            no_lower_dist: float = 0.5,
+                            lift_start: float = 0.0,
+                            lift_end: float = 0.20,
+                            walk_start_z: float = 0.80,):
         """
         Generate trajectory via autoregressive diffusion (mirrors inference.py).
         
@@ -553,6 +575,14 @@ class MotionGenerator:
             enable_physics_stop: If True, truncate and pad when a physical consistency
                                  violation is detected (ground penetration / position spike).
                                  Set to False to continue generating regardless.
+            use_last_frame_wp: If True and model supports inbetweening, add a partial
+                               waypoint at the last frame with obj_delta_xy + obj_z.
+            arrival_ratio: Object should arrive within this fraction of total time (0-1).
+            lift_height: Peak lift height in metres for pick-and-place z profile.
+            no_lower_dist: Lower z only when remaining XY distance < this (metres).
+            lift_start: Fraction of trajectory where lift begins.
+            lift_end: Fraction of trajectory where lift reaches peak.
+            walk_start_z: Gate XY walk until z >= this fraction of lift_height.
             
         Returns:
             np.ndarray of shape (B * num_samples, T_total, D) where D = 36 (robot) + 7 (object).
@@ -568,8 +598,12 @@ class MotionGenerator:
         # --- Auto-compute stitch_steps from target trajectory length ---
         if stitch_steps is None:
             if target_traj_length is not None:
-                _eff = window_size - 1   # t=0 frame is discarded per window
-                stitch_steps = math.ceil(target_traj_length / _eff)
+                _eff = window_size - 1   # frames contributed by steps 1+ (t=0 skipped)
+                # Step 0 contributes window_size frames; steps 1+ contribute _eff each.
+                # Total = window_size + (stitch_steps-1)*_eff  =  1 + stitch_steps*_eff.
+                # Ensure total >= target_traj_length:
+                #   stitch_steps >= (target_traj_length - 1) / _eff
+                stitch_steps = max(1, math.ceil((target_traj_length - 1) / _eff))
             else:
                 stitch_steps = 1
 
@@ -599,8 +633,14 @@ class MotionGenerator:
         else:
              raise ValueError("Goal condition format not supported yet. Pass np.ndarray or list.")
         
-        # Convert from initial-pelvis-local frame to world frame
-        init_base = r_hist[:, 0, :7]   # (B, 7) initial pelvis [x,y,z,w,x,y,z]
+        # Convert from initial-pelvis-local frame to world frame.
+        # The goal encodes relative object *displacement* (final − initial)
+        # expressed in the robot's yaw-aligned local frame.  To recover the
+        # desired final object world position we rotate the displacement back
+        # into the world frame and add the *initial object position* (NOT the
+        # robot position).
+        init_base = r_hist[:, 0, :7]    # (B, 7) initial pelvis [x,y,z, qw,qx,qy,qz]
+        init_obj_pos = o_hist[:, 0, :3]  # (B, 3) initial object position (world)
         goal_world = np.zeros((B_input, 3), dtype=np.float64)
         for b in range(B_input):
             yaw = yaw_from_quat(init_base[b, 3:7])
@@ -608,7 +648,7 @@ class MotionGenerator:
             goal_3d = np.zeros(3, dtype=np.float64)
             n = min(gc_np.shape[-1], 3)
             goal_3d[:n] = gc_np[b, :n]
-            goal_world[b] = (R_local_to_world @ goal_3d[:, None])[:, 0] + init_base[b, :3]
+            goal_world[b] = (R_local_to_world @ goal_3d[:, None])[:, 0] + init_obj_pos[b]
 
         # 3. Replicate for num_samples (when generating multiple samples per condition)
         if num_samples > 1 and curr_state_tens.shape[0] == 1:
@@ -632,13 +672,16 @@ class MotionGenerator:
         _goal_reached     = np.zeros(effective_batch, dtype=bool)
         _goal_last_frame  = np.zeros((effective_batch, 43), dtype=np.float64)
 
+        # Episode-start object z — absolute baseline for the z-waypoint target.
+        _rest_obj_z = float(current_anchors['ref_obj_pos'][0, 2])
+
         stitched_segments = []
 
         # 4. Autoregressive Loop
         with torch.no_grad():
             for step in range(stitch_steps):
                 # A. Compute per-step task params (world-frame goal → local displacement)
-                task_cond_np, _ = compute_task_params(
+                task_cond_np, actual_dist = compute_task_params(
                     current_robot_state=current_anchors['ref_quat'],
                     current_obj_state=current_anchors['ref_obj_pos'],
                     desired_obj_pos=goal_world,
@@ -646,27 +689,55 @@ class MotionGenerator:
                     num_task_params=self.data_cfg.get("num_task_params", 3),
                     max_goal_dist=self.dataset.max_obj_displacement,
                 )
+                # task_actual uses the real (unclipped) distance for waypoint planning
+                task_actual = task_cond_np.copy()
+                if actual_dist is not None:
+                    task_actual[..., -1:] = actual_dist
+
                 task_cond = self.dataset._normalize(
                     'task_params',
                     torch.from_numpy(task_cond_np.astype(np.float32)).to(self.device),
                 )
 
-                # B. Generate normalized sample
+                # B. Build waypoints (full keyframe at t=0 + optional last-frame partial wp)
+                wv, wm = None, None
+                if getattr(self.diffuser.model, 'inbetweening_enabled', False):
+                    remaining = max(stitch_steps - step, 1)
+                    _current_obj_z = torch.from_numpy(
+                        current_anchors['ref_obj_pos'][:, 2].astype(np.float32)
+                    )
+                    wv, wm = build_inference_waypoints(
+                        curr_state_tens, task_actual, self.dataset,
+                        self.data_cfg['num_features'], window_size,
+                        use_last_frame_wp=use_last_frame_wp,
+                        stitch_steps=stitch_steps,
+                        remaining_steps=remaining,
+                        arrival_ratio=arrival_ratio,
+                        lift_height=lift_height,
+                        no_lower_dist=no_lower_dist,
+                        lift_start=lift_start,
+                        lift_end=lift_end,
+                        walk_start_z=walk_start_z,
+                        current_obj_z=_current_obj_z,
+                        rest_obj_z=_rest_obj_z,
+                    )
+
+                # C. Generate normalized sample
                 normalized_sample = self.diffuser.getSample(
                     num_trajectories=effective_batch,
                     state_cond=curr_state_tens,
                     goal_cond=task_cond,
                     deterministic=self.noise_cfg.get("deterministic_inference", False),
                     cfg_w=cfg_w,
-                    waypoint_values=None,
-                    waypoint_mask=None,
+                    waypoint_values=wv,
+                    waypoint_mask=wm,
                 )  # (B, T, D_out)
                 
-                # C. Denormalize
+                # D. Denormalize
                 denorm_btc = self.dataset.denormalize_global(normalized_sample)
                 future_traj_np = denorm_btc.detach().cpu().numpy()
                 
-                # D. Reconstruct World Frame from SBTO features
+                # E. Reconstruct World Frame from SBTO features
                 #    final_obj_pos in anchor must be in world frame for reconstruction
                 current_anchors['final_obj_pos'] = goal_world
 
@@ -683,8 +754,9 @@ class MotionGenerator:
                 )
                 r_world, o_world = res[0], res[1]
 
-                r_world = r_world[:, 1:, :]  # skip t=0 (anchored to current state)
-                o_world = o_world[:, 1:, :]
+                if step > 0:
+                    r_world = r_world[:, 1:, :]  # skip t=0 (anchored to current state)
+                    o_world = o_world[:, 1:, :]
                 
                 # Store segment: Robot(36) + Object(7)
                 segment_world = np.concatenate([r_world[..., :36], o_world[..., :7]], axis=-1)
@@ -777,9 +849,19 @@ class MotionGenerator:
         
         full_trajectory = np.concatenate(stitched_segments, axis=1)
 
-        # Interpolate if needed (based on dataset downsample config)
-        if self.dataset is not None:
-             full_trajectory = self._interpolate_trajectory(full_trajectory)
+        # Trim or pad to exactly target_traj_length frames
+        if target_traj_length is not None:
+            T_actual = full_trajectory.shape[1]
+            if T_actual > target_traj_length:
+                full_trajectory = full_trajectory[:, :target_traj_length, :]
+            elif T_actual < target_traj_length:
+                deficit = target_traj_length - T_actual
+                pad = np.repeat(full_trajectory[:, -1:, :], deficit, axis=1)
+                full_trajectory = np.concatenate([full_trajectory, pad], axis=1)
+
+        # # Interpolate if needed (based on dataset downsample config)
+        # if self.dataset is not None:
+        #      full_trajectory = self._interpolate_trajectory(full_trajectory)
 
         # Smooth trajectory
         full_trajectory = self._smooth_trajectory(full_trajectory, sigma=2.0)

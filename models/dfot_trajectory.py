@@ -845,7 +845,7 @@ class DFoTTrajectory(nn.Module):
         task_cond: Optional[torch.Tensor] = None,
         guidance_fn: Optional[Callable] = None,
         guidance_goal: Optional[torch.Tensor] = None,
-        guidance_wt: float = 1.0,
+        guidance_wt: float = 0.0,
         return_all: bool = False,
         pbar: Optional[tqdm] = None,
         inpaint: bool = False,

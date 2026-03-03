@@ -114,9 +114,10 @@ def get_data_path(data_cfg: dict) -> str:
     print(f"Getting data from {data_path}...\n")
     return data_path
 
-def get_norm_path(model_cfg: dict, training_cfg: dict, data_cfg: dict) -> str:    
+def get_norm_path(model_cfg: dict, training_cfg: dict, data_cfg: dict, num_training_calls = None) -> str:    
     run_path = get_run_path(model_cfg=model_cfg, data_cfg=data_cfg, training_cfg=training_cfg)
     save_dir = training_cfg.get('save_dir', './runs') + run_path
-    norm_path = os.path.join(save_dir, "norm_stats.npz")
+    norm_file_name = f"norm_stats.npz" if num_training_calls is None else f"norm_stats_{num_training_calls}.npz"
+    norm_path = os.path.join(save_dir, norm_file_name)
     
     return norm_path

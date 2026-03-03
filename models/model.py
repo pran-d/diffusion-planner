@@ -49,11 +49,11 @@ class RobotDiffuser():
             self.model.eval()
         
     def loadWeights(self, policy_num, ema=False):
-        if ema:
-            path=self.save_dir+f"ema_model_{policy_num}.pth"
+        if isinstance(policy_num, str):
+            path = policy_num
         else:
             path=self.save_dir+f"model_{policy_num}.pth"
-        print(f"Loading model weights from {path}... \n")
+        print(f"Loading diffusion model weights from {path}... \n")
         weights = torch.load(path, map_location=self.device)
         state = weights["model"] if "model" in weights else weights
         missing, unexpected = self.model.load_state_dict(state, strict=False)
