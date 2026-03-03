@@ -796,6 +796,7 @@ def compute_guidance_vec(current_pos, target_pos, R_robot_yaw_inv, current_rot=N
 def compute_task_params(current_robot_state, current_obj_state, desired_obj_pos, normalize_goal_vec=True, num_task_params=3, max_goal_dist=None):
     """
     Computes the task parameters (local object displacement) for the diffusion model.
+    Matches the normalization convention of FlexibleWindowDataset._compute_task_params.
 
     Args:
         current_robot_state (np.ndarray): Shape (7,) or (4,) [x, y, z, qx, qy, qz, qw]
@@ -806,8 +807,12 @@ def compute_task_params(current_robot_state, current_obj_state, desired_obj_pos,
                                       representing the GOAL object position in world frame.
 
     Returns:
-        np.ndarray: Shape (num_task_params,) [delta_x_local, delta_y_local, ...] normalized if needed.
+        np.ndarray: Shape (..., num_task_params).
     """
+    current_robot_state = np.asarray(current_robot_state, dtype=np.float64)
+    current_obj_state = np.asarray(current_obj_state, dtype=np.float64)
+    desired_obj_pos = np.asarray(desired_obj_pos, dtype=np.float64)
+
     # 1. Extract Positions
     curr_obj_pos = current_obj_state[..., :3]
     goal_obj_pos = desired_obj_pos[..., :3]
@@ -820,22 +825,45 @@ def compute_task_params(current_robot_state, current_obj_state, desired_obj_pos,
         quat = current_robot_state[..., 3:7]
     else:
         quat = current_robot_state
-    R_ref_inv = yaw_to_rot_matrix(-yaw_from_quat(quat))
+    
+    # yaw_from_quat returns (N,) or ()
+    # yaw_to_rot_matrix returns (N, 3, 3) or (3, 3)
+    yaw = -yaw_from_quat(quat)
+    R_ref_inv = yaw_to_rot_matrix(yaw)
 
     # 4. Rotate into Robot Frame (Global -> Local)
-    local_delta = (R_ref_inv @ world_delta[..., None])[..., 0]
+    # Ensure correct broadcasting for batch matrix multiplication
+    # world_delta is (N, 3) -> (N, 3, 1)
+    if world_delta.ndim == 1:
+        wd_col = world_delta[:, None]
+    else:
+        wd_col = world_delta[..., None]
+        
+    # Standard matrix multiplication (supports broadcasting if shapes align)
+    local_delta = (R_ref_inv @ wd_col)[..., 0]
 
+    local_delta_norm = None
     if normalize_goal_vec:    
-        local_delta = local_delta[..., :num_task_params-1]
-        local_delta_norm = np.linalg.norm(local_delta, keepdims=True)
-        if local_delta_norm > 1e-3:
-            local_delta = local_delta / local_delta_norm
-        else:
-            local_delta = np.zeros_like(local_delta)
-            local_delta_norm = np.zeros_like(local_delta_norm)
-        if max_goal_dist is not None:
-            local_delta_norm_clipped = np.clip(local_delta_norm, min=0.0, max=max_goal_dist)
-        local_delta = np.concatenate([local_delta, np.atleast_1d(local_delta_norm_clipped)], axis=-1)
+        # Project to task dimensions (e.g. 2D plane)
+        vec_part = local_delta[..., :num_task_params-1]
+        
+        # Consistent norm calculation
+        norm = np.linalg.norm(vec_part, axis=-1, keepdims=True)
+        local_delta_norm = norm
+        
+        # Vectorized normalization with safe division
+        mask = (norm > 1e-3)
+        normalized_vec = np.zeros_like(vec_part)
+        
+        # Use np.divide with 'where' to handle zero norms safely and efficiently
+        np.divide(vec_part, norm, out=normalized_vec, where=mask)
+        
+        # Clip distance magnitude
+        norm_clipped = np.clip(norm, a_min=None, a_max=1.0)
+        
+        # Concatenate: [normalized_dir, clipped_magnitude]
+        # Ensure we concatenate along the last axis
+        local_delta = np.concatenate([normalized_vec, norm_clipped], axis=-1)
         
     return local_delta, local_delta_norm
 

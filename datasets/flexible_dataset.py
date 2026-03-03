@@ -131,11 +131,17 @@ class FlexibleWindowDataset(Dataset):
             bp = np.asarray(raw_data[bp_key], dtype=np.float64)
             bq = np.asarray(raw_data[bq_key], dtype=np.float64)
 
-            # body_pos_w may be (N, T, K, 3) with K bodies — take pelvis (0)
+            # body_pos_w may have a bodies dim — take pelvis (0):
+            #   batched:  (N, T, K, 3) -> (N, T, 3)
+            #   single:   (T, K, 3)    -> (T, 3)
             if bp.ndim == 4:
                 bp = bp[:, :, 0, :]
+            elif bp.ndim == 3:
+                bp = bp[:, 0, :]
             if bq.ndim == 4:
                 bq = bq[:, :, 0, :]
+            elif bq.ndim == 3:
+                bq = bq[:, 0, :]
 
             processed['base'] = np.concatenate([bp, bq], axis=-1)
             processed['joints'] = np.asarray(raw_data[jp_key], dtype=np.float64)
@@ -410,10 +416,6 @@ class FlexibleWindowDataset(Dataset):
         else:
             anchor["final_obj_pos"] = raw_traj['obj'][-1, :3]
             features["task_params"], _ = self._compute_task_params(raw_traj['base'], raw_traj['obj'], start_idx=read_start)
-        
-        # Add metadata to anchor
-        if 'fps' in raw_traj:
-            anchor['fps'] = np.array(raw_traj['fps'])
 
         return features, anchor
 

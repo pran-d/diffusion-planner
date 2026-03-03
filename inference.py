@@ -249,7 +249,7 @@ def build_last_frame_waypoints(
         min_walk_z = walk_start_z * lift_height
         if z_now < min_walk_z:
             per_window_delta = torch.zeros_like(per_window_delta)
-            print(f"  [xy-wp] Walk gated: z_now={z_now:.3f}m < threshold={min_walk_z:.3f}m")
+            # print(f"  [xy-wp] Walk gated: z_now={z_now:.3f}m < threshold={min_walk_z:.3f}m")
     # -----------------------------------
     # ----------------------------------------------
 
@@ -325,8 +325,8 @@ def build_last_frame_waypoints(
         avg_rem    = remaining_dist_m.mean().item()
         avg_z      = target_abs_z.mean().item()
         n_lowering = (remaining_dist_m < no_lower_dist).sum().item()
-        print(f"  [z-wp] target_z={avg_z:.3f}m  rem={avg_rem:.3f}m  "
-              f"lowering={n_lowering}/{B}")
+        # print(f"  [z-wp] target_z={avg_z:.3f}m  rem={avg_rem:.3f}m  "
+        #       f"lowering={n_lowering}/{B}")
 
     return values, mask
 
