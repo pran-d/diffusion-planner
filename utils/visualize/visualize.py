@@ -448,9 +448,19 @@ class DiffusionOverlayVisualizer:
 
         with mujoco.viewer.launch_passive(mj_model_rep, mj_data_rep,
                                           key_callback=_key_callback) as viewer:
-            
+
+            # ── Camera setup ─────────────────────────────────────────────
+            # All robots are overlaid at the origin (spacing=0), so aim at
+            # the approximate whole-body COM and pull back far enough to
+            # capture the full motion range.
+            viewer.cam.lookat[:] = [0.0, 0.0, 0.9]
+            viewer.cam.distance  = 5.0
+            viewer.cam.azimuth   = 135.0   # front-right 3/4 view
+            viewer.cam.elevation = -30.0   # slight top-down
+            # ─────────────────────────────────────────────────────────────
+
             step = 0
-            print("Controls:  Space=pause  ←/→=step  R=restart")
+            print("Controls:  Space=pause  \u2190/\u2192=step  R=restart")
             while viewer.is_running():
 
                 # ── Handle restart request ────────────────────────────────
