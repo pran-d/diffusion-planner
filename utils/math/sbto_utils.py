@@ -7,7 +7,6 @@ from .math_tools import (
     compute_relative_se3,
     quat_to_rot,
     rot_to_6d,
-    remove_yaw_from_rot,
     rot6d_to_rot,
     rot_to_quat,
     batch_rotation,
@@ -125,32 +124,36 @@ def compute_fk_batched(model,
 # Feature Layouts
 # ============================================================
 
-FEATURE_LAYOUT_WITH_VEL = {
-    "delta_xy": 2,
-    "delta_yaw": 1,
-    "obj_delta_xy": 2,
-    "joints": 29,
-    "body_z": 1,
-    "body_rot6d": 6,
-    "obj_rel_pos": 3,
-    "obj_rel_rot6d": 6,
-    "joints_vel": 29,
-    "body_lin_vel": 3,
-    "body_ang_vel": 3,
-    "obj_lin_vel": 3,
-    "obj_ang_vel": 3,
-}
-
-FEATURE_LAYOUT_NO_VEL = {
-    "delta_xy": 2,
-    "delta_yaw": 1,
-    "obj_delta_xy": 2,
-    "joints": 29,
-    "body_z": 1,
-    "body_rot6d": 6,
-    "obj_rel_pos": 3,
-    "obj_rel_rot6d": 6,
-}
+def build_feature_layout(has_vel=False, has_obj_delta_xy=True, has_obj_z=True):
+    """
+    Build the feature layout dict adaptively based on which optional feature
+    groups are present in the trajectory.  The insertion order must match the
+    assembly order in ``compute_sbto_components``.
+    """
+    layout = {
+        "delta_xy":  2,
+        "delta_yaw": 1,
+    }
+    if has_obj_delta_xy:
+        layout["obj_delta_xy"] = 2
+    if has_obj_z:
+        layout["obj_z"] = 1
+    layout.update({
+        "joints":       29,
+        "body_z":        1,
+        "body_rot6d":    6,
+        "obj_rel_pos":   3,
+        "obj_rel_rot6d": 6,
+    })
+    if has_vel:
+        layout.update({
+            "joints_vel":  29,
+            "body_lin_vel": 3,
+            "body_ang_vel": 3,
+            "obj_lin_vel":  3,
+            "obj_ang_vel":  3,
+        })
+    return layout
 
 # ============================================================
 # Assembly functions
@@ -277,6 +280,7 @@ def compute_sbto_components(
     obj_delta_pos_world = obj_w[..., :3] - obj_w[..., [ref_idx], :3]
     obj_delta_pos_local = batch_rotation(R_ref_inv, obj_delta_pos_world)
     obj_delta_xy = obj_delta_pos_local[..., :2]
+    obj_z = obj_w[..., 2:3]
 
     comps = {
         "joints": joints,
@@ -287,6 +291,7 @@ def compute_sbto_components(
         "obj_rel_pos": obj_rel_pos,
         "obj_rel_rot6d": obj_rel_rot6d,
         "obj_delta_xy": obj_delta_xy,
+        "obj_z": obj_z,
         "ee_rel_pos": ee_rel_pos,
     }
     
@@ -488,27 +493,22 @@ def reconstruct_sbto_trajectory(
     _, T, D = future_traj.shape
     has_vel = (D > 60) # Heuristic to detect if we have velocity layout (D=89 vs D=48)
     has_obj_delta_xy = (D > 48) # Heuristic to detect if we have obj_delta_xy (D=48 vs D=50)
-
+    has_obj_z = (D > 50) # Heuristic to detect if we have obj_z (D=50 vs D=51)
     # --------------------------------------------------
     # Feature indices
-    # --------------------------------------------------    
-    if has_vel:
-        FEATURE_MAP = FEATURE_LAYOUT_WITH_VEL
-    else:
-        FEATURE_MAP = FEATURE_LAYOUT_NO_VEL
-    
-    idx = 0
+    # --------------------------------------------------
+    FEATURE_MAP = build_feature_layout(has_vel, has_obj_delta_xy, has_obj_z)
+    indices = get_feature_indices(FEATURE_MAP)
 
-    # Layout: [joints(29), j_vel(29), d_xy(2), d_yaw(1), z(1), rot(6), ...]
-    IDX_DELTA_XY = slice(idx, idx+FEATURE_MAP["delta_xy"]); idx += FEATURE_MAP["delta_xy"]
-    IDX_DELTA_YAW = slice(idx, idx+FEATURE_MAP["delta_yaw"]); idx += FEATURE_MAP["delta_yaw"]
-    if has_obj_delta_xy:
-        IDX_OBJ_DELTA_XY = slice(idx, idx+FEATURE_MAP["obj_delta_xy"]); idx += FEATURE_MAP["obj_delta_xy"]
-    IDX_JOINTS = slice(idx, idx+FEATURE_MAP["joints"]); idx += FEATURE_MAP["joints"]
-    IDX_Z = idx; idx += FEATURE_MAP["body_z"]
-    IDX_ROT = slice(idx, idx+FEATURE_MAP["body_rot6d"]); idx += FEATURE_MAP["body_rot6d"]
-    IDX_OBJ_POS = slice(idx, idx+FEATURE_MAP["obj_rel_pos"]); idx += FEATURE_MAP["obj_rel_pos"]
-    IDX_OBJ_ROT = slice(idx, idx+FEATURE_MAP["obj_rel_rot6d"]); idx += FEATURE_MAP["obj_rel_rot6d"]
+    IDX_DELTA_XY     = indices["delta_xy"]
+    IDX_DELTA_YAW    = indices["delta_yaw"]
+    IDX_OBJ_DELTA_XY = indices.get("obj_delta_xy")          # None when absent
+    IDX_OBJ_Z        = indices.get("obj_z")                 # None when absent
+    IDX_JOINTS       = indices["joints"]
+    IDX_Z            = indices["body_z"].start               # integer — body_z is 1-D
+    IDX_ROT          = indices["body_rot6d"]
+    IDX_OBJ_POS      = indices["obj_rel_pos"]
+    IDX_OBJ_ROT      = indices["obj_rel_rot6d"]
 
     # --------------------------------------------------
     # Base world pose (anchor)
@@ -592,11 +592,11 @@ def reconstruct_sbto_trajectory(
     # Velocities (optional)
     # --------------------------------------------------
     if has_vel:
-        IDX_JOINTS_VEL = slice(idx, idx+FEATURE_MAP["joints_vel"]); idx += FEATURE_MAP["joints_vel"]
-        IDX_LIN_VEL = slice(idx, idx+FEATURE_MAP["body_lin_vel"]); idx += FEATURE_MAP["body_lin_vel"]
-        IDX_ANG_VEL = slice(idx, idx+FEATURE_MAP["body_ang_vel"]); idx += FEATURE_MAP["body_ang_vel"]
-        IDX_OBJ_LIN_VEL = slice(idx, idx+FEATURE_MAP["obj_lin_vel"]); idx += FEATURE_MAP["obj_lin_vel"]
-        IDX_OBJ_ANG_VEL = slice(idx, idx+FEATURE_MAP["obj_ang_vel"]); idx += FEATURE_MAP["obj_ang_vel"]
+        IDX_JOINTS_VEL  = indices["joints_vel"]
+        IDX_LIN_VEL     = indices["body_lin_vel"]
+        IDX_ANG_VEL     = indices["body_ang_vel"]
+        IDX_OBJ_LIN_VEL = indices["obj_lin_vel"]
+        IDX_OBJ_ANG_VEL = indices["obj_ang_vel"]
 
         traj_joints_vel = future_traj[:, :, IDX_JOINTS_VEL]
 

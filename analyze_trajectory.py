@@ -41,6 +41,7 @@ FEATURE_LAYOUT = {
     "delta_xy": 2,
     "delta_yaw": 1,
     "obj_delta_xy": 2,
+    "obj_z": 1,
     "joints": 29,
     "body_z": 1,
     "body_rot6d": 6,
@@ -50,6 +51,7 @@ FEATURE_LAYOUT = {
 
 FEATURE_GROUPS = {
     "locomotion": ["obj_delta_xy"],
+    "pick_place": ["obj_z"],
     "robot_pos": ["delta_xy", "delta_yaw", "body_z"],
     "object_pos": ["obj_rel_rot6d", "obj_rel_pos"],
     "pose_summary": ["joints", "body_rot6d"],

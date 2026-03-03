@@ -13,7 +13,7 @@ from einops.layers.torch import Rearrange
 import numpy as np
 from utils.configcls import Config
 
-from utils.math.sbto_utils import FEATURE_LAYOUT_NO_VEL, get_feature_indices
+from utils.math.sbto_utils import build_feature_layout, get_feature_indices
 
 # =========================
 # Conditioning Embeddings
@@ -187,16 +187,30 @@ class DFoTTrajectory(nn.Module):
                   f"keep_last={self.inbetweening_cfg.get('keep_last_partial', False)}")
 
         # Build feature index map from data config's feature_order
+        _layout = build_feature_layout()
         self.feature_index_map = {}
         fidx = 0
         for key in data_config.get("feature_order", []):
-            dim = FEATURE_LAYOUT_NO_VEL.get(key, 0)
+            dim = _layout.get(key, 0)
             if dim > 0:
                 self.feature_index_map[key] = slice(fidx, fidx + dim)
                 fidx += dim
 
         # Build feature group slices for partial masking
         partial_cfg = self.inbetweening_cfg.get("partial_masking", {})
+
+        # Register joints sub-slices (joints_lower, joints_upper) so they can
+        # be referenced as independent feature groups in the config.
+        # joints_split: number of leading joint dims treated as "lower body".
+        # Default: 12 (6 left-leg + 6 right-leg DOFs come first in the G1 layout).
+        joints_split = partial_cfg.get("joints_split", None)
+        if joints_split is not None and "joints" in self.feature_index_map:
+            j_sl = self.feature_index_map["joints"]
+            self.feature_index_map["joints_lower"] = slice(j_sl.start,
+                                                            j_sl.start + joints_split)
+            self.feature_index_map["joints_upper"] = slice(j_sl.start + joints_split,
+                                                            j_sl.stop)
+
         self.feature_group_slices = {}
         for group_name, keys in partial_cfg.get("feature_groups", {}).items():
             slices = []
@@ -977,7 +991,7 @@ class DFoTTrajectory(nn.Module):
                             )
                 
             if inpaint:
-                f_map = get_feature_indices(FEATURE_LAYOUT_NO_VEL)
+                f_map = get_feature_indices(build_feature_layout())
                 xs_pred[..., 0, f_map['joints']] = self.state_cond[..., 0, :29]
                 xs_pred[..., 0, f_map['body_z']] = self.state_cond[..., 0, 29:30]
                 xs_pred[..., 0, f_map['body_rot6d']] = self.state_cond[..., 0, 30:36]

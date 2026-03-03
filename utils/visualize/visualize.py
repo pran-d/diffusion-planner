@@ -351,7 +351,8 @@ class DiffusionOverlayVisualizer:
         guidance_vec: np.ndarray = None,
         world_goal_pos: np.ndarray = None, 
         world_goal_quat: np.ndarray = None,
-        spacing: float = 1
+        spacing: float = 1,
+        ref_start_idx: int = -1,
     ):
         """
         Visualizes multiple trajectories simultaneously using a repeated-robot XML scene.
@@ -404,11 +405,59 @@ class DiffusionOverlayVisualizer:
             else:
                 arrow_mocap_ids.append(-1)
 
-        with mujoco.viewer.launch_passive(mj_model_rep, mj_data_rep) as viewer:
+        # ── Recolour reference robots so they stand out ───────────────────────
+        # Robots with index >= ref_start_idx are ground-truth; colour them
+        # sky-blue so they are visually distinct from the generated trajectories.
+        # We must also clear the material assignment (geom_matid = -1) because
+        # MuJoCo prioritises material rgba over geom_rgba.
+        if ref_start_idx >= 0:
+            _ref_rgba = np.array([0.25, 0.75, 0.95, 0.85], dtype=np.float32)
+            _recoloured = 0
+            for _gid in range(mj_model_rep.ngeom):
+                _bid   = mj_model_rep.geom_bodyid[_gid]
+                _bname = mujoco.mj_id2name(
+                    mj_model_rep, mujoco.mjtObj.mjOBJ_BODY, _bid
+                ) or ""
+                # Body names end with _<robot_index>, e.g. "pelvis_3"
+                _parts = _bname.rsplit('_', 1)
+                if (len(_parts) == 2 and _parts[1].isdigit()
+                        and int(_parts[1]) >= ref_start_idx):
+                    mj_model_rep.geom_rgba[_gid]  = _ref_rgba
+                    mj_model_rep.geom_matid[_gid] = -1   # disable material so rgba is used
+                    _recoloured += 1
+            print(f"Recoloured {_recoloured} geoms for reference robots.")
+            print(f"Colour legend:  robots 0–{ref_start_idx-1} = generated (default)  "
+                  f"| robots {ref_start_idx}–{num_to_show-1} = ground-truth (sky-blue)")
+
+        # ── Playback state (mutable dicts so the key callback closure can write) ──
+        _paused   = {"active": False}
+        _step_req = {"delta": 0}
+        _restart  = {"active": False}
+
+        def _key_callback(keycode: int):
+            if keycode == 32:       # Space  → toggle pause
+                _paused["active"] = not _paused["active"]
+            elif keycode == 262:    # Right  → step forward  (auto-pauses)
+                _step_req["delta"] = 1
+                _paused["active"] = True
+            elif keycode == 263:    # Left   → step backward (auto-pauses)
+                _step_req["delta"] = -1
+                _paused["active"] = True
+            elif keycode == 82:     # 'R'    → restart
+                _restart["active"] = True
+
+        with mujoco.viewer.launch_passive(mj_model_rep, mj_data_rep,
+                                          key_callback=_key_callback) as viewer:
             
             step = 0
+            print("Controls:  Space=pause  ←/→=step  R=restart")
             while viewer.is_running():
-                
+
+                # ── Handle restart request ────────────────────────────────
+                if _restart["active"]:
+                    step = 0
+                    _restart["active"] = False
+
                 n_cols = int(np.ceil(np.sqrt(num_to_show)))
                 
                 # 1. Update Robot/Object States using OFFSETS
@@ -442,9 +491,12 @@ class DiffusionOverlayVisualizer:
                     x_offset = row * spacing
                     y_offset = col * spacing
                     
+                    # Skip goal markers and arrows for reference (ground-truth) robots
+                    _is_ref = (ref_start_idx >= 0 and i >= ref_start_idx)
+
                     # --- Goal Marker ---
                     mid_g = goal_mocap_ids[i]
-                    if mid_g >= 0:
+                    if mid_g >= 0 and not _is_ref:
                         if world_goal_pos is not None:
                             # Support (B, 3) or (3,)
                             gp = world_goal_pos[i] if (world_goal_pos.ndim > 1 and i < len(world_goal_pos)) else world_goal_pos.flatten()
@@ -460,7 +512,7 @@ class DiffusionOverlayVisualizer:
                             
                     # --- Arrow ---
                     mid_a = arrow_mocap_ids[i]
-                    if mid_a >= 0 and guidance_vec is not None:
+                    if mid_a >= 0 and guidance_vec is not None and not _is_ref:
                          # Get object pos from modified qpos
                          if nq_single >= 39:
                              # 36:39 is typically object root pos
@@ -495,11 +547,21 @@ class DiffusionOverlayVisualizer:
                 viewer.sync()
                 
                 time.sleep(timestep_delay)
-                
-                step += 1
-                if step >= T_len:
-                    if loop:
-                        step = 0
-                        time.sleep(0.5)
+
+                # ── Frame advance ─────────────────────────────────────────
+                if _paused["active"]:
+                    if _step_req["delta"] != 0:
+                        step = (step + _step_req["delta"]) % T_len
+                        _step_req["delta"] = 0
                     else:
-                        step = T_len - 1
+                        time.sleep(0.05)
+                        continue
+                else:
+                    step += 1
+                    if step >= T_len:
+                        if loop:
+                            step = 0
+                            time.sleep(0.5)
+                        else:
+                            step = T_len - 1
+                            _paused["active"] = True

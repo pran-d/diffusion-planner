@@ -40,7 +40,7 @@ class FlexibleWindowDataset(Dataset):
         self.normalization_type = config.get("normalization_type", "mean_std")  # 'mean_std' or 'min_max'
         self.feature_order = config.get("feature_order", 
                 [
-                    "delta_xy", "delta_yaw", "obj_delta_xy",
+                    "delta_xy", "delta_yaw", "obj_delta_xy", "obj_z",
                     "joints", "body_z", "body_rot6d", 
                     "obj_rel_pos", "obj_rel_rot6d",
                 ]

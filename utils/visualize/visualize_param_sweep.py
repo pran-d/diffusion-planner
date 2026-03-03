@@ -12,7 +12,8 @@ from models.model import RobotDiffuser
 from datasets.flexible_dataset import FlexibleWindowDataset, yaw_to_rot_matrix, yaw_from_quat
 from utils.data.load_dataset import preload_dataset
 from utils.math.sbto_utils import reconstruct_sbto_trajectory, compute_task_params
-from inference import build_inference_waypoints
+from utils.visualize.visualize import MjVisualizer
+from inference import build_inference_waypoints, DEFAULT_LIFT_HEIGHT, run_visualization
 
 def update_condition(dataset, robot_world_history, obj_world_history, final_obj_pos=None):
     """
@@ -112,10 +113,20 @@ def parse_args():
 
     # Waypoint arguments
     parser.add_argument("--last_frame_waypoint", action="store_true",
-                        help="Add partial waypoint at last frame (obj_delta_xy) when inbetweening is enabled")
+                        help="Add partial waypoint at last frame (obj_delta_xy + obj_z absolute) when inbetweening is enabled")
     parser.add_argument("--arrival_ratio", type=float, default=0.85,
                         help="Object arrives in this fraction of remaining time (0-1)")
-    
+    parser.add_argument("--lift_height", type=float, default=DEFAULT_LIFT_HEIGHT,
+                        help=f"Peak lift height in meters for pick-and-place z profile (default: {DEFAULT_LIFT_HEIGHT}m)")
+    parser.add_argument("--lift_start", type=float, default=0.0, help="Fraction of trajectory where lift begins (0=immediately)")
+    parser.add_argument("--lift_end", type=float, default=0.20, help="Fraction of trajectory where lift reaches peak")
+    parser.add_argument("--walk_start_z", type=float, default=0.80,
+                        help="Gate XY motion: don't walk until z >= this fraction of lift_height (default: 0.80)")
+    parser.add_argument("--no_lower_dist", type=float, default=0.5,
+                        help="Lower z when remaining XY distance drops below this value in metres (default: 0.5m)")
+    parser.add_argument("--visualize", action="store_true",
+                        help="Render generated trajectories in MuJoCo after evaluation")
+
     return parser.parse_args()
 
 def run_evaluation_batch(
@@ -141,7 +152,8 @@ def run_evaluation_batch(
         max_stitch_steps = max(stitch_steps_list)
         print(f"Using max stitch_steps {max_stitch_steps} for this batch.")
     elif args.stitch_steps is None:
-        max_stitch_steps = dataset.traj_lengths[args.sample_idx] // diffuser.input_size
+        _eff = diffuser.input_size - 1  # t=0 always skipped; each window yields (T-1) frames
+        max_stitch_steps = (dataset.traj_lengths[args.sample_idx] + _eff - 1) // _eff
         print(f"Auto-setting stitch_steps to {max_stitch_steps} based on dataset length.")
     else:
         max_stitch_steps = args.stitch_steps
@@ -156,15 +168,39 @@ def run_evaluation_batch(
 
     generated_segments = []
 
-    # Check if waypoints should be used
-    use_waypoints = (
-        getattr(args, 'last_frame_waypoint', False)
-        and hasattr(diffuser, 'model')
+    # Physical-consistency sanity check (task-agnostic).
+    _FLOOR_Z        = -0.1   # robot/object z below this → ground penetration
+    _MAX_ROBOT_STEP = 0.1    # max robot pelvis XY step per frame at 100 Hz (m)
+    _MAX_OBJ_STEP   = 0.2    # max object XY step per frame at 100 Hz (m)
+    _prev_robot_xyz = anchors_dict['ref_pos'][:, :3].copy()    # (N, 3)
+    _prev_obj_xyz   = anchors_dict['ref_obj_pos'][:, :3].copy() # (N, 3)
+
+    # Per-trajectory goal-stop state
+    enable_goal_stop     = getattr(args, 'enable_goal_stop', True)
+    enable_physics_stop  = getattr(args, 'enable_physics_stop', True)
+    goal_stop_threshold  = getattr(args, 'goal_stop_threshold', 0.1)
+    goal_reached         = np.zeros(num_samples, dtype=bool)
+    _goal_last_frame     = np.zeros((num_samples, 43), dtype=np.float64)
+
+    # Waypoint config: always build first-frame keyframe when inbetweening is enabled
+    # (matches inference.py which calls build_inference_waypoints unconditionally).
+    # use_last_frame_wp controls whether the *last*-frame partial waypoint is also added.
+    inbetweening_active = (
+        hasattr(diffuser, 'model')
         and getattr(diffuser.model, 'inbetweening_enabled', False)
     )
+    use_last_frame_wp = getattr(args, 'last_frame_waypoint', False)
     arrival_ratio = getattr(args, 'arrival_ratio', 0.85)
+    lift_height = getattr(args, 'lift_height', DEFAULT_LIFT_HEIGHT)
+    no_lower_dist = getattr(args, 'no_lower_dist', 0.5)
+    lift_start = getattr(args, 'lift_start', 0.0)
+    lift_end = getattr(args, 'lift_end', 0.20)
+    walk_start_z = getattr(args, 'walk_start_z', 0.80)
     num_features = dataset.num_features
     window_size = dataset.window_size
+
+    # Episode-start object z — absolute baseline for z-waypoint targeting.
+    _rest_obj_z_np = anchors_dict['ref_obj_pos'][:, 2].copy()  # (N,)
 
     for step in range(max_stitch_steps):
         # --------------------------------------------------------
@@ -214,21 +250,35 @@ def run_evaluation_batch(
             batch_state = curr_state_tens[b_start:b_end] if curr_state_tens is not None else None
             batch_task = gt_task_tens[b_start:b_end]
 
-            # Build waypoints for this batch slice
+            # Build waypoints: always provide t=0 keyframe when inbetweening is active;
+            # optionally also add the last-frame partial waypoint.
             wv, wm = None, None
-            if use_waypoints and batch_state is not None:
+            if inbetweening_active and batch_state is not None:
                 remaining = max(max_stitch_steps - step, 1)
                 batch_raw_task = torch.from_numpy(raw_task_arr[b_start:b_end]).float()
+                _current_obj_z_b = torch.from_numpy(
+                    current_anchors['ref_obj_pos'][b_start:b_end, 2].astype(np.float32)
+                )
+                _rest_obj_z_b = torch.from_numpy(
+                    _rest_obj_z_np[b_start:b_end].astype(np.float32)
+                )
                 wv, wm = build_inference_waypoints(
-                    batch_state.to(),
+                    batch_state,
                     batch_raw_task,
                     dataset,
                     num_features,
                     window_size,
-                    use_last_frame_wp=True,
+                    use_last_frame_wp=use_last_frame_wp,
                     stitch_steps=max_stitch_steps,
                     remaining_steps=remaining,
                     arrival_ratio=arrival_ratio,
+                    lift_height=lift_height,
+                    no_lower_dist=no_lower_dist,
+                    lift_start=lift_start,
+                    lift_end=lift_end,
+                    walk_start_z=walk_start_z,
+                    current_obj_z=_current_obj_z_b,
+                    rest_obj_z=_rest_obj_z_b,
                 )
             
             sample = diffuser.getSample(
@@ -270,8 +320,13 @@ def run_evaluation_batch(
                 )
 
             if args.action_horizon is not None:
+                robot_world = robot_world[:, 1:, :]  # skip t=0 then apply horizon
+                obj_world   = obj_world[:, 1:, :]
                 robot_world = robot_world[:, :args.action_horizon, :]
                 obj_world = obj_world[:, :args.action_horizon, :]
+            else:
+                robot_world = robot_world[:, 1:, :]  # skip t=0 (anchored to current state)
+                obj_world   = obj_world[:, 1:, :]
 
             # Store (B, T, D)
             segment = np.concatenate([robot_world[..., :36], obj_world[..., :7]], axis=-1)
@@ -279,8 +334,85 @@ def run_evaluation_batch(
             
         # Concatenate batches for this step
         full_step_segment = np.concatenate(step_segments, axis=0) # (N, T, D)
+
+        # ── Physical-consistency check ─────────────────────────────────────────
+        _rxy   = full_step_segment[:, :, :2]
+        _rz    = full_step_segment[:, :, 2]
+        _oxy   = full_step_segment[:, :, 36:38]
+        _oz    = full_step_segment[:, :, 38]
+        _rxy_p = np.concatenate([_prev_robot_xyz[:, None, :2], _rxy[:, :-1, :]], axis=1)
+        _oxy_p = np.concatenate([_prev_obj_xyz[:, None, :2],   _oxy[:, :-1, :]], axis=1)
+        _floor   = (_rz < _FLOOR_Z) | (_oz < _FLOOR_Z)
+        _rspike  = np.linalg.norm(_rxy - _rxy_p, axis=-1) > _MAX_ROBOT_STEP
+        _ospike  = np.linalg.norm(_oxy - _oxy_p, axis=-1) > _MAX_OBJ_STEP
+        _bad_t   = np.where((_floor | _rspike | _ospike).any(axis=0))[0]
+        _phys_stop = enable_physics_stop and _bad_t.size > 0
+        if _phys_stop:
+            _t_bad   = int(_bad_t[0])
+            _t_clamp = max(_t_bad, 1)
+            _last_ok = full_step_segment[:, _t_clamp - 1 : _t_clamp, :]
+            full_step_segment = full_step_segment.copy()
+            full_step_segment[:, _t_clamp:, :] = _last_ok
+            print(f"[physics] step {step+1}: violation at frame {_t_bad} "
+                  f"(floor={bool(_floor.any(0)[_t_bad])}, "
+                  f"robot_spike={bool(_rspike.any(0)[_t_bad])}, "
+                  f"obj_spike={bool(_ospike.any(0)[_t_bad])}). Truncating and halting.")
+        # ──────────────────────────────────────────────────────────────────────
+
+        # ── Per-trajectory goal-stop ──────────────────────────────────────────
+        if enable_goal_stop:
+            # 1. Overwrite segments for trajectories that already reached goal
+            if goal_reached.any():
+                _seg_T = full_step_segment.shape[1]
+                full_step_segment = full_step_segment.copy()
+                for _di in np.where(goal_reached)[0]:
+                    full_step_segment[_di] = np.tile(_goal_last_frame[_di], (_seg_T, 1))
+
+            # 2. Detect trajectories reaching goal at the end of this segment
+            _obj_end  = full_step_segment[:, -1, 36:39]              # (N, 3)
+            _goal_3d  = current_anchors['final_obj_pos'][:, :3]      # (N, 3)
+            _goal_err = np.linalg.norm(_obj_end - _goal_3d, axis=-1) # (N,)
+            _newly_reached = (~goal_reached) & (_goal_err < goal_stop_threshold)
+            if _newly_reached.any():
+                for _ni in np.where(_newly_reached)[0]:
+                    _goal_last_frame[_ni] = full_step_segment[_ni, -1, :]
+                goal_reached |= _newly_reached
+                print(f"[goal] step {step+1}: traj {np.where(_newly_reached)[0].tolist()} "
+                      f"reached goal (err={_goal_err[_newly_reached].round(4).tolist()})")
+        # ─────────────────────────────────────────────────────────────────────
+
         generated_segments.append(full_step_segment)
-        
+
+        # Update per-window position trackers for spike detection at next boundary
+        _prev_robot_xyz = full_step_segment[:, -1, :3].copy()
+        _prev_obj_xyz   = full_step_segment[:, -1, 36:39].copy()
+
+        if _phys_stop:
+            _steps_to_pad = max_stitch_steps - step - 1
+            if _steps_to_pad > 0:
+                _last_frame = full_step_segment[:, -1:, :]
+                _seg_T      = full_step_segment.shape[1]
+                _pad_seg    = np.repeat(_last_frame, _seg_T, axis=1)
+                for _ in range(_steps_to_pad):
+                    generated_segments.append(_pad_seg)
+            break
+
+        # ── Early-exit when all trajectories have reached their goal ──────────
+        if enable_goal_stop and goal_reached.all():
+            _steps_to_pad = max_stitch_steps - step - 1
+            if _steps_to_pad > 0:
+                _seg_T   = full_step_segment.shape[1]
+                _all_pad = np.stack([
+                    np.tile(_goal_last_frame[_i], (_seg_T, 1))
+                    for _i in range(num_samples)
+                ])
+                for _ in range(_steps_to_pad):
+                    generated_segments.append(_all_pad.copy())
+                print(f"[goal] All {num_samples} trajectories reached goal after step "
+                      f"{step+1}. Padding {_steps_to_pad} remaining steps.")
+            break
+        # ─────────────────────────────────────────────────────────────────────
+
         # Update Condition for next step
         if step < max_stitch_steps - 1:
             # We need to update curr_state_tens and current_anchors
@@ -319,7 +451,7 @@ def run_evaluation_batch(
         end_pt = obj_traj_w[i, -1, :3]
         final_displacements.append(end_pt - start_pt)
 
-    return obj_traj_w, np.stack(final_displacements)
+    return full_traj, obj_traj_w, np.stack(final_displacements)
 
 def plot_trajectories(obj_traj_w, anchors, save_path, title):
     """
@@ -353,6 +485,29 @@ def plot_trajectories(obj_traj_w, anchors, save_path, title):
     plt.grid(True)
     plt.savefig(save_path)
     print(f"Trajectory plot saved to {save_path}")
+
+def to_ego_frame(world_pts, start_obj_pos, start_robot_quat):
+    """Transform world XY points into ego-frame displacement (centred on object start,
+    rotated into robot heading frame).  Works per-sample: each sample i is independently
+    centred and rotated.
+
+    Args:
+        world_pts:        (N, T, 2) or (N, 2)
+        start_obj_pos:    (N, 2) or (N, 3)  — object position at t=0
+        start_robot_quat: (N, 4)            — robot base quaternion at t=0
+    Returns:
+        (N, T, 2) ego-frame XY
+    """
+    if world_pts.ndim == 2:
+        world_pts = world_pts[:, None, :]  # (N, 1, 2)
+    diff = world_pts - start_obj_pos[:, None, :2]  # (N, T, 2)
+    q_t  = torch.from_numpy(np.asarray(start_robot_quat)).float()
+    yaw  = yaw_from_quat(q_t).view(-1).numpy()     # (N,)
+    c, s = np.cos(-yaw), np.sin(-yaw)
+    x, y = diff[..., 0], diff[..., 1]
+    return np.stack([c[:, None] * x - s[:, None] * y,
+                     s[:, None] * x + c[:, None] * y], axis=-1)
+
 
 def maximize_window(plot_title=""):
     mng = plt.get_current_fig_manager()
@@ -395,8 +550,16 @@ def main():
     )
     diffuser.loadWeights(args.epoch)
 
-    # --------------------------------------------------------
-    # Dataset Tasks Evaluation (In-Distribution, With State Cond)
+    # MuJoCo visualizer (created once, reused for all visualizations)
+    vis = None
+    if args.visualize:
+        xml_path = "mj_model.xml"
+        if not os.path.exists(xml_path):
+            xml_path = os.path.join(data_path, "mj_model.xml")
+        if os.path.exists(xml_path):
+            vis = MjVisualizer(xml_path, close_on_enter=False)
+        else:
+            print(f"Warning: mj_model.xml not found at '{xml_path}', --visualize disabled.")
     # --------------------------------------------------------
     if args.num_dataset_tasks > 0:
         print(f"\nExample Dataset Tasks: {args.num_dataset_tasks} samples")
@@ -452,7 +615,7 @@ def main():
         dummy_task = torch.zeros(args.num_dataset_tasks, data_cfg["num_task_params"])
         
         # Run Eval
-        traj_w, gen_displacements = run_evaluation_batch(
+        full_traj_ds, traj_w, gen_displacements = run_evaluation_batch(
             args, diffuser, dataset, device, 
             initial_states, dummy_task, anchors_arr, 
             use_state_cond=True, desc="Dataset Eval",
@@ -487,6 +650,18 @@ def main():
         # Plot Trajectories
         if args.num_dataset_tasks <= 50:
             plot_trajectories(traj_w, anchors_arr, "eval_dataset_trajs.png", "In-Distribution Trajectories")
+
+        # MuJoCo visualization
+        if vis is not None:
+            N_vis = len(full_traj_ds)
+            print(f"Visualizing {N_vis} dataset trajectories in MuJoCo (press Enter to advance)...")
+            for i in range(N_vis):
+                print(f"  Trajectory {i+1}/{N_vis}")
+                run_visualization(vis, full_traj_ds[i:i+1],
+                                  final_obj_pos=anchors_arr['final_obj_pos'][i:i+1])
+
+        _ds_traj_w_cache  = traj_w
+        _ds_anchors_cache = anchors_arr
 
     # --------------------------------------------------------
     # OOD Tasks Evaluation (Random Goals, State Cond OFF)
@@ -541,7 +716,7 @@ def main():
         dummy_task = torch.zeros(args.num_ood_tasks, data_cfg["num_task_params"])
         
         # Run Eval with use_state_cond=FALSE
-        traj_w, gen_displacements = run_evaluation_batch(
+        full_traj_ood, traj_w, gen_displacements = run_evaluation_batch(
             args, diffuser, dataset, device, 
             initial_states, dummy_task, anchors_arr, 
             use_state_cond=False, desc="OOD Eval",
@@ -568,6 +743,15 @@ def main():
         # Plot Trajectories
         if args.num_ood_tasks <= 50:
             plot_trajectories(traj_w, anchors_arr, "eval_ood_trajs.png", "OOD Trajectories (No State Cond)")
+
+        # MuJoCo visualization
+        if vis is not None:
+            N_vis = len(full_traj_ood)
+            print(f"Visualizing {N_vis} OOD trajectories in MuJoCo (press Enter to advance)...")
+            for i in range(N_vis):
+                print(f"  Trajectory {i+1}/{N_vis}")
+                run_visualization(vis, full_traj_ood[i:i+1],
+                                  final_obj_pos=anchors_arr['final_obj_pos'][i:i+1])
 
     # --------------------------------------------------------
     # Goal Multiplier Sweep
@@ -626,12 +810,20 @@ def main():
 
             dummy_task = torch.zeros(N, data_cfg["num_task_params"])
 
-            traj_w, gen_disp = run_evaluation_batch(
+            full_traj_mult, traj_w, gen_disp = run_evaluation_batch(
                 args, diffuser, dataset, device,
                 base_states_t.clone(), dummy_task, scaled_anchors,
                 use_state_cond=True, desc=f"Multiplier {mult}",
                 stitch_steps_list=base_stitch_list * int(mult),
             )
+
+            # MuJoCo visualization for this multiplier
+            if vis is not None:
+                N_vis = len(full_traj_mult)
+                print(f"  Visualizing {N_vis} trajectories for multiplier {mult} (press Enter to advance)...")
+                for i in range(N_vis):
+                    run_visualization(vis, full_traj_mult[i:i+1],
+                                      final_obj_pos=scaled_anchors['final_obj_pos'][i:i+1])
 
             scaled_gt = base_gt_deltas * mult  # expected delta at this multiplier
             gen_d = gen_disp[:, :data_cfg["num_task_params"]]
@@ -640,43 +832,10 @@ def main():
             sweep_results[mult] = (gen_d, traj_w, errs, scaled_gt)
 
         # ---- Combined Trajectory + Target Plot (single image) ----
-        # Plot relative to robot frame
+        # Plot relative to robot ego frame (see module-level to_ego_frame)
         n_mult = len(multipliers)
         cmap = cm.get_cmap("tab10", n_mult)
         mult_colors = {m: cmap(i) for i, m in enumerate(multipliers)}
-
-        # Helper to transform world points to ego-relative displacement
-        def to_ego_frame(world_pts, start_obj_pos, start_robot_quat):
-            # world_pts: (N, T, 2) or (N, 2)
-            # start_obj_pos: (N, 2)
-            # start_robot_quat: (N, 4)
-            if world_pts.ndim == 2:
-                world_pts = world_pts[:, None, :] # (N, 1, 2)
-            
-            # 1. Translation relative to object start (displacement)
-            diff = world_pts - start_obj_pos[:, None, :2] # (N, T, 2)
-
-            # 2. Rotation into robot frame
-            # Using torch for robust yaw extraction (consistent with model)
-            q_t = torch.from_numpy(start_robot_quat).float()
-            
-            # Check shape of q_t. Ensure it is correct for yaw_from_quat
-            # Assuming yaw_from_quat is robust to [x,y,z,w] vs [w,x,y,z] if it's the one from flexible_dataset
-            yaw = yaw_from_quat(q_t) # (N,) or (N, 1)
-            yaw = yaw.view(-1).numpy()
-
-            # Rotate by -yaw to get into ego frame
-            # The rotation matrix from Body to World is R(yaw).
-            # We want World to Body (Displacement), so R(-yaw).
-            c = np.cos(-yaw)
-            s = np.sin(-yaw)
-            
-            x = diff[..., 0]
-            y = diff[..., 1]
-            new_x = c[:, None] * x - s[:, None] * y
-            new_y = s[:, None] * x + c[:, None] * y
-            
-            return np.stack([new_x, new_y], axis=-1)
 
         base_ref_obj = np.stack(base_anchors['ref_obj_pos'])[:, :2] # (N, 2)
         base_ref_quat = np.stack(base_anchors['ref_quat']) # (N, 4)
@@ -770,6 +929,81 @@ def main():
         fig_curve.savefig("eval_goal_multiplier_curve.png", dpi=150)
         print(f"Saved error curve to eval_goal_multiplier_curve.png")
 
+        _sweep_results      = sweep_results
+        _sweep_base_anchors = base_anchors
+        _sweep_base_gt      = base_gt_deltas
+
+    # --------------------------------------------------------
+    # Combined dataset + goal-multiplier sweep plot
+    # --------------------------------------------------------
+    if _ds_traj_w_cache is not None and _sweep_results is not None:
+        print("\nGenerating combined dataset + sweep plot...")
+        base_ref_obj_ds  = _ds_anchors_cache['ref_obj_pos']  # (N_ds, 3)
+        base_ref_quat_ds = _ds_anchors_cache['ref_quat']     # (N_ds, 4)
+        N_ds = len(_ds_traj_w_cache)
+
+        # Dataset trajectories in ego frame
+        ds_traj_ego = to_ego_frame(
+            _ds_traj_w_cache[:, :, :2], base_ref_obj_ds, base_ref_quat_ds)
+        ds_goal_world = _ds_anchors_cache['final_obj_pos'][:, :2]  # (N_ds, 2)
+        ds_goal_ego   = to_ego_frame(ds_goal_world, base_ref_obj_ds, base_ref_quat_ds).squeeze(1)
+
+        # Sweep trajectories in ego frame (use sweep's own base anchors)
+        base_ref_obj_sw  = np.stack(_sweep_base_anchors['ref_obj_pos'])[:, :2]
+        base_ref_quat_sw = np.stack(_sweep_base_anchors['ref_quat'])
+
+        fig_comb, ax_comb = plt.subplots(1, 1, figsize=(12, 12))
+        ax_comb.scatter([0], [0], marker='o', s=120, c='black', zorder=10, label='obj start')
+
+        # Dataset trajectories (grey)
+        for i in range(N_ds):
+            path = ds_traj_ego[i]        # (T, 2)
+            ax_comb.plot(path[:, 0], path[:, 1], color='grey', alpha=0.45,
+                         linewidth=1.0, label='dataset' if i == 0 else None)
+            ax_comb.scatter(ds_goal_ego[i, 0], ds_goal_ego[i, 1],
+                            marker='*', s=80, c='grey', edgecolors='white', linewidths=0.5,
+                            zorder=7, label='dataset goal' if i == 0 else None)
+
+        # Sweep trajectories
+        n_mult = len(_sweep_results)
+        cmap_comb = cm.get_cmap('tab10', max(n_mult, 1))
+        for ci, mult in enumerate(sorted(_sweep_results.keys())):
+            color = cmap_comb(ci)
+            _, traj_w_sw, errs, _ = _sweep_results[mult]
+            traj_ego_sw = to_ego_frame(traj_w_sw[:, :, :2],
+                                        base_ref_obj_sw, base_ref_quat_sw)
+            targets_world = base_ref_obj_sw + mult * _sweep_base_gt[:, :2]
+            target_ego_sw = to_ego_frame(targets_world, base_ref_obj_sw,
+                                          base_ref_quat_sw).squeeze(1)
+            for i in range(len(traj_ego_sw)):
+                ax_comb.plot(traj_ego_sw[i, :, 0], traj_ego_sw[i, :, 1],
+                             color=color, alpha=0.6, linewidth=1.4,
+                             label=f'sweep ×{mult} (err={np.mean(errs):.3f})' if i == 0 else None)
+            ax_comb.scatter(target_ego_sw[:, 0], target_ego_sw[:, 1],
+                            marker='*', s=100, c=[color], edgecolors='black',
+                            linewidths=0.5, zorder=8)
+
+        all_pts = np.concatenate([ds_traj_ego.reshape(-1, 2), ds_goal_ego], axis=0)
+        max_d = np.max(np.linalg.norm(all_pts, axis=-1)) * 1.15 + 0.1
+        ax_comb.set_xlim(-max_d, max_d)
+        ax_comb.set_ylim(-max_d, max_d)
+        ax_comb.set_xlabel('Forward (Robot Frame)')
+        ax_comb.set_ylabel('Left (Robot Frame)')
+        ax_comb.set_title('Dataset Trajectories + Goal-Multiplier Sweep (Ego Frame)')
+        ax_comb.set_aspect('equal')
+        ax_comb.grid(True, alpha=0.3)
+        handles, labels = ax_comb.get_legend_handles_labels()
+        seen = {}; dedup_h, dedup_l = [], []
+        for h, l in zip(handles, labels):
+            if l not in seen:
+                seen[l] = True; dedup_h.append(h); dedup_l.append(l)
+        ax_comb.legend(dedup_h, dedup_l, fontsize=8, ncol=2, loc='upper left')
+        fig_comb.tight_layout()
+        fig_comb.savefig('eval_combined.png', dpi=150)
+        print('Combined plot saved to eval_combined.png')
+
+    if vis is not None:
+        vis.close()
 
 if __name__ == "__main__":
     main()

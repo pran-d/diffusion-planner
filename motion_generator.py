@@ -16,7 +16,7 @@ from scipy.ndimage import gaussian_filter1d
 
 from config.configure import load_config, get_data_path, get_save_path, get_norm_path
 from models.model import RobotDiffuser
-from datasets.buffer_dataset import BufferDataset
+from datasets.flexible_dataset import FlexibleWindowDataset
 from utils.math.sbto_utils import reconstruct_sbto_trajectory, compute_task_params
 from utils.math.math_tools import yaw_from_quat, yaw_to_rot_matrix
 
@@ -54,7 +54,7 @@ def compute_dataset_weights(dataset, sigma=0.2):
     for f, b in tqdm(unique_traj_keys, desc="Extracting Task Params"):
         raw = dataset._get_single_traj(f, b)
         
-        # BufferDataset check: if 'obj' is missing
+        # FlexibleWindowDataset: if 'obj' is missing
         if 'task_params' in raw:
              tp_raw = raw['task_params']
         elif 'obj' in raw and 'base' in raw:
@@ -163,16 +163,16 @@ class MotionGenerator:
             # Create a tiny single-step buffer just to bootstrap the dataset object
             # so we can use its normalize/denormalize/feature logic.
             dummy_buffer = {
-                'base_xyz_quat': np.zeros((1, 2, 7)),
-                'actuator_pos': np.zeros((1, 2, 29)),
-                'obj_0_xyz_quat': np.zeros((1, 2, 7)),
+                'base': np.zeros((1, 2, 7)),
+                'joints': np.zeros((1, 2, 29)),
+                'obj': np.zeros((1, 2, 7)),
             }
-            self.dataset = BufferDataset(
+            self.dataset = FlexibleWindowDataset(
                 data_buffer=dummy_buffer,
                 config=self.data_cfg,
-                calculate_stats=False,
                 norm_path=norm_path,
-                noise_cfg={},
+                calculate_stats=False,
+                training_cfg={},
             )
 
     def fit(self, 
@@ -212,15 +212,13 @@ class MotionGenerator:
              else:
                  print("Epochs=0 but no stats found at {norm_path}. Recalculating stats from data_source.")
         
-        self.dataset = BufferDataset(
+        self.dataset = FlexibleWindowDataset(
             data_buffer=data_source,
             task_params=task_params,
             config=self.data_cfg, 
             calculate_stats=calc_stats, 
-            norm_path=norm_path, # will overwrite if provided
-            noise_cfg=self.training_cfg.get("state_conditioning_noise_level", {}),
-            add_noise=self.training_cfg.get("add_obs_noise", False), 
-            add_goal_noise=self.training_cfg.get("add_goal_noise", False)
+            norm_path=norm_path,
+            training_cfg=self.training_cfg,
         )
         # Task Density Balancing
         sampler = None
@@ -528,7 +526,9 @@ class MotionGenerator:
                             stitch_steps: int = None, 
                             num_samples: int = 1,
                             cfg_w: float = 1.25,
-                            end_error_threshold: float = 0.1):
+                            end_error_threshold: float = 0.1,
+                            enable_goal_stop: bool = True,
+                            enable_physics_stop: bool = True):
         """
         Generate trajectory via autoregressive diffusion (mirrors inference.py).
         
@@ -545,7 +545,14 @@ class MotionGenerator:
             num_samples: Number of parallel samples **per input condition**.
                          When input is already batched (B > 1), set to 1.
             cfg_w: Classifier-free guidance weight.
-            end_error_threshold: Stop stitching early if goal reached within this L2 error.
+            end_error_threshold: Stop stitching early if goal reached within this L2 error
+                                 (per trajectory). Only used when enable_goal_stop=True.
+            enable_goal_stop: If True, each trajectory independently stops generating and
+                              pads once its goal is reached within end_error_threshold.
+                              Set to False to always run the full stitch_steps.
+            enable_physics_stop: If True, truncate and pad when a physical consistency
+                                 violation is detected (ground penetration / position spike).
+                                 Set to False to continue generating regardless.
             
         Returns:
             np.ndarray of shape (B * num_samples, T_total, D) where D = 36 (robot) + 7 (object).
@@ -560,8 +567,9 @@ class MotionGenerator:
 
         # --- Auto-compute stitch_steps from target trajectory length ---
         if stitch_steps is None:
-            if target_traj_length is not None and target_traj_length > window_size:
-                stitch_steps = target_traj_length // window_size + 1
+            if target_traj_length is not None:
+                _eff = window_size - 1   # t=0 frame is discarded per window
+                stitch_steps = math.ceil(target_traj_length / _eff)
             else:
                 stitch_steps = 1
 
@@ -611,7 +619,19 @@ class MotionGenerator:
         
         curr_state_tens = curr_state_tens.to(self.device)
         effective_batch = curr_state_tens.shape[0]
-        
+
+        # Physics-check thresholds
+        _FLOOR_Z        = -0.1   # m — pelvis/object z below this → ground penetration
+        _MAX_ROBOT_STEP =  0.1   # m/frame — robot pelvis XY spike threshold
+        _MAX_OBJ_STEP   =  0.2   # m/frame — object XY spike threshold
+        # Seed "previous position" trackers from the reference frame of the initial condition
+        _prev_robot_xyz = current_anchors['ref_pos'][:, :3].copy()    # (B, 3)
+        _prev_obj_xyz   = current_anchors['ref_obj_pos'][:, :3].copy() # (B, 3)
+
+        # Per-trajectory goal-stop state
+        _goal_reached     = np.zeros(effective_batch, dtype=bool)
+        _goal_last_frame  = np.zeros((effective_batch, 43), dtype=np.float64)
+
         stitched_segments = []
 
         # 4. Autoregressive Loop
@@ -638,6 +658,8 @@ class MotionGenerator:
                     goal_cond=task_cond,
                     deterministic=self.noise_cfg.get("deterministic_inference", False),
                     cfg_w=cfg_w,
+                    waypoint_values=None,
+                    waypoint_mask=None,
                 )  # (B, T, D_out)
                 
                 # C. Denormalize
@@ -660,30 +682,89 @@ class MotionGenerator:
                     inpaint=self.diffuser.model_cfg.get("inpaint", False)
                 )
                 r_world, o_world = res[0], res[1]
+
+                r_world = r_world[:, 1:, :]  # skip t=0 (anchored to current state)
+                o_world = o_world[:, 1:, :]
                 
                 # Store segment: Robot(36) + Object(7)
                 segment_world = np.concatenate([r_world[..., :36], o_world[..., :7]], axis=-1)
 
-                if step == stitch_steps - 1 and target_traj_length is not None:
-                    if target_traj_length % window_size != 0:
-                        # Trim to target length if last segment overshoots
-                        segment_world = segment_world[:, :(target_traj_length % window_size), :]
-                    else:
-                        segment_world = None
-                
-                if segment_world is not None:
-                    stitched_segments.append(segment_world)
+                # ── Physical-consistency check ─────────────────────────────────────────
+                _rxy   = segment_world[:, :, :2]      # robot pelvis XY  (B, T, 2)
+                _rz    = segment_world[:, :, 2]       # robot pelvis Z   (B, T)
+                _oxy   = segment_world[:, :, 36:38]   # object XY        (B, T, 2)
+                _oz    = segment_world[:, :, 38]      # object Z         (B, T)
+                _rxy_p = np.concatenate([_prev_robot_xyz[:, None, :2], _rxy[:, :-1, :]], axis=1)
+                _oxy_p = np.concatenate([_prev_obj_xyz[:, None, :2],   _oxy[:, :-1, :]], axis=1)
+                _floor   = (_rz < _FLOOR_Z) | (_oz < _FLOOR_Z)
+                _rspike  = np.linalg.norm(_rxy - _rxy_p, axis=-1) > _MAX_ROBOT_STEP
+                _ospike  = np.linalg.norm(_oxy - _oxy_p, axis=-1) > _MAX_OBJ_STEP
+                _bad_t   = np.where((_floor | _rspike | _ospike).any(axis=0))[0]
+                _phys_stop = enable_physics_stop and _bad_t.size > 0
+                if _phys_stop:
+                    _t_bad   = int(_bad_t[0])
+                    _t_clamp = max(_t_bad, 1)
+                    _last_ok = segment_world[:, _t_clamp - 1 : _t_clamp, :]
+                    segment_world = segment_world.copy()
+                    segment_world[:, _t_clamp:, :] = _last_ok
+                    print(f"[physics] step {step+1}: violation at frame {_t_bad} "
+                          f"(floor={bool(_floor.any(0)[_t_bad])}, "
+                          f"robot_spike={bool(_rspike.any(0)[_t_bad])}, "
+                          f"obj_spike={bool(_ospike.any(0)[_t_bad])}). Truncating and halting.")
+                # ──────────────────────────────────────────────────────────────────────
 
+                # ── Per-trajectory goal-stop ───────────────────────────────────────────
+                if enable_goal_stop:
+                    # 1. Overwrite segments for trajectories already at goal
+                    if _goal_reached.any():
+                        _seg_T = segment_world.shape[1]
+                        segment_world = segment_world.copy()
+                        for _di in np.where(_goal_reached)[0]:
+                            segment_world[_di] = np.tile(_goal_last_frame[_di], (_seg_T, 1))
 
-                # E. Early stopping check (world-frame goal vs. achieved object position)
-                # err = np.linalg.norm(
-                #     goal_world - segment_world[:, -1, 36:39],
-                #     axis=-1,
-                # ).mean()
-                # if err < end_error_threshold:
-                #     print(f"Segment {step+1} reached goal (Error: {err:.4f}). Stopping.")
-                #     break
-                
+                    # 2. Detect trajectories newly reaching goal
+                    _obj_end  = segment_world[:, -1, 36:39]                    # (B, 3)
+                    _goal_err = np.linalg.norm(_obj_end - goal_world, axis=-1) # (B,)
+                    _newly    = (~_goal_reached) & (_goal_err < end_error_threshold)
+                    if _newly.any():
+                        for _ni in np.where(_newly)[0]:
+                            _goal_last_frame[_ni] = segment_world[_ni, -1, :]
+                        _goal_reached |= _newly
+                        print(f"[goal] step {step+1}: sample {np.where(_newly)[0].tolist()} "
+                              f"reached goal (err={_goal_err[_newly].round(4).tolist()})")
+                # ──────────────────────────────────────────────────────────────────────
+
+                stitched_segments.append(segment_world)
+
+                _prev_robot_xyz = segment_world[:, -1, :3].copy()
+                _prev_obj_xyz   = segment_world[:, -1, 36:39].copy()
+
+                if _phys_stop:
+                    _steps_to_pad = stitch_steps - step - 1
+                    if _steps_to_pad > 0:
+                        _last_frame = segment_world[:, -1:, :]
+                        _seg_T      = segment_world.shape[1]
+                        _pad_seg    = np.repeat(_last_frame, _seg_T, axis=1)
+                        for _ in range(_steps_to_pad):
+                            stitched_segments.append(_pad_seg)
+                    break
+
+                # ── Early-exit when all samples have reached their goal ────────────────
+                if enable_goal_stop and _goal_reached.all():
+                    _steps_to_pad = stitch_steps - step - 1
+                    if _steps_to_pad > 0:
+                        _seg_T   = segment_world.shape[1]
+                        _all_pad = np.stack([
+                            np.tile(_goal_last_frame[_i], (_seg_T, 1))
+                            for _i in range(effective_batch)
+                        ])
+                        for _ in range(_steps_to_pad):
+                            stitched_segments.append(_all_pad.copy())
+                        print(f"[goal] All {effective_batch} samples reached goal after "
+                              f"step {step+1}. Padding {_steps_to_pad} remaining steps.")
+                    break
+                # ──────────────────────────────────────────────────────────────────────
+
                 # F. Update Condition for next step
                 if step < stitch_steps - 1:
                     r_hist_new = r_world[:, -history_size:, :]

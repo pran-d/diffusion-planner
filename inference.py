@@ -8,7 +8,48 @@ from models.model import RobotDiffuser
 from datasets import BufferDataset
 from utils.data.load_dataset import preload_dataset
 from datasets.flexible_dataset import yaw_to_rot_matrix, yaw_from_quat
-from utils.math.sbto_utils import reconstruct_sbto_trajectory, compute_task_params, FEATURE_LAYOUT_NO_VEL
+from utils.math.sbto_utils import reconstruct_sbto_trajectory, compute_task_params, build_feature_layout
+
+# Default lift height derived from dataset statistics:
+# median peak cumulative obj_delta_z across 1634 pick-and-place trajectories.
+DEFAULT_LIFT_HEIGHT = 0.5
+
+
+def compute_z_profile(progress, lift_height=DEFAULT_LIFT_HEIGHT,
+                      lift_start=0.0, lift_end=0.20,):
+    """
+    Compute the desired cumulative z-offset at a given progress fraction [0, 1]
+    using a smooth raised-cosine bell.
+
+    Profile phases:
+        [0, lift_start)        → 0            (no lift yet)
+        [lift_start, lift_end) → ramp up      (pick up)
+        [lift_end, lower_start)→ lift_height  (carry at full height)
+        [lower_start, lower_end)→ ramp down   (time-based lower; default disabled)
+        [lower_end, 1]         → 0            (settled)
+
+    Lowering is normally controlled by remaining XY distance in
+    build_last_frame_waypoints (lower_start=1.0 default disables time-based lower).
+
+    Args:
+        progress: float in [0, 1]
+        lift_height: peak z-offset in meters
+        lift_start/lift_end: trajectory fraction for the lift ramp
+        lower_start/lower_end: trajectory fraction for the lower ramp (default disabled)
+    Returns:
+        float: desired cumulative delta_z at this progress
+    """
+    import math
+    p = max(0.0, min(1.0, progress))
+    
+    if p < lift_start:
+        return 0.0
+    elif p < lift_end:
+        # Smooth ramp up (raised cosine: 0 → 1)
+        t = (p - lift_start) / (lift_end - lift_start)
+        return lift_height * 0.5 * (1.0 - math.cos(math.pi * t))
+    else:
+        return lift_height  # carry phase — hold at peak
 
 
 def build_keyframes(normalized_window, keep_first=True, keep_last=True, num_samples=1):
@@ -35,18 +76,21 @@ def build_keyframes(normalized_window, keep_first=True, keep_last=True, num_samp
     return values, mask
 
 
-def build_first_keyframe_from_state(curr_state_tens, dataset, num_features, window_size):
+def build_first_keyframe_from_state(curr_state_tens, dataset, num_features, window_size,
+                                     current_obj_z=None):
     """
     Build a waypoint tensor where only t=0 is marked (all features known),
     constructed from the current observation state.  The first
-    `num_features - num_observations` dims (delta_xy, delta_yaw, obj_delta_xy)
-    are zero at t=0 (no motion yet).
+    `num_features - num_observations` dims (delta_xy, delta_yaw, obj_delta_xy, obj_z)
+    are zero at t=0 (no motion yet), except obj_z which uses the actual current height.
 
     Args:
         curr_state_tens: (B, H, obs_dim)  — current observation (last H frames)
         dataset:         the dataset object (for normalization)
         num_features:    total feature dim (D)
         window_size:     T tokens in a window
+        current_obj_z:   (B,) or scalar — absolute object z at start of this window.
+                         If None, normalised 0 is used (legacy behaviour).
 
     Returns:
         waypoint_values: (B, T, D)
@@ -57,38 +101,37 @@ def build_first_keyframe_from_state(curr_state_tens, dataset, num_features, wind
     D = num_features
     T = window_size
 
-    # At t=0 deltas are zero — normalize them
-    prefix_dim = D - obs_dim  # typically 5 (delta_xy=2, delta_yaw=1, obj_delta_xy=2)
+    # At t=0 deltas are zero; obj_z uses the actual current absolute height.
+    prefix_dim = D - obs_dim
+    key_dim_map = {
+        'delta_xy': 2, 'delta_yaw': 1, 'obj_delta_xy': 2, 'obj_z': 1,
+    }
 
-    # Normalize each delta component (must go through dataset normalization
-    # so that zero deltas map to the correct normalized value)
-    prefix_parts = []
+    # Build per-batch prefix: zeros for delta features, actual z for obj_z.
+    prefix_B = torch.zeros(B, prefix_dim, device=curr_state_tens.device)
     cumulative = 0
     for key in dataset.feature_order:
-        key_dim_map = {
-            'delta_xy': 2, 'delta_yaw': 1, 'obj_delta_xy': 2,
-        }
         if key in key_dim_map:
             kd = key_dim_map[key]
-            part = dataset._normalize(key, torch.zeros(1, kd, device=curr_state_tens.device))
-            if isinstance(part, torch.Tensor):
-                part = part.squeeze(0)
+            if key == 'obj_z' and current_obj_z is not None:
+                val = torch.as_tensor(current_obj_z, dtype=torch.float32,
+                                      device=curr_state_tens.device).reshape(-1, 1)
+                if val.shape[0] == 1:
+                    val = val.expand(B, 1)
             else:
-                part = torch.tensor(part, dtype=torch.float32, device=curr_state_tens.device).squeeze(0)
-            prefix_parts.append(part)
+                val = torch.zeros(B, kd, device=curr_state_tens.device)
+            norm_val = dataset._normalize(key, val)
+            if not isinstance(norm_val, torch.Tensor):
+                norm_val = torch.tensor(norm_val, dtype=torch.float32,
+                                        device=curr_state_tens.device)
+            prefix_B[:, cumulative:cumulative + kd] = norm_val.reshape(B, kd)
             cumulative += kd
         if cumulative >= prefix_dim:
             break
 
-    if prefix_parts:
-        prefix = torch.cat(prefix_parts)  # (prefix_dim,)
-
-    # Build first frame: [normalized_deltas=0, observation_features]
+    # Build first frame: [prefix (delta + obj_z features), observation_features]
     obs_frame = curr_state_tens[:, -1, :]  # (B, obs_dim) — latest observation frame
-    first_frame = torch.cat([
-        prefix.unsqueeze(0).expand(B, -1),
-        obs_frame
-    ], dim=-1)  # (B, D)
+    first_frame = torch.cat([prefix_B, obs_frame], dim=-1)  # (B, D)
 
     # Construct waypoint tensor (B, T, D) — zeros, then fill t=0
     waypoint_values = torch.zeros(B, T, D, device=curr_state_tens.device)
@@ -110,12 +153,27 @@ def build_last_frame_waypoints(
     total_steps,         # The initial total number of windows/steps for this task
     remaining_steps,     # how many windows remain to reach goal
     arrival_ratio=0.85,  # finish in this fraction of total time
-    t_accel=0.3,         # fraction of time spent accelerating
-    t_decel=0.3          # fraction of time spent decelerating
+    t_accel=0.35,        # fraction of time spent accelerating (data: peak XY velocity at ~40%)
+    t_decel=0.35,        # fraction of time spent decelerating (data: long tail, ~0 at 90%)
+    lift_height=DEFAULT_LIFT_HEIGHT,  # peak z-offset for pick-and-place
+    no_lower_dist=0.5,   # lower z only when remaining XY dist drops below this (metres)
+    lift_start=0.0,      # fraction of trajectory where lift begins (0 = immediately)
+    lift_end=0.20,       # fraction of trajectory where lift reaches peak
+    walk_start_z=0.80,   # don't move XY until cumulative z >= this fraction of lift_height
+    rest_obj_z=None,     # (B,) or scalar: absolute object z at episode start (rest height)
 ):
     """
-    Build a partial waypoint at the last frame (t=T-1) of the window using 
-    an inlined trapezoidal velocity profile.
+    Build a partial waypoint at the last frame (t=T-1) of the window.
+
+    Sequence:
+      1. Lift immediately (lift_start=0 → lift_end=0.20).
+      2. Walk only after z >= walk_start_z * lift_height (default 80% of peak).
+      3. Lower only when remaining XY dist < no_lower_dist (default 0.5 m).
+         Lowering uses a smooth raised-cosine ramp: lift_height at no_lower_dist, 0 at goal.
+
+    XY profile (data-calibrated):
+        t_accel=0.35  peak velocity at ~40% of walking phase
+        t_decel=0.35  long deceleration tail
     """
     if isinstance(task_params_raw, np.ndarray):
         task_params_raw = torch.from_numpy(task_params_raw).float()
@@ -181,15 +239,26 @@ def build_last_frame_waypoints(
         step_fraction = (s_end - s_start) / (1.0 - s_start)
         
     per_window_delta = total_remaining_delta * step_fraction  # (B, 2)
+
+    # --- Z-HEIGHT GATE ON XY MOTION ---
+    # Don't let the robot walk until the box is sufficiently lifted.
+    if walk_start_z > 0 and lift_height > 0:
+        progress_now = current_step / max(total_steps, 1)
+        z_now = compute_z_profile(progress_now, lift_height=lift_height,
+                                   lift_start=lift_start, lift_end=lift_end,)  # lifting only
+        min_walk_z = walk_start_z * lift_height
+        if z_now < min_walk_z:
+            per_window_delta = torch.zeros_like(per_window_delta)
+            print(f"  [xy-wp] Walk gated: z_now={z_now:.3f}m < threshold={min_walk_z:.3f}m")
+    # -----------------------------------
     # ----------------------------------------------
 
     # Build feature index map
     feature_idx = {}
     idx = 0
-    # Assuming FEATURE_LAYOUT_NO_VEL is imported/available in your scope
+    _layout = build_feature_layout()
     for key in feature_order:
-        from utils.math.sbto_utils import FEATURE_LAYOUT_NO_VEL # Adjust import if needed
-        dim = FEATURE_LAYOUT_NO_VEL.get(key, 0)
+        dim = _layout.get(key, 0)
         if dim > 0:
             feature_idx[key] = slice(idx, idx + dim)
             idx += dim
@@ -204,6 +273,61 @@ def build_last_frame_waypoints(
         values[:, t_last, feature_idx["obj_delta_xy"]] = norm_obj_delta.reshape(B, -1)
         mask[:, t_last, feature_idx["obj_delta_xy"]] = True
 
+    # Set obj_z: ABSOLUTE target height = rest_z + z_profile_offset.
+    # Using an absolute constraint eliminates the "delta trap" where tiny
+    # unmasked-frame drifts accumulate across windows and cause early dropping.
+    if "obj_z" in feature_idx and lift_height > 0:
+        import math as _math
+
+        # Time-based lifting profile (offset above rest: 0 → lift_height)
+        progress_end = (current_step + 1) / max(total_steps, 1)
+        z_lift_end   = compute_z_profile(progress_end, lift_height=lift_height,
+                                          lift_start=lift_start, lift_end=lift_end)
+
+        # Distance-based lowering: hold lift_height while far; cosine ramp to 0 near goal.
+        remaining_dist_m  = torch.norm(total_remaining_delta, dim=-1)   # (B,)
+        per_window_xy_mag = torch.norm(per_window_delta, dim=-1)        # (B,)
+        remaining_end_m   = torch.clamp(remaining_dist_m - per_window_xy_mag, min=0.0)
+
+        def _z_from_dist(rem):
+            frac = torch.clamp(rem / max(no_lower_dist, 1e-6), 0.0, 1.0)
+            return lift_height * 0.5 * (1.0 - torch.cos(_math.pi * frac))
+
+        # Gate: don't enter lowering zone early via XY lookahead
+        still_far  = remaining_dist_m >= no_lower_dist
+        z_dist_end = torch.where(
+            still_far,
+            torch.full_like(remaining_dist_m, lift_height),
+            _z_from_dist(remaining_end_m),
+        )
+
+        # Combined height offset = min(lift profile, distance-based lowering)
+        z_offset_end = torch.minimum(torch.full((B,), z_lift_end), z_dist_end)  # (B,)
+
+        # Absolute target z = episode-start rest height + height offset
+        if rest_obj_z is not None:
+            rest_t = torch.as_tensor(rest_obj_z, dtype=torch.float32)
+            if rest_t.ndim == 0:
+                rest_t = rest_t.expand(B)
+            elif rest_t.shape[0] == 1 and B > 1:
+                rest_t = rest_t.expand(B)
+        else:
+            rest_t = torch.zeros(B)
+        target_abs_z = rest_t + z_offset_end  # (B,)
+
+        target_tensor = target_abs_z.unsqueeze(-1)  # (B, 1)
+        norm_z = dataset._normalize("obj_z", target_tensor)
+        if not isinstance(norm_z, torch.Tensor):
+            norm_z = torch.tensor(norm_z, dtype=torch.float32)
+        values[:, t_last, feature_idx["obj_z"]] = norm_z.reshape(B, -1)
+        mask[:, t_last, feature_idx["obj_z"]] = True
+
+        avg_rem    = remaining_dist_m.mean().item()
+        avg_z      = target_abs_z.mean().item()
+        n_lowering = (remaining_dist_m < no_lower_dist).sum().item()
+        print(f"  [z-wp] target_z={avg_z:.3f}m  rem={avg_rem:.3f}m  "
+              f"lowering={n_lowering}/{B}")
+
     return values, mask
 
 
@@ -217,11 +341,18 @@ def build_inference_waypoints(
     stitch_steps=1,
     remaining_steps=1,
     arrival_ratio=0.85,
+    lift_height=DEFAULT_LIFT_HEIGHT,  # peak z-offset for pick-and-place profile
+    no_lower_dist=0.5,               # lower z only when remaining XY dist < this (metres)
+    lift_start=0.0,                  # z profile: lift start (fraction of total trajectory)
+    lift_end=0.20,                   # z profile: lift end
+    walk_start_z=0.80,               # gate XY walk until z >= this fraction of lift_height
+    current_obj_z=None,              # (B,) absolute object z at t=0 of this window (for t=0 keyframe)
+    rest_obj_z=None,                 # (B,) or scalar: episode-start rest z (for absolute z target)
 ):
     """
     Build complete waypoint specification for inference.
     Combines a full keyframe at t=0 (from current state) with an optional
-    analytically-computed partial waypoint at the last frame (obj_delta_xy + delta_yaw).
+    analytically-computed partial waypoint at the last frame (obj_delta_xy + obj_z).
 
     Returns:
         waypoint_values: (B, T, D) float tensor
@@ -231,9 +362,10 @@ def build_inference_waypoints(
     D = num_features
     T = window_size
 
-    # 1. Full keyframe at t=0 from current state
+    # 1. Full keyframe at t=0 from current state (anchors obj_z to actual current height)
     kf_vals, _ = build_first_keyframe_from_state(
-        curr_state_tens, dataset, num_features, window_size
+        curr_state_tens, dataset, num_features, window_size,
+        current_obj_z=current_obj_z,
     )
 
     values = kf_vals.clone()
@@ -251,6 +383,12 @@ def build_inference_waypoints(
             total_steps=stitch_steps,
             remaining_steps=remaining_steps,
             arrival_ratio=arrival_ratio,
+            lift_height=lift_height,
+            no_lower_dist=no_lower_dist,
+            lift_start=lift_start,
+            lift_end=lift_end,
+            walk_start_z=walk_start_z,
+            rest_obj_z=rest_obj_z,
         )
         # Merge: last-frame waypoint fills in only its marked positions
         values = torch.where(wp_mask.to(values.device), wp_vals.to(values.device), values)
@@ -358,8 +496,16 @@ def main():
     parser.add_argument("--guidance_wt", type=float, default=0.0, help="Test-time gradient guidance strength")
     parser.add_argument("--guidance_goal", nargs="+", type=float, default=None, help="Target values for guidance (normalized)")
     parser.add_argument("--guidance_indices", nargs="+", type=int, default=None, help="Indices of the state vector to apply guidance on")
-    parser.add_argument("--last_frame_waypoint", action="store_true", help="Add partial waypoint at last frame (obj_delta_xy + delta_yaw)")
+    parser.add_argument("--last_frame_waypoint", action="store_true", help="Add partial waypoint at last frame (obj_delta_xy + obj_z absolute)")
     parser.add_argument("--arrival_ratio", type=float, default=0.85, help="Object arrives in this fraction of remaining time (0-1)")
+    parser.add_argument("--lift_height", type=float, default=DEFAULT_LIFT_HEIGHT,
+                        help=f"Peak lift height in meters for pick-and-place z profile (default: {DEFAULT_LIFT_HEIGHT}m from dataset)")
+    parser.add_argument("--lift_start", type=float, default=0.0, help="Fraction of trajectory where lift begins (0=immediately)")
+    parser.add_argument("--lift_end", type=float, default=0.20, help="Fraction of trajectory where lift reaches peak")
+    parser.add_argument("--walk_start_z", type=float, default=0.80,
+                        help="Gate XY motion: don't walk until z >= this fraction of lift_height (default: 0.80)")
+    parser.add_argument("--no_lower_dist", type=float, default=0.4,
+                        help="Lower z when remaining XY distance drops below this value in metres (default: 0.3m)")
     
     args = parser.parse_args()
 
@@ -441,7 +587,8 @@ def main():
     task_tens = task_params.repeat(args.num_samples, 1)
 
     if args.stitch_steps is None:
-        args.stitch_steps = dataset.traj_lengths[args.traj_idx] // data_cfg["num_timesteps"] 
+        _eff = data_cfg["num_timesteps"] - 1  # t=0 always skipped; each window yields (T-1) frames
+        args.stitch_steps = (dataset.traj_lengths[args.traj_idx] + _eff - 1) // _eff
         print(f"Auto-setting stitch_steps to {args.stitch_steps} based on dataset length.")
 
     if args.action_horizon is not None:
@@ -462,6 +609,17 @@ def main():
         'final_obj_pos': np.tile(anchor['final_obj_pos'][None], (args.num_samples, 1)),
     }
 
+    # Episode-start object z — used as absolute baseline for the z-waypoint target.
+    _rest_obj_z = float(anchor['ref_obj_pos'][2])
+
+    # Physical-consistency sanity check (task-agnostic).
+    # Flags clearly unphysical frames; halts and pads on first violation.
+    _FLOOR_Z        = -0.1   # robot/object z below this → ground penetration
+    _MAX_ROBOT_STEP = 0.25    # max robot pelvis XY step per frame at 100 Hz (m)
+    _MAX_OBJ_STEP   = 0.25    # max object XY step per frame at 100 Hz (m)
+    _prev_robot_xyz = current_anchors['ref_pos'][:, :3].copy()    # (B, 3)
+    _prev_obj_xyz   = current_anchors['ref_obj_pos'][:, :3].copy() # (B, 3)
+
     # 5. Autoregressive Loop
     for step in range(args.stitch_steps):
         # print(f"Generating segment {step+1}/{args.stitch_steps}...")
@@ -478,7 +636,6 @@ def main():
             )
             task_actual = tp_init.copy()
             task_actual[..., 2] = actual_dist  
-            print(task_actual)
 
             task_params = dataset._normalize("task_params", tp_init)
             task_tens = task_params if isinstance(task_params, torch.Tensor) else torch.tensor(task_params, dtype=torch.float32)
@@ -487,6 +644,9 @@ def main():
             wv, wm = None, None
             if diffuser.model.inbetweening_enabled:
                 remaining = max(args.stitch_steps - step, 1)
+                _current_obj_z = torch.from_numpy(
+                    current_anchors['ref_obj_pos'][:, 2].astype(np.float32)
+                )
                 wv, wm = build_inference_waypoints(
                     curr_state_tens, task_actual, dataset,
                     data_cfg['num_features'], dataset.window_size,
@@ -494,6 +654,13 @@ def main():
                     stitch_steps=args.stitch_steps,
                     remaining_steps=remaining,
                     arrival_ratio=args.arrival_ratio,
+                    lift_height=args.lift_height,
+                    no_lower_dist=args.no_lower_dist,
+                    lift_start=args.lift_start,
+                    lift_end=args.lift_end,
+                    walk_start_z=args.walk_start_z,
+                    current_obj_z=_current_obj_z,
+                    rest_obj_z=_rest_obj_z,
                 )
             normalized_sample = diffuser.getSample(
                 num_trajectories=args.num_samples,
@@ -540,15 +707,45 @@ def main():
         res = reconstruct_sbto_trajectory(anchor_arr, future_traj_np, inpaint=diffuser.model_cfg.get("inpaint", False))
         r_world, o_world = res[0], res[1]
 
+        r_world = r_world[:, 1:, :]
+        o_world = o_world[:, 1:, :]
+
         if args.action_horizon is not None:
-            r_world = r_world[:, 1:args.action_horizon+1, :]
-            o_world = o_world[:, 1:args.action_horizon+1, :]
+            r_world = r_world[:, :args.action_horizon, :]
+            o_world = o_world[:, :args.action_horizon, :]
         
-        # Store Segment
-        # Robot(36) + Object(7)
+        # Store Segment — Robot(36) + Object(7)
         segment_world = np.concatenate([r_world[..., :36], o_world[..., :7]], axis=-1)
+
+        # ── Physical-consistency check ─────────────────────────────────────────
+        # Scan every frame for ground penetration or position spikes.  On the
+        # first violating frame: clamp the window there, pad all remaining
+        # stitch windows with that static frame, and halt generation.
+        _rxy   = segment_world[:, :, :2]      # robot pelvis XY  (B, T, 2)
+        _rz    = segment_world[:, :, 2]       # robot pelvis Z   (B, T)
+        _oxy   = segment_world[:, :, 36:38]   # object XY        (B, T, 2)
+        _oz    = segment_world[:, :, 38]      # object Z         (B, T)
+        _rxy_p = np.concatenate([_prev_robot_xyz[:, None, :2], _rxy[:, :-1, :]], axis=1)
+        _oxy_p = np.concatenate([_prev_obj_xyz[:, None, :2],   _oxy[:, :-1, :]], axis=1)
+        _floor   = (_rz < _FLOOR_Z) | (_oz < _FLOOR_Z)
+        _rspike  = np.linalg.norm(_rxy - _rxy_p, axis=-1) > _MAX_ROBOT_STEP
+        _ospike  = np.linalg.norm(_oxy - _oxy_p, axis=-1) > _MAX_OBJ_STEP
+        _bad_t   = np.where((_floor | _rspike | _ospike).any(axis=0))[0]
+        _phys_stop = _bad_t.size > 0
+        if _phys_stop:
+            _t_bad   = int(_bad_t[0])
+            _t_clamp = max(_t_bad, 1)
+            _last_ok = segment_world[:, _t_clamp - 1 : _t_clamp, :]
+            segment_world = segment_world.copy()
+            segment_world[:, _t_clamp:, :] = _last_ok
+            print(f"[physics] step {step+1}: violation at frame {_t_bad} "
+                  f"(floor={bool(_floor.any(0)[_t_bad])}, "
+                  f"robot_spike={bool(_rspike.any(0)[_t_bad])}, "
+                  f"obj_spike={bool(_ospike.any(0)[_t_bad])}). Truncating and halting.")
+        # ──────────────────────────────────────────────────────────────────────
+
         stitched_segments.append(segment_world)
-    
+
         # Denormalize task params before transforming to global frame
         task_denorm = dataset._denormalize("task_params", task_tens) # (B, 2)
         if task_denorm.shape[1] < 3:
@@ -558,18 +755,34 @@ def main():
         goal_vec_global = (yaw_to_rot_matrix(yaw_from_quat(current_anchors['ref_quat'])) @ task_denorm_3d.cpu().numpy())[..., :data_cfg["num_task_params"], 0]
         goal_vectors.append(goal_vec_global.repeat(segment_world.shape[1], 0)[..., :2]) # (B, 3)
 
+        # Update per-window position trackers for spike detection at next boundary
+        _prev_robot_xyz = segment_world[:, -1, :3].copy()
+        _prev_obj_xyz   = segment_world[:, -1, 36:39].copy()
+
+        # If physics check fired: pad all remaining windows and stop generation
+        if _phys_stop:
+            _steps_to_pad = args.stitch_steps - step - 1
+            if _steps_to_pad > 0:
+                _last_frame = segment_world[:, -1:, :]
+                _seg_T      = segment_world.shape[1]
+                _pad_seg    = np.repeat(_last_frame, _seg_T, axis=1)
+                _last_gv    = goal_vectors[-1]
+                for _ in range(_steps_to_pad):
+                    stitched_segments.append(_pad_seg)
+                    goal_vectors.append(_last_gv)
+            break
+
         # Optionally visualize this window
         visualize_every = 50
         if args.visualize_windows and step % visualize_every == 0:
-            part_traj = np.concatenate(stitched_segments[-visualize_every:], axis=1) # Visualize last 5 segments
+            part_traj = np.concatenate(stitched_segments[-visualize_every:], axis=1)
             part_goal_vec = np.concatenate(goal_vectors[-visualize_every:], axis=0)
             try:
-                # Use the interactive visualizer used at the end of stitching
                 run_visualization(vis, part_traj, part_goal_vec, anchor["final_obj_pos"], repeat=False)
             except Exception as e:
                 print(f"Warning: interactive visualization failed for window {step}: {e}")
 
-        # Desired Displacement (From Ground Truth Full Trajectory)                    
+        # Desired Displacement (From Ground Truth Full Trajectory)
         err = np.linalg.norm(current_anchors["final_obj_pos"][..., :data_cfg["num_task_params"]] - segment_world[:, -1, 36 : 36 + data_cfg["num_task_params"]])
         if err < args.end_error_threshold and not args.visualize_dataset:
             print(f"Segment {step+1} successfully reached the goal (Error: {err:.4f}).")
@@ -619,7 +832,7 @@ def main():
         'waypoint_values': np.array(analysis_waypoint_values),                  # (num_windows, B, T, D)
         'waypoint_masks': np.array(analysis_waypoint_masks),                    # (num_windows, B, T, D) bool
         'feature_order': np.array(dataset.feature_order),                       # feature names
-        'feature_dims': np.array([FEATURE_LAYOUT_NO_VEL[k] for k in dataset.feature_order]),  # dim per feature
+        'feature_dims': np.array([build_feature_layout()[k] for k in dataset.feature_order]),  # dim per feature
     }
     if unreconstructed_trajectory is not None:
         analysis_data['unreconstructed'] = unreconstructed_trajectory
