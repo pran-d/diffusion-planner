@@ -20,6 +20,7 @@ from datasets import BufferDataset, ConditionalStateDataset
 from models.model import RobotDiffuser
 from config.configure import load_config, get_data_path, get_save_path, get_log_path, get_norm_path
 from utils.data.load_dataset import preload_dataset
+from utils.math.sbto_utils import build_feature_layout, get_feature_indices
 
 # ===============================
 # Helper Functions
@@ -104,12 +105,101 @@ def compute_dataset_weights(dataset, sigma=0.2):
         
     return torch.tensor(sample_weights).double()
 
+
+def check_physical_consistency(
+    diffuser, dataset, ema, device,
+    state_condition, task_condition, data_cfg,
+    num_eval_samples=32, eval_batch_size=16,
+):
+    """
+    Runs a quick generative evaluation using EMA weights on a random
+    mini-batch drawn from the dataset.  Returns (violations, total_frames)
+    where a violation is any frame where:
+      - robot pelvis z < -0.1 m  (floor penetration), OR
+      - object z       < -0.1 m  (floor penetration), OR
+      - per-frame XY delta magnitude > 0.1 m  (position spike / sim instability)
+    """
+    _FLOOR_Z = -0.1
+    _MAX_DXY =  0.2  # m / frame at 100 Hz
+
+    layout = build_feature_layout(
+        has_vel=data_cfg.get("has_vel", False),
+        has_obj_delta_xy=data_cfg.get("has_obj_delta_xy", True),
+        has_obj_z=data_cfg.get("has_obj_z", True),
+    )
+    feat_idx   = get_feature_indices(layout)
+    body_z_col = feat_idx["body_z"].start
+    dxy_sl     = feat_idx["delta_xy"]                          # slice(0, 2)
+    obj_z_sl   = feat_idx.get("obj_z")                        # slice or None
+    obj_z_col  = obj_z_sl.start if obj_z_sl is not None else None
+
+    n = min(num_eval_samples, len(dataset))
+    rng_idx = np.random.choice(len(dataset), size=n, replace=False)
+
+    # Swap EMA weights into model; store originals for restoration
+    ema.store(diffuser.model.parameters())
+    ema.copy_to(diffuser.model.parameters())
+    diffuser.model.eval()
+
+    violations   = 0
+    total_frames = 0
+
+    try:
+        with torch.no_grad():
+            for b_start in range(0, n, eval_batch_size):
+                b_idx = rng_idx[b_start : b_start + eval_batch_size].tolist()
+                items = [dataset[int(i)] for i in b_idx]
+                bs = len(items)
+
+                state_cond_t = None
+                goal_cond_t  = None
+                slot = 1
+                if state_condition:
+                    state_cond_t = torch.stack([it[slot] for it in items]).to(device)
+                    slot += 1
+                if task_condition:
+                    goal_cond_t = torch.stack([it[slot] for it in items]).to(device)
+
+                sample = diffuser.getSample(
+                    num_trajectories=bs,
+                    state_cond=state_cond_t,
+                    goal_cond=goal_cond_t,
+                    deterministic=True,
+                    cfg_w=1.0,
+                    no_state_cond=not state_condition,
+                )  # (B, T, D) — normalized
+
+                denorm = dataset.denormalize_global(sample).cpu().numpy()  # (B, T, D)
+
+                # Floor-penetration check
+                floor_v = denorm[:, :, body_z_col] < _FLOOR_Z
+                if obj_z_col is not None:
+                    floor_v |= (denorm[:, :, obj_z_col] < _FLOOR_Z)
+
+                # Per-frame XY spike (consecutive diff of accumulated delta_xy)
+                dxy     = denorm[:, :, dxy_sl]  # (B, T, 2)
+                dxy_vel = np.diff(dxy, axis=1, prepend=dxy[:, :1, :])
+                spike_v = np.linalg.norm(dxy_vel, axis=-1) > _MAX_DXY
+
+                any_v         = floor_v | spike_v
+                violations   += int(any_v.sum())
+                total_frames += int(any_v.size)
+    finally:
+        ema.restore(diffuser.model.parameters())
+        diffuser.model.train()
+
+    return violations, total_frames
+
 # ===============================
 # Setup
 # ===============================
 parser = argparse.ArgumentParser(description="Clean Inference & Stitching Pipeline")
 parser.add_argument("--resume", type=int, default=None, help="Resume from checkpoint epoch (int)")
 parser.add_argument("--save_every", type=int, default=50, help="Save checkpoint every N epochs")
+parser.add_argument("--eval_every", type=int, default=20,
+                    help="Run generative physics eval every N epochs (0 = disable, default: 20)")
+parser.add_argument("--num_eval_samples", type=int, default=32,
+                    help="Number of dataset samples to use for each physics eval (default: 32)")
 
 args = parser.parse_args()
 
@@ -187,6 +277,11 @@ if args.resume is not None:
             scheduler.load_state_dict(checkpoint["scheduler"])
         if "scaler" in checkpoint:
             scaler.load_state_dict(checkpoint["scaler"])
+        if "ema" in checkpoint:
+            ema.load_state_dict(checkpoint["ema"])
+            print("Loaded EMA state from checkpoint.")
+        else:
+            print("No EMA state found in checkpoint — starting EMA fresh.")
 
 if data_cfg.get("dataset_class", "flexible") == "conditional":
     dataset = ConditionalStateDataset(
@@ -248,6 +343,9 @@ diffuser.model.train()
 
 num_epochs = training_cfg["num_epochs"] + 1
 
+# Track best generative checkpoint by physics violations
+best_phys_violations = float("inf")
+best_phys_epoch      = -1
 for epoch in range(starting_epoch, num_epochs):
     epoch_losses = []
 
@@ -346,7 +444,7 @@ for epoch in range(starting_epoch, num_epochs):
         scaler.update()
 
         # use ema to update the model average
-        # ema.step(diffuser.model.parameters())
+        ema.step(diffuser.model.parameters())
         
         losses.append(loss.item())
         epoch_losses.append(loss.item())
@@ -394,7 +492,8 @@ for epoch in range(starting_epoch, num_epochs):
                 "model": diffuser.model.state_dict(),
                 "optimizer": optimizer.state_dict(),
                 "scaler": scaler.state_dict(),
-                "scheduler": scheduler.state_dict()
+                "scheduler": scheduler.state_dict(),
+                "ema": ema.state_dict(),
             }
             torch.save(checkpoint, f"{save_dir}/model_{epoch}.pth")
             break
@@ -409,13 +508,42 @@ for epoch in range(starting_epoch, num_epochs):
             "model": diffuser.model.state_dict(),
             "optimizer": optimizer.state_dict(),
             "scaler": scaler.state_dict(),
-            "scheduler": scheduler.state_dict()
+            "scheduler": scheduler.state_dict(),
+            "ema": ema.state_dict(),
         }
-
         torch.save(checkpoint, f"{save_dir}/model_{epoch}.pth")
-    
-    # if epoch % 500 == 0:
-    #     diffuser.save_ema_weights(ema.shadow_params, f"{save_dir}/ema_model_{epoch}.pth")
+
+    # ===============================
+    # Generative Physics Eval (EMA)
+    # ===============================
+    eval_every = args.eval_every if args.eval_every else 0
+    if eval_every > 0 and epoch > 0 and epoch % eval_every == 0:
+        print(f"\n[PhysicsEval] Epoch {epoch}: running generative evaluation "
+              f"({args.num_eval_samples} samples)…")
+        viols, frames = check_physical_consistency(
+            diffuser, dataset, ema, device,
+            state_condition, task_condition, data_cfg,
+            num_eval_samples=args.num_eval_samples,
+            eval_batch_size=min(16, args.num_eval_samples),
+        )
+        viol_rate = viols / max(frames, 1)
+        print(f"[PhysicsEval] violations={viols}/{frames}  rate={viol_rate:.4f}")
+        writer.add_scalar("PhysicsEval/violation_count", viols, epoch)
+        writer.add_scalar("PhysicsEval/violation_rate",  viol_rate, epoch)
+
+        if viols < best_phys_violations:
+            best_phys_violations = viols
+            best_phys_epoch      = epoch
+            best_ckpt = {
+                "model": diffuser.model.state_dict(),
+                "optimizer": optimizer.state_dict(),
+                "scaler": scaler.state_dict(),
+                "scheduler": scheduler.state_dict(),
+                "ema": ema.state_dict(),
+            }
+            torch.save(best_ckpt, f"{save_dir}/model_best_phys.pth")
+            print(f"[PhysicsEval] ✓ New best checkpoint saved "
+                  f"(violations={viols}, epoch={epoch})")
 
 # ===============================
 # Plot Loss Curve (after training)

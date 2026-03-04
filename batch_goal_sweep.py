@@ -274,6 +274,11 @@ def extract_ref_trajectories(dataset, ref_pos, target_T):
         base_a       = base.copy();  base_a[:, :2] += xy_offset
         obj_a        = obj.copy();   obj_a[:, :2]  += xy_offset
 
+        # Guard: base / joints / obj may have different T when downsampling
+        # is applied unevenly across keys — trim to the common minimum.
+        T_min = min(base_a.shape[0], joints.shape[0], obj_a.shape[0])
+        base_a, joints, obj_a = base_a[:T_min], joints[:T_min], obj_a[:T_min]
+
         traj = np.concatenate([base_a, joints, obj_a], axis=-1).astype(np.float32)  # (T, 43)
 
         # Pad or trim to target_T
