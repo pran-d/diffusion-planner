@@ -477,6 +477,9 @@ def main():
     parser.add_argument("--num_samples", type=int, default=1)
     parser.add_argument("--stitch_steps", type=int, default=None, help="Number of autoregressive segments to generate")
     parser.add_argument("--save_path", type=str, default="results/inference.npy")
+    parser.add_argument("--analysis_path", type=str, default=None,
+                        help="If provided, save a *_analysis.npz with per-window data for analyze_trajectory.py. "
+                             "Supports --mode normalized / denormalized / waypoints / world / all.")
     parser.add_argument("--sample_idx", type=int, default=0, help="Initial condition index (Overridden if traj_idx is set)")
     parser.add_argument("--traj_idx", type=int, default=0, help="Trajectory (file) index")
     parser.add_argument("--batch_idx", type=int, default=0, help="Batch index within file")
@@ -630,7 +633,8 @@ def main():
         if args.num_samples > 1:
             full_trajectory = np.repeat(full_trajectory, args.num_samples, axis=0)
     else:
-        full_trajectory = generator.generate_trajectory(
+        _want_analysis = args.analysis_path is not None
+        _gen_result = generator.generate_trajectory(
             initial_condition=initial_condition,
             goal_condition=goal_condition,
             stitch_steps=args.stitch_steps,
@@ -638,7 +642,7 @@ def main():
             cfg_w=args.cfg_w,
             end_error_threshold=args.end_error_threshold,
             enable_goal_stop=True,
-            enable_physics_stop=True,
+            enable_physics_stop=False,
             use_last_frame_wp=args.last_frame_waypoint,
             arrival_ratio=args.arrival_ratio,
             lift_height=args.lift_height,
@@ -646,12 +650,31 @@ def main():
             lift_start=args.lift_start,
             lift_end=args.lift_end,
             walk_start_z=args.walk_start_z,
+            return_analysis=_want_analysis,
         )
+        if _want_analysis:
+            full_trajectory, _analysis_dict = _gen_result
+        else:
+            full_trajectory = _gen_result
 
     # 6. Save
     os.makedirs(os.path.dirname(args.save_path), exist_ok=True)
     np.save(args.save_path, full_trajectory)
     print(f"Trajectory saved to {args.save_path} (Shape: {full_trajectory.shape})")
+
+    if args.analysis_path and not args.visualize_dataset:
+        os.makedirs(os.path.dirname(args.analysis_path) or ".", exist_ok=True)
+        np.savez(
+            args.analysis_path,
+            normalized_windows=_analysis_dict["normalized_windows"],
+            denormalized_windows=_analysis_dict["denormalized_windows"],
+            waypoint_values=_analysis_dict["waypoint_values"],
+            waypoint_masks=_analysis_dict["waypoint_masks"],
+            feature_order=_analysis_dict["feature_order"],
+            feature_dims=_analysis_dict["feature_dims"],
+            trajectory=full_trajectory,
+        )
+        print(f"Analysis data saved to {args.analysis_path}")
 
     # 7. Print metrics
     if full_trajectory.shape[-1] >= 38:

@@ -550,7 +550,8 @@ class MotionGenerator:
                             no_lower_dist: float = 0.5,
                             lift_start: float = 0.0,
                             lift_end: float = 0.20,
-                            walk_start_z: float = 0.80,):
+                            walk_start_z: float = 0.80,
+                            return_analysis: bool = False,):
         """
         Generate trajectory via autoregressive diffusion.
         
@@ -594,7 +595,17 @@ class MotionGenerator:
             walk_start_z: Gate XY walk until z >= this fraction of lift_height.
             
         Returns:
-            np.ndarray of shape (B * num_samples, T_total, D) where D = 36 (robot) + 7 (object).
+            When return_analysis=False (default):
+                np.ndarray of shape (B * num_samples, T_total, D) where D = 36 (robot) + 7 (object).
+            When return_analysis=True:
+                Tuple (trajectory, analysis_dict) where analysis_dict has keys:
+                  'normalized_windows'    – (num_windows, B, T, D_feat)
+                  'denormalized_windows'  – (num_windows, B, T, D_feat)
+                  'waypoint_values'       – (num_windows, B, T, D_feat)
+                  'waypoint_masks'        – (num_windows, B, T, D_feat) bool
+                  'feature_order'         – list[str]
+                  'feature_dims'          – np.ndarray[int]
+                  'trajectory'            – same ndarray as the first return value
         """
         if self.dataset is None:
              raise RuntimeError("Dataset not initialized. Call fit() or setup.")
@@ -686,6 +697,13 @@ class MotionGenerator:
 
         stitched_segments = []
 
+        # Per-window data for optional analysis export
+        if return_analysis:
+            _ana_norm    = []   # normalized model outputs
+            _ana_denorm  = []   # denormalized model outputs
+            _ana_wv      = []   # waypoint values
+            _ana_wm      = []   # waypoint masks
+
         # 4. Autoregressive Loop
         with torch.no_grad():
             for step in range(stitch_steps):
@@ -745,7 +763,19 @@ class MotionGenerator:
                 # D. Denormalize
                 denorm_btc = self.dataset.denormalize_global(normalized_sample)
                 future_traj_np = denorm_btc.detach().cpu().numpy()
-                
+
+                # Collect per-window tensors for analysis export
+                if return_analysis:
+                    _B_an, _T_an, _D_an = normalized_sample.shape
+                    _ana_norm.append(normalized_sample.detach().cpu().numpy())
+                    _ana_denorm.append(future_traj_np)
+                    if wv is not None:
+                        _ana_wv.append(wv.detach().cpu().numpy())
+                        _ana_wm.append(wm.detach().cpu().numpy())
+                    else:
+                        _ana_wv.append(np.zeros((_B_an, _T_an, _D_an), dtype=np.float32))
+                        _ana_wm.append(np.zeros((_B_an, _T_an, _D_an), dtype=bool))
+
                 # E. Reconstruct World Frame from SBTO features
                 #    final_obj_pos in anchor must be in world frame for reconstruction
                 current_anchors['final_obj_pos'] = goal_world
@@ -874,6 +904,18 @@ class MotionGenerator:
 
         # Smooth trajectory
         full_trajectory = self._smooth_trajectory(full_trajectory, sigma=2.0)
+
+        if return_analysis:
+            analysis_dict = {
+                "normalized_windows":   np.stack(_ana_norm,   axis=0),  # (N, B, T, D)
+                "denormalized_windows": np.stack(_ana_denorm, axis=0),  # (N, B, T, D)
+                "waypoint_values":      np.stack(_ana_wv,     axis=0),  # (N, B, T, D)
+                "waypoint_masks":       np.stack(_ana_wm,     axis=0),  # (N, B, T, D)
+                "feature_order":        list(self.dataset.feature_order),
+                "feature_dims":         self.dataset.feature_dims,
+                "trajectory":           full_trajectory,
+            }
+            return full_trajectory, analysis_dict
 
         return full_trajectory
 

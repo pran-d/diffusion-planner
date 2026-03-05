@@ -7,7 +7,7 @@ import yaml
 from torch.utils.data import Dataset
 from tqdm import tqdm
 
-from utils.math.sbto_utils import compute_sbto_components, yaw_to_rot_matrix, yaw_from_quat, rot6d_to_rot, quat_to_rot, compute_task_params, rot_to_6d
+from utils.math.sbto_utils import compute_sbto_components, rot6d_to_rot, quat_to_rot, compute_task_params, rot_to_6d
 from utils.math.rotation_conversions import ( 
     axis_angle_to_quaternion, 
 )
@@ -399,6 +399,23 @@ class FlexibleWindowDataset(Dataset):
             features["task_params"], _ = self._compute_task_params(raw_traj['base'], raw_traj['obj'], start_idx=read_start)
 
         return features, anchor
+
+    @property
+    def feature_dims(self):
+        """Return an int array of feature dimensions, one per entry in feature_order.
+
+        Derived from the per-feature normalization statistics stored in self.stats,
+        so it is always consistent with the features actually present in the data.
+        """
+        import numpy as _np
+        dims = []
+        for key in self.feature_order:
+            if self.normalization_type == "min_max":
+                v = self.stats.get(f"min_{key}")
+            else:
+                v = self.stats.get(f"mean_{key}")
+            dims.append(int(v.shape[0]) if v is not None else 0)
+        return _np.array(dims, dtype=np.int64)
 
     def _compute_task_params(self, base_traj, obj_traj, start_idx=0):
         # Default: Object X, Y displacement from start to end of trajectory
