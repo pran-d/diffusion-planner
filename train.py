@@ -187,6 +187,9 @@ if args.resume is not None:
             scheduler.load_state_dict(checkpoint["scheduler"])
         if "scaler" in checkpoint:
             scaler.load_state_dict(checkpoint["scaler"])
+        if "ema" in checkpoint:
+            ema.load_state_dict(checkpoint["ema"])
+            print("Loaded EMA state from checkpoint.")
 
 if data_cfg.get("dataset_class", "flexible") == "conditional":
     dataset = ConditionalStateDataset(
@@ -346,7 +349,7 @@ for epoch in range(starting_epoch, num_epochs):
         scaler.update()
 
         # use ema to update the model average
-        # ema.step(diffuser.model.parameters())
+        ema.step(diffuser.model.parameters())
         
         losses.append(loss.item())
         epoch_losses.append(loss.item())
@@ -394,9 +397,11 @@ for epoch in range(starting_epoch, num_epochs):
                 "model": diffuser.model.state_dict(),
                 "optimizer": optimizer.state_dict(),
                 "scaler": scaler.state_dict(),
-                "scheduler": scheduler.state_dict()
+                "scheduler": scheduler.state_dict(),
+                "ema": ema.state_dict(),
             }
             torch.save(checkpoint, f"{save_dir}/model_{epoch}.pth")
+            diffuser.save_ema_weights(ema.shadow_params, f"{save_dir}/ema_model_{epoch}.pth")
             break
     
     # ===============================
@@ -409,13 +414,12 @@ for epoch in range(starting_epoch, num_epochs):
             "model": diffuser.model.state_dict(),
             "optimizer": optimizer.state_dict(),
             "scaler": scaler.state_dict(),
-            "scheduler": scheduler.state_dict()
+            "scheduler": scheduler.state_dict(),
+            "ema": ema.state_dict(),
         }
 
         torch.save(checkpoint, f"{save_dir}/model_{epoch}.pth")
-    
-    # if epoch % 500 == 0:
-    #     diffuser.save_ema_weights(ema.shadow_params, f"{save_dir}/ema_model_{epoch}.pth")
+        diffuser.save_ema_weights(ema.shadow_params, f"{save_dir}/ema_model_{epoch}.pth")
 
 # ===============================
 # Plot Loss Curve (after training)
