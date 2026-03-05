@@ -169,7 +169,6 @@ class MotionGenerator:
 
     def fit(self, 
         data_source: Union[str, List[Dict]], 
-        task_params: Optional[List[Dict]] = None,
         epochs: int = None, 
         save_path: str = None,
         checkpoint: Optional[str] = None,
@@ -181,7 +180,9 @@ class MotionGenerator:
         
         Args:
             data_source: Path to data folder (str) or list of trajectory dicts.
-            task_params: Optional list of task parameters (e.g. goals) aligned with data_source.
+                         The dataset internally computes task_params from each
+                         trajectory's final object position. No external goals
+                         need to be passed.
             epochs: Number of epochs to train. Overrides config if provided.
             save_path: Path to save model checkpoints. Overrides config if provided.
             checkpoint: Optional path to a checkpoint to resume from.
@@ -216,7 +217,6 @@ class MotionGenerator:
 
         self.dataset = FlexibleWindowDataset(
             data_buffer=data_source,
-            task_params=task_params,
             config=self.data_cfg, 
             calculate_stats=calc_stats, 
             norm_path=norm_path,
@@ -552,13 +552,22 @@ class MotionGenerator:
                             lift_end: float = 0.20,
                             walk_start_z: float = 0.80,):
         """
-        Generate trajectory via autoregressive diffusion (mirrors inference.py).
+        Generate trajectory via autoregressive diffusion.
+        
+        This is the single unified entry point for trajectory generation, used by
+        both inference.py and the evolutionary pipeline.
         
         Args:
             initial_condition: Dict with 'robot' (B, H, 36) or (H, 36) and 
                                'obj' (B, H, 7) or (H, 7) history in world frame.
-            goal_condition: np.ndarray (B, D_task) or (D_task,) — desired task params 
-                           (e.g. final object position) in world frame.
+                               Robot: [x, y, z, qw, qx, qy, qz, joint_1..joint_29].
+                               Object: [x, y, z, qw, qx, qy, qz].
+            goal_condition: np.ndarray (B, D) or (D,) — desired final object
+                           displacement from initial object position, expressed in
+                           the yaw-rotated initial robot pelvis frame.
+                           For pick_place_relative_box_pose: D=2, [relative_x, relative_y].
+                           Internally converted to world frame via:
+                             goal_world = R(yaw_init) @ goal_local + init_obj_pos
             target_traj_length: Desired output trajectory length (pre-interpolation).
                                 Used to auto-compute stitch_steps from the model window size.
                                 Ignored if stitch_steps is explicitly provided.

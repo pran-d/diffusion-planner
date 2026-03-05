@@ -22,7 +22,6 @@ class BufferDataset(FlexibleWindowDataset):
     def __init__(self, 
         data_buffer, 
         config, 
-        task_params=None,
         norm_path=None, 
         calculate_stats=True, 
         training_cfg=None,
@@ -31,7 +30,6 @@ class BufferDataset(FlexibleWindowDataset):
         super().__init__(
             data_buffer=data_buffer,
             config=config,
-            task_params=task_params,
             norm_path=norm_path,
             calculate_stats=calculate_stats,
             training_cfg=training_cfg,

@@ -293,7 +293,7 @@ if data_cfg.get("dataset_class", "flexible") == "conditional":
 elif data_cfg.get("dataset_class", "flexible") == "flexible":
     data_buffer = preload_dataset(data_cfg, data_path)
     dataset = BufferDataset(
-        data_buffer=data_buffer, config=data_cfg, task_params=None,
+        data_buffer=data_buffer, config=data_cfg,
         calculate_stats=calculate_stats, norm_path=norm_path,
         training_cfg=training_cfg,
     )

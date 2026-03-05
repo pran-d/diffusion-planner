@@ -21,7 +21,6 @@ class FlexibleWindowDataset(Dataset):
     def __init__(self, 
         data_buffer, 
         config, 
-        task_params=None,
         norm_path=None, 
         calculate_stats=False,
         training_cfg=None,  
@@ -56,7 +55,6 @@ class FlexibleWindowDataset(Dataset):
         self.add_goal_noise = training_cfg.get("add_goal_noise", False)
 
         self._raw_buffer = data_buffer
-        self._task_params = task_params
         
         # ---- Preload buffer into ram_cache ----
         self.ram_cache = []
@@ -204,7 +202,12 @@ class FlexibleWindowDataset(Dataset):
           - single dict    (from RL buffer with batched arrays)
 
         For each dict: detects schema via _convert_schema, ensures batch dim,
-        applies start_timestep / downsampling, computes goal_obj_world.
+        applies start_timestep / downsampling.
+        
+        Task params are always computed internally from the trajectory's own
+        final object position. If callers need to specify external goals, they
+        should embed 'goal_obj_world' (world-frame, shape (N,3)) directly in
+        the data dicts before passing to the dataset.
         """
         if not self._raw_buffer:
             return
@@ -218,7 +221,6 @@ class FlexibleWindowDataset(Dataset):
             buf = [buf]
 
         total_trajs = 0
-        tp_offset = 0  # running offset into the flat task_params list
 
         for raw_data in buf:
             if not raw_data:
@@ -244,27 +246,6 @@ class FlexibleWindowDataset(Dataset):
                     processed[k] = processed[k][:, start_ts::ds]
 
             N_i = processed['base'].shape[0]
-
-            # Compute goal_obj_world from task_params if provided
-            if self._task_params is not None:
-                goal_world = np.zeros((N_i, 3), dtype=np.float64)
-                for j in range(N_i):
-                    goal_local = np.asarray(self._task_params[tp_offset + j], dtype=np.float64)
-
-                    init_base = processed['base'][j, 0, :]   # (7,) [x,y,z,qw,qx,qy,qz]
-                    init_obj  = processed['obj'][j, 0, :3]    # (3,)
-
-                    init_yaw = yaw_from_quat(init_base[3:7])
-                    R = yaw_to_rot_matrix(init_yaw)
-
-                    goal_3d = np.zeros(3, dtype=np.float64)
-                    n = min(len(goal_local), 3)
-                    goal_3d[:n] = goal_local[:n]
-
-                    goal_world[j] = (R @ goal_3d[:, None])[:, 0] + init_obj
-
-                processed['goal_obj_world'] = goal_world  # (N_i, 3)
-                tp_offset += N_i
 
             self.ram_cache.append(processed)
             total_trajs += N_i
