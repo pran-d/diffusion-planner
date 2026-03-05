@@ -511,7 +511,6 @@ def main() -> None:
     print(f"[INFO] Loading checkpoint: {args.checkpoint}")
     diff_gen.fit(
         data_source=all_base,
-        task_params=None,
         epochs=0,
         checkpoint=args.checkpoint,
     )

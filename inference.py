@@ -4,8 +4,6 @@ import yaml
 import os
 import argparse
 from config.configure import load_config, get_data_path, get_norm_path
-from models.model import RobotDiffuser
-from datasets import BufferDataset
 from utils.data.load_dataset import preload_dataset
 from datasets.flexible_dataset import yaw_to_rot_matrix, yaw_from_quat
 from utils.math.sbto_utils import reconstruct_sbto_trajectory, compute_task_params, build_feature_layout
@@ -509,27 +507,29 @@ def main():
     
     args = parser.parse_args()
 
-    # 1. Load Config
+    # 1. Setup MotionGenerator (handles config, dataset, and model internally)
+    from motion_generator import MotionGenerator
+
     config_path = "config/config.yaml"
     with open(config_path, 'r') as file:
         raw_config = yaml.safe_load(file)
     model_cfg, data_cfg, training_cfg, noise_cfg = load_config(config_path, raw_config.get("auto_conf", False))
     
     device = torch.device(args.device if torch.cuda.is_available() else "cpu")
-    
-    # 2. Setup Dataset & Stats
     data_path = get_data_path(data_cfg)
-    norm_path = get_norm_path(model_cfg, training_cfg, data_cfg)
-    calculate_stats = True
-    if norm_path and os.path.exists(norm_path):
-        calculate_stats = False
-
     data_buffer = preload_dataset(data_cfg, data_path)
-    dataset = BufferDataset(
-        data_buffer=data_buffer, config=data_cfg, task_params=None,
-        calculate_stats=calculate_stats, norm_path=norm_path,
-        training_cfg={},
+
+    generator = MotionGenerator(config_path=config_path, device=device)
+    ckpt_path = args.epoch if os.path.exists(args.epoch) else None
+    generator.fit(
+        data_source=data_buffer,
+        epochs=0,
+        checkpoint=ckpt_path,
     )
+    if ckpt_path is None:
+        generator.diffuser.loadWeights(int(args.epoch))
+    
+    dataset = generator.dataset
 
     from utils.visualize.visualize import MjVisualizer
     xml_path = "mj_model.xml"
@@ -537,332 +537,128 @@ def main():
         xml_path = os.path.join(data_path, "mj_model.xml")
     vis = MjVisualizer(xml_path, close_on_enter=False)
 
-    # 3. Model
-    diffuser = RobotDiffuser(
-        model_config=model_cfg, data_config=data_cfg,
-        training_config=training_cfg, noise_scheduler_config=noise_cfg,
-        mode='inference', device=device
-    )
-    
-    if os.path.exists(args.epoch):
-        diffuser.load_weights_from_file(args.epoch)
-    else:
-        diffuser.loadWeights(int(args.epoch))
-
-    # 4. Prepare Initial Condition
+    # 2. Prepare Initial Condition
     if args.traj_idx is not None:
         target = (args.traj_idx, args.batch_idx, args.start_time)
         try:
             args.sample_idx = dataset.indices.index(target)
             print(f"Mapped {target} -> Sample {args.sample_idx}")
         except ValueError:
-            print(f"Error: Target {target} not found in dataset indices.")
             raise ValueError(f"Target indices {target} (Trajectory {args.traj_idx}, Batch {args.batch_idx}, Start {args.start_time}) not present in valid window list.")
 
     print(f"Loading initial condition (Sample {args.sample_idx})...")
-
-    # Capture start meta for task updates
     current_file_idx, current_batch_idx, current_start_time = dataset.indices[args.sample_idx]
 
-    # Build index map for faster access
-    index_map = {idx_tuple: i for i, idx_tuple in enumerate(dataset.indices)}
+    # Extract world-frame robot+object history for generate_trajectory()
+    raw_traj = dataset._get_single_traj(current_file_idx, current_batch_idx)
+    H = dataset.history_size
+    t_start = current_start_time
 
-    fut_traj, curr_state, task_params, anchor = dataset[args.sample_idx]
-    
-    history_size = dataset.history_size
-    stitched_segments = []
-    unreconstructed_segments = []
-    goal_vectors = []
-    # Analysis data: per-window normalized outputs and waypoints
-    analysis_normalized_windows = []
-    analysis_denormalized_windows = []
-    analysis_waypoint_values = []
-    analysis_waypoint_masks = []
+    base_hist = raw_traj['base'][t_start:t_start + H]       # (H, 7)
+    joints_hist = raw_traj['joints'][t_start:t_start + H]   # (H, 29)
+    obj_hist = raw_traj['obj'][t_start:t_start + H]         # (H, 7)
+    robot_hist = np.concatenate([base_hist, joints_hist], axis=-1)  # (H, 36)
 
-    # Override task params if provided
+    initial_condition = {
+        'robot': robot_hist,  # (H, 36) world frame
+        'obj': obj_hist,      # (H, 7)  world frame
+    }
+
+    # Get anchor for goal computation and metrics
+    _, _, _, anchor = dataset[args.sample_idx]
+
+    # 3. Compute goal as pelvis-local displacement from initial object position
+    #    This is the unified goal representation: displacement of the object
+    #    from initial to desired final position, expressed in the yaw-rotated
+    #    initial robot pelvis frame (matches pick_place_relative_box_pose).
     if args.task_params is not None:
-        anchor["final_obj_pos"][..., :2] = args.task_params
+        # User provides goal as pelvis-local displacement directly
+        goal_condition = np.array(args.task_params, dtype=np.float64)
+    else:
+        # Convert dataset's world-frame goal to pelvis-local displacement
+        init_quat = anchor['ref_quat']        # (4,) [qw, qx, qy, qz]
+        init_obj = anchor['ref_obj_pos'][:3]   # (3,)
+        final_obj = anchor['final_obj_pos'][:3] # (3,)
 
-    curr_state_tens = curr_state.unsqueeze(0).repeat(args.num_samples, 1, 1)
-    task_tens = task_params.repeat(args.num_samples, 1)
-
-    if args.stitch_steps is None:
-        _eff = data_cfg["num_timesteps"] - 1  # t=0 always skipped; each window yields (T-1) frames
-        args.stitch_steps = (dataset.traj_lengths[args.traj_idx] + _eff - 1) // _eff
-        print(f"Auto-setting stitch_steps to {args.stitch_steps} based on dataset length.")
-
-    if args.action_horizon is not None:
-        args.stitch_steps *= (data_cfg["num_timesteps"] // args.action_horizon)
-        print(f"Adjusting stitch_steps to {args.stitch_steps} based on action horizon")
+        yaw = yaw_from_quat(init_quat)
+        R_inv = yaw_to_rot_matrix(-yaw)  # world -> pelvis-local
+        world_delta = final_obj - init_obj
+        local_delta = (R_inv @ world_delta[:, None])[:, 0]
+        goal_condition = local_delta[:data_cfg["num_task_params"]]
 
     if args.goal_multiplier != 1.0:
         print(f"Scaling goal by multiplier {args.goal_multiplier}")
-        anchor["final_obj_pos"][..., :2] = anchor["ref_obj_pos"][..., :2] + args.goal_multiplier * (anchor["final_obj_pos"] - anchor["ref_obj_pos"])[..., :2]
+        goal_condition = goal_condition * args.goal_multiplier
+
+    print(f"Goal condition (pelvis-local displacement): {goal_condition}")
+
+    # 4. Auto-compute stitch steps
+    if args.stitch_steps is None:
+        _eff = dataset.window_size - 1
+        args.stitch_steps = (dataset.traj_lengths[current_file_idx] + _eff - 1) // _eff
+        print(f"Auto-setting stitch_steps to {args.stitch_steps}")
+
+    if args.action_horizon is not None:
+        args.stitch_steps *= (data_cfg["num_timesteps"] // args.action_horizon)
+        print(f"Adjusting stitch_steps to {args.stitch_steps} for action horizon")
+
+    if args.goal_multiplier != 1.0:
         args.stitch_steps = max(1, int(args.stitch_steps * abs(args.goal_multiplier)))
 
-    print(f"Using final box pos: {anchor['final_obj_pos']} for computing task parameters.")
+    # 5. Generate trajectory
+    if args.visualize_dataset:
+        # Ground truth mode: reconstruct directly from raw dataset (no diffusion model)
+        raw_data = dataset.ram_cache[current_file_idx]
+        base_raw = raw_data['base'][current_batch_idx]       # (T_raw, 7)
+        joints_raw = raw_data['joints'][current_batch_idx]   # (T_raw, 29)
+        obj_raw = raw_data['obj'][current_batch_idx]         # (T_raw, 7)
 
-    current_anchors = {
-        'ref_pos': np.tile(anchor['ref_pos'][None], (args.num_samples, 1)),
-        'ref_quat': np.tile(anchor['ref_quat'][None], (args.num_samples, 1)),
-        'ref_obj_pos': np.tile(anchor['ref_obj_pos'][None], (args.num_samples, 1)),
-        'final_obj_pos': np.tile(anchor['final_obj_pos'][None], (args.num_samples, 1)),
-    }
+        robot_raw = np.concatenate([base_raw, joints_raw], axis=-1)  # (T_raw, 36)
+        full_trajectory = np.concatenate([robot_raw, obj_raw], axis=-1)  # (T_raw, 43)
+        full_trajectory = full_trajectory[None]  # (1, T, 43) add batch dim
 
-    # Episode-start object z — used as absolute baseline for the z-waypoint target.
-    _rest_obj_z = float(anchor['ref_obj_pos'][2])
+        if args.num_samples > 1:
+            full_trajectory = np.repeat(full_trajectory, args.num_samples, axis=0)
+    else:
+        full_trajectory = generator.generate_trajectory(
+            initial_condition=initial_condition,
+            goal_condition=goal_condition,
+            stitch_steps=args.stitch_steps,
+            num_samples=args.num_samples,
+            cfg_w=args.cfg_w,
+            end_error_threshold=args.end_error_threshold,
+            enable_goal_stop=True,
+            enable_physics_stop=True,
+            use_last_frame_wp=args.last_frame_waypoint,
+            arrival_ratio=args.arrival_ratio,
+            lift_height=args.lift_height,
+            no_lower_dist=args.no_lower_dist,
+            lift_start=args.lift_start,
+            lift_end=args.lift_end,
+            walk_start_z=args.walk_start_z,
+        )
 
-    # Physical-consistency sanity check (task-agnostic).
-    # Flags clearly unphysical frames; halts and pads on first violation.
-    _FLOOR_Z        = -0.1   # robot/object z below this → ground penetration
-    _MAX_ROBOT_STEP = 0.25    # max robot pelvis XY step per frame at 100 Hz (m)
-    _MAX_OBJ_STEP   = 0.25    # max object XY step per frame at 100 Hz (m)
-    _prev_robot_xyz = current_anchors['ref_pos'][:, :3].copy()    # (B, 3)
-    _prev_obj_xyz   = current_anchors['ref_obj_pos'][:, :3].copy() # (B, 3)
-
-    # 5. Autoregressive Loop
-    for step in range(args.stitch_steps):
-        # print(f"Generating segment {step+1}/{args.stitch_steps}...")
-
-        # A. Inference
-        if not args.visualize_dataset:
-            tp_init, actual_dist = compute_task_params(
-                current_robot_state=current_anchors['ref_quat'], 
-                current_obj_state=current_anchors['ref_obj_pos'], 
-                desired_obj_pos=current_anchors["final_obj_pos"],
-                normalize_goal_vec=data_cfg.get("normalize_goal_vec", False),
-                num_task_params=data_cfg["num_task_params"],
-                max_goal_dist=dataset.max_obj_displacement
-            )
-            task_actual = tp_init.copy()
-            task_actual[..., 2] = actual_dist  
-
-            task_params = dataset._normalize("task_params", tp_init)
-            task_tens = task_params if isinstance(task_params, torch.Tensor) else torch.tensor(task_params, dtype=torch.float32)
-
-            # Build waypoints: full keyframe at t=0 + optional last-frame partial waypoint
-            wv, wm = None, None
-            if diffuser.model.inbetweening_enabled:
-                remaining = max(args.stitch_steps - step, 1)
-                _current_obj_z = torch.from_numpy(
-                    current_anchors['ref_obj_pos'][:, 2].astype(np.float32)
-                )
-                wv, wm = build_inference_waypoints(
-                    curr_state_tens, task_actual, dataset,
-                    data_cfg['num_features'], dataset.window_size,
-                    use_last_frame_wp=args.last_frame_waypoint,
-                    stitch_steps=args.stitch_steps,
-                    remaining_steps=remaining,
-                    arrival_ratio=args.arrival_ratio,
-                    lift_height=args.lift_height,
-                    no_lower_dist=args.no_lower_dist,
-                    lift_start=args.lift_start,
-                    lift_end=args.lift_end,
-                    walk_start_z=args.walk_start_z,
-                    current_obj_z=_current_obj_z,
-                    rest_obj_z=_rest_obj_z,
-                )
-            normalized_sample = diffuser.getSample(
-                num_trajectories=args.num_samples,
-                state_cond=curr_state_tens.to(device),
-                goal_cond=task_tens.to(device),
-                deterministic=True,
-                cfg_w=args.cfg_w,
-                guidance_wt=args.guidance_wt,
-                guidance_goal=args.guidance_goal,
-                waypoint_values=wv,
-                waypoint_mask=wm,
-            )
-        else:
-            # Bypass generative model for visualization:
-            # Use original dataset future trajectory directly
-            normalized_sample = fut_traj.unsqueeze(0).repeat(args.num_samples, 1, 1).to(device)
-            # Create dummy empty waypoints for analysis compatibility
-            wv = torch.zeros_like(normalized_sample)
-            wm = torch.zeros_like(normalized_sample, dtype=torch.bool)
-        
-        # B. Denormalize
-        denorm_btc = dataset.denormalize_global(normalized_sample)
-        future_traj_np = denorm_btc.cpu().numpy()
-
-        # Store unreconstructed segment for debugging   
-        unreconstructed_segments.append(future_traj_np)
-
-        # Collect analysis data
-        analysis_normalized_windows.append(normalized_sample.cpu().numpy())
-        analysis_denormalized_windows.append(future_traj_np)
-        if wv is not None and wm is not None:
-            analysis_waypoint_values.append(wv.cpu().numpy())
-            analysis_waypoint_masks.append(wm.cpu().numpy())
-
-        # C. Reconstruct World Frame
-        anchor_arr = np.concatenate([
-            current_anchors['ref_pos'], 
-            current_anchors['ref_quat'], 
-            current_anchors['ref_obj_pos'],
-            current_anchors['final_obj_pos']
-        ], axis=-1)
-
-        # Assuming reconstruct_sbto_trajectory returns (robot, object, ...)
-        res = reconstruct_sbto_trajectory(anchor_arr, future_traj_np, inpaint=diffuser.model_cfg.get("inpaint", False))
-        r_world, o_world = res[0], res[1]
-
-        r_world = r_world[:, 1:, :]
-        o_world = o_world[:, 1:, :]
-
-        if args.action_horizon is not None:
-            r_world = r_world[:, :args.action_horizon, :]
-            o_world = o_world[:, :args.action_horizon, :]
-        
-        # Store Segment — Robot(36) + Object(7)
-        segment_world = np.concatenate([r_world[..., :36], o_world[..., :7]], axis=-1)
-
-        # ── Physical-consistency check ─────────────────────────────────────────
-        # Scan every frame for ground penetration or position spikes.  On the
-        # first violating frame: clamp the window there, pad all remaining
-        # stitch windows with that static frame, and halt generation.
-        _rxy   = segment_world[:, :, :2]      # robot pelvis XY  (B, T, 2)
-        _rz    = segment_world[:, :, 2]       # robot pelvis Z   (B, T)
-        _oxy   = segment_world[:, :, 36:38]   # object XY        (B, T, 2)
-        _oz    = segment_world[:, :, 38]      # object Z         (B, T)
-        _rxy_p = np.concatenate([_prev_robot_xyz[:, None, :2], _rxy[:, :-1, :]], axis=1)
-        _oxy_p = np.concatenate([_prev_obj_xyz[:, None, :2],   _oxy[:, :-1, :]], axis=1)
-        _floor   = (_rz < _FLOOR_Z) | (_oz < _FLOOR_Z)
-        _rspike  = np.linalg.norm(_rxy - _rxy_p, axis=-1) > _MAX_ROBOT_STEP
-        _ospike  = np.linalg.norm(_oxy - _oxy_p, axis=-1) > _MAX_OBJ_STEP
-        _bad_t   = np.where((_floor | _rspike | _ospike).any(axis=0))[0]
-        _phys_stop = _bad_t.size > 0
-        if _phys_stop:
-            _t_bad   = int(_bad_t[0])
-            _t_clamp = max(_t_bad, 1)
-            _last_ok = segment_world[:, _t_clamp - 1 : _t_clamp, :]
-            segment_world = segment_world.copy()
-            segment_world[:, _t_clamp:, :] = _last_ok
-            print(f"[physics] step {step+1}: violation at frame {_t_bad} "
-                  f"(floor={bool(_floor.any(0)[_t_bad])}, "
-                  f"robot_spike={bool(_rspike.any(0)[_t_bad])}, "
-                  f"obj_spike={bool(_ospike.any(0)[_t_bad])}). Truncating and halting.")
-        # ──────────────────────────────────────────────────────────────────────
-
-        stitched_segments.append(segment_world)
-
-        # Denormalize task params before transforming to global frame
-        task_denorm = dataset._denormalize("task_params", task_tens) # (B, 2)
-        if task_denorm.shape[1] < 3:
-            task_denorm = torch.cat([task_denorm, torch.zeros_like(task_denorm[:, :1])], dim=1)
-        task_denorm_3d = task_denorm[..., None] # (B, 3)
-        
-        goal_vec_global = (yaw_to_rot_matrix(yaw_from_quat(current_anchors['ref_quat'])) @ task_denorm_3d.cpu().numpy())[..., :data_cfg["num_task_params"], 0]
-        goal_vectors.append(goal_vec_global.repeat(segment_world.shape[1], 0)[..., :2]) # (B, 3)
-
-        # Update per-window position trackers for spike detection at next boundary
-        _prev_robot_xyz = segment_world[:, -1, :3].copy()
-        _prev_obj_xyz   = segment_world[:, -1, 36:39].copy()
-
-        # If physics check fired: pad all remaining windows and stop generation
-        if _phys_stop:
-            _steps_to_pad = args.stitch_steps - step - 1
-            if _steps_to_pad > 0:
-                _last_frame = segment_world[:, -1:, :]
-                _seg_T      = segment_world.shape[1]
-                _pad_seg    = np.repeat(_last_frame, _seg_T, axis=1)
-                _last_gv    = goal_vectors[-1]
-                for _ in range(_steps_to_pad):
-                    stitched_segments.append(_pad_seg)
-                    goal_vectors.append(_last_gv)
-            break
-
-        # Optionally visualize this window
-        visualize_every = 50
-        if args.visualize_windows and step % visualize_every == 0:
-            part_traj = np.concatenate(stitched_segments[-visualize_every:], axis=1)
-            part_goal_vec = np.concatenate(goal_vectors[-visualize_every:], axis=0)
-            try:
-                run_visualization(vis, part_traj, part_goal_vec, anchor["final_obj_pos"], repeat=False)
-            except Exception as e:
-                print(f"Warning: interactive visualization failed for window {step}: {e}")
-
-        # Desired Displacement (From Ground Truth Full Trajectory)
-        err = np.linalg.norm(current_anchors["final_obj_pos"][..., :data_cfg["num_task_params"]] - segment_world[:, -1, 36 : 36 + data_cfg["num_task_params"]])
-        if err < args.end_error_threshold and not args.visualize_dataset:
-            print(f"Segment {step+1} successfully reached the goal (Error: {err:.4f}).")
-            break
-
-        # D. Update Condition
-        if step < args.stitch_steps - 1:
-            r_hist = r_world[:, -history_size:, :]
-            o_hist = o_world[:, -history_size:, :]
-            curr_state_tens, current_anchors = update_condition(dataset, r_hist, o_hist, final_obj_pos=current_anchors['final_obj_pos'])
-
-            if args.visualize_dataset: 
-                # Update Task Params and anchor for next window from ground truth
-                next_start = current_start_time + (step + 1) * dataset.window_size
-                target_key = (current_file_idx, current_batch_idx, next_start)
-                if target_key in index_map:
-                    next_idx = index_map[target_key]
-                    fut_traj, _, next_task, next_anchor = dataset[next_idx]
-                    task_tens = next_task.unsqueeze(0).repeat(args.num_samples, 1).to(device)
-                    # Use ground truth anchor so reconstruction errors don't accumulate
-                    current_anchors = {
-                        'ref_pos': np.tile(next_anchor['ref_pos'][None], (args.num_samples, 1)),
-                        'ref_quat': np.tile(next_anchor['ref_quat'][None], (args.num_samples, 1)),
-                        'ref_obj_pos': np.tile(next_anchor['ref_obj_pos'][None], (args.num_samples, 1)),
-                        'final_obj_pos': np.tile(next_anchor['final_obj_pos'][None], (args.num_samples, 1)),
-                    }
-                    print(f"Updated task params for step {step+1} to sample {next_idx} (Start T={next_start})")
-                else:
-                    print(f"Warning: Could not find next window starting at {next_start}. Reusing previous task params.")
-
-
-    # 6. Finalize
-    full_trajectory = np.concatenate(stitched_segments, axis=1) # (B, T, D)
-    unreconstructed_trajectory = np.concatenate(unreconstructed_segments, axis=1) if len(unreconstructed_segments) > 0 else None
-    goal_vectors = np.concatenate(goal_vectors, axis=0) # (B, task_dim)
-
+    # 6. Save
     os.makedirs(os.path.dirname(args.save_path), exist_ok=True)
     np.save(args.save_path, full_trajectory)
-    print(f"Stitched trajectory saved to {args.save_path} (Shape: {full_trajectory.shape})")
+    print(f"Trajectory saved to {args.save_path} (Shape: {full_trajectory.shape})")
 
-    # Save analysis data
-    analysis_path = args.save_path.replace('.npy', '_analysis.npz')
-    analysis_data = {
-        'trajectory': full_trajectory,                                          # (B, total_T, 43) world frame
-        'normalized_windows': np.array(analysis_normalized_windows),            # (num_windows, B, T, D) normalized
-        'denormalized_windows': np.array(analysis_denormalized_windows),        # (num_windows, B, T, D) denormalized features
-        'waypoint_values': np.array(analysis_waypoint_values),                  # (num_windows, B, T, D)
-        'waypoint_masks': np.array(analysis_waypoint_masks),                    # (num_windows, B, T, D) bool
-        'feature_order': np.array(dataset.feature_order),                       # feature names
-        'feature_dims': np.array([build_feature_layout()[k] for k in dataset.feature_order]),  # dim per feature
-    }
-    if unreconstructed_trajectory is not None:
-        analysis_data['unreconstructed'] = unreconstructed_trajectory
-    np.savez(analysis_path, **analysis_data)
-    print(f"Analysis data saved to {analysis_path}")
-    
-    # Object indices: 36:38 (pos), 38:42 (quat)
+    # 7. Print metrics
     if full_trajectory.shape[-1] >= 38:
-        # Achieved Displacement
-        start_obj = full_trajectory[0, 0, 36 : 36 + data_cfg["num_task_params"]]
-        end_obj = full_trajectory[0, -1, 36 : 36 + data_cfg["num_task_params"]]
-        achieved_displacement = (end_obj - start_obj)[..., :data_cfg['num_task_params']]
-        desired_displacement = (anchor["final_obj_pos"] - anchor["ref_obj_pos"])[..., :data_cfg['num_task_params']]
-        try:            
-            print("-" * 30)
-            print(f"Goal: Full Trajectory Displacement")
-            print(f"Desired (GT) Delta XY: {desired_displacement}")
-            print(f"Achieved (Gen) Delta XY: {achieved_displacement}")
-            err = np.linalg.norm(desired_displacement - achieved_displacement)
-            print(f"L2 Error: {err:.4f}")
-            print("-" * 30)
-            
-        except Exception as e:
-            print(f"Could not load ground truth for comparison: {e}")
-            # Fallback to previous method if needed, but it's likely wrong for windows
-            pass
+        start_obj = full_trajectory[0, 0, 36:36 + data_cfg["num_task_params"]]
+        end_obj = full_trajectory[0, -1, 36:36 + data_cfg["num_task_params"]]
+        achieved_displacement = end_obj - start_obj
+        desired_displacement = (anchor["final_obj_pos"] - anchor["ref_obj_pos"])[:data_cfg["num_task_params"]]
+        print("-" * 30)
+        print(f"Desired (GT) Delta XY: {desired_displacement}")
+        print(f"Achieved (Gen) Delta XY: {achieved_displacement}")
+        err = np.linalg.norm(desired_displacement - achieved_displacement)
+        print(f"L2 Error: {err:.4f}")
+        print("-" * 30)
 
-    # 7. Visualize
+    # 8. Visualize
     if os.path.exists(xml_path):
-        run_visualization(vis, full_trajectory, goal_vectors, anchor["final_obj_pos"])
+        run_visualization(vis, full_trajectory, final_obj_pos=anchor["final_obj_pos"])
     else:
         print("Could not find mj_model.xml for visualization.")
 

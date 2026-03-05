@@ -27,7 +27,7 @@ def load_dataset():
     # Initialize dataset
     data_buffer = preload_dataset(data_cfg, data_path)
     dataset = BufferDataset(
-        data_buffer=data_buffer, config=data_cfg, task_params=None,
+        data_buffer=data_buffer, config=data_cfg,
         calculate_stats=False, norm_path=norm_path,
         training_cfg=training_cfg,
     )
