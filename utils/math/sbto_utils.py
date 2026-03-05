@@ -588,6 +588,12 @@ def reconstruct_sbto_trajectory(
         delta_obj_global = (R_ref_yaw[:, None, :, :] @ delta_obj_local[..., None]).squeeze(-1)
         obj_pos_world[..., :2] = obj_global_anchor[:, None, :2] + delta_obj_global[..., :2]
 
+    # Use the absolute obj_z feature for the object Z coordinate when available.
+    # Without this, the Z comes from obj_rel_pos (relative to pelvis), which is
+    # inconsistent with any obj_z waypoint constraints applied during inference.
+    if inpaint and IDX_OBJ_Z is not None:
+        obj_pos_world[..., 2] = future_traj[:, :, IDX_OBJ_Z.start]
+
     # --------------------------------------------------
     # Velocities (optional)
     # --------------------------------------------------
@@ -793,7 +799,7 @@ def compute_guidance_vec(current_pos, target_pos, R_robot_yaw_inv, current_rot=N
 
     return np.concatenate([guidance_dir, dist], axis=-1).squeeze(1)
 
-def compute_task_params(current_robot_state, current_obj_state, desired_obj_pos, normalize_goal_vec=True, num_task_params=3, max_goal_dist=None):
+def compute_task_params(current_robot_state, current_obj_state, desired_obj_pos, normalize_goal_vec=True, num_task_params=3, max_goal_dist=1.0):
     """
     Computes the task parameters (local object displacement) for the diffusion model.
     Matches the normalization convention of FlexibleWindowDataset._compute_task_params.
@@ -805,6 +811,7 @@ def compute_task_params(current_robot_state, current_obj_state, desired_obj_pos,
                                         representing the current object position.
         desired_obj_pos (np.ndarray): Shape (3,) [x, y, z] 
                                       representing the GOAL object position in world frame.
+        max_goal_dist (float): Maximum allowed distance for the goal vector.
 
     Returns:
         np.ndarray: Shape (..., num_task_params).
@@ -859,7 +866,7 @@ def compute_task_params(current_robot_state, current_obj_state, desired_obj_pos,
         np.divide(vec_part, norm, out=normalized_vec, where=mask)
         
         # Clip distance magnitude
-        norm_clipped = np.clip(norm, a_min=None, a_max=1.0)
+        norm_clipped = np.clip(norm, a_min=None, a_max=max_goal_dist)
         
         # Concatenate: [normalized_dir, clipped_magnitude]
         # Ensure we concatenate along the last axis

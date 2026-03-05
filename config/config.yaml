@@ -49,6 +49,8 @@ model:
   num_heads: 4
   mlp_ratio: 4.0
   pos_emb_type: "sinusoidal_1d"
+  attn_drop: 0.05
+  proj_drop: 0.05
 
 training:
   save_dir: "./runs/ablations/masking/"
@@ -70,14 +72,14 @@ training:
     body_rot6d: 0.005
     obj_rel_pos: 0.005
     obj_rel_rot6d: 0.005
-    task_params: 0.025
-    task_magnitude: 0.0
+    task_params: 0.05
+    task_magnitude: 0.15
 
   # In-betweening (waypoint-masked trajectory completion)
   inbetweening:
     enabled: True
     resample_steps: 2      # number of times to re-mask and re-predict waypoints during training
-    min_keyframes: 0        # minimum number of unmasked keyframes per window
+    min_keyframes: 1        # minimum number of unmasked keyframes per window
     max_keyframes: 3        # maximum number of unmasked keyframes per window
     always_keep_first: True # always keep t=0 as a full keyframe
     keep_last_partial: True # always keep t=T-1 as a keyframe
@@ -97,7 +99,7 @@ training:
         robot_pos: [body_z, delta_xy, delta_yaw]
       group_keep_prob:      # per-group probability of being kept clean in a partial waypoint
         locomotion: 0.5
-        pick_place: 0.2
+        pick_place: 0.4
         lower_body: 0.15
         upper_body: 0.15
         object_pos: 0.0

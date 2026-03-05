@@ -527,7 +527,13 @@ class FlexibleWindowDataset(Dataset):
             noise = torch.randn_like(tensor) * noise_level
             tensor = tensor + noise
         if key == "task_params" and self.noise_cfg.get("task_magnitude", 0) > 0:
-            tensor[..., 2] *= torch.rand_like(tensor[..., 2]) * self.noise_cfg["task_magnitude"] # Large noise for goal distance to encourage generalization
+            # Multiplicative jitter on the distance component (index 2) to
+            # encourage generalization to novel goal distances.
+            # Scale factor is uniform in [1 - mag, 1 + mag].
+            mag = self.noise_cfg["task_magnitude"]
+            scale = 1.0 + (2.0 * torch.rand_like(tensor[..., 2]) - 1.0) * mag
+            tensor = tensor.clone()
+            tensor[..., 2] = tensor[..., 2] * scale
         return tensor
 
     def __getitem__(self, idx):

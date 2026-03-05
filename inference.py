@@ -41,7 +41,7 @@ def compute_z_profile(progress, lift_height=DEFAULT_LIFT_HEIGHT,
     p = max(0.0, min(1.0, progress))
     
     if p < lift_start:
-        return 0.0
+        return 0.18
     elif p < lift_end:
         # Smooth ramp up (raised cosine: 0 → 1)
         t = (p - lift_start) / (lift_end - lift_start)

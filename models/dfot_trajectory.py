@@ -107,6 +107,8 @@ class DFoTTrajectory(nn.Module):
                 "pos_emb_type": model_config.get("pos_emb_type", "learned_1d"),
                 "use_gradient_checkpointing": False,
                 "external_cond_dropout": model_config.get("external_cond_dropout", 0.1),
+                "attn_drop": model_config.get("attn_drop", 0.0),
+                "proj_drop": model_config.get("proj_drop", 0.0),
             })
         elif backbone_type == "unet1d":
             backbone_cfg = Config({

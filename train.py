@@ -250,6 +250,7 @@ diffuser = RobotDiffuser(
 optimizer = torch.optim.AdamW(
     diffuser.model.parameters(), 
     lr=training_cfg.get("learning_rate", 1e-4),
+    weight_decay=training_cfg.get("weight_decay", 0.01),
 )
 
 scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(

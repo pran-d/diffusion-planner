@@ -104,6 +104,8 @@ class DiT1D(BaseBackbone):
         mlp_ratio = cfg.mlp_ratio
         use_gradient_checkpointing = cfg.use_gradient_checkpointing
         pos_emb_type = cfg.pos_emb_type
+        attn_drop = getattr(cfg, 'attn_drop', 0.0)
+        proj_drop = getattr(cfg, 'proj_drop', 0.0)
 
         self.input_embedder = nn.Linear(in_channels, hidden_size)
         
@@ -133,6 +135,8 @@ class DiT1D(BaseBackbone):
                 hidden_size=hidden_size,
                 num_heads=num_heads,
                 mlp_ratio=mlp_ratio,
+                attn_drop=attn_drop,
+                proj_drop=proj_drop,
             )
             for _ in range(depth)
         ])
