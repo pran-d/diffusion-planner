@@ -85,17 +85,17 @@ def parse_args():
     # Waypoint / z-profile args (forwarded to run_evaluation_batch)
     parser.add_argument("--last_frame_waypoint", action="store_true",
                         help="Add last-frame partial waypoint (obj_delta_xy + obj_delta_z)")
-    parser.add_argument("--arrival_ratio", type=float, default=0.85,
-                        help="Object arrives in this fraction of remaining time (0-1)")
+    parser.add_argument("--arrival_ratio", type=float, default=0.70,
+                        help="Object arrives in this fraction of total time (0-1; data: 90%% XY by 65%%)")
     parser.add_argument("--lift_height",   type=float, default=DEFAULT_LIFT_HEIGHT,
                         help=f"Peak lift height in metres (default: {DEFAULT_LIFT_HEIGHT}m)")
-    parser.add_argument("--lift_start",    type=float, default=0.0,
-                        help="Fraction of trajectory where lift begins")
-    parser.add_argument("--lift_end",      type=float, default=0.20,
-                        help="Fraction of trajectory where lift reaches peak")
-    parser.add_argument("--walk_start_z",  type=float, default=0.80,
-                        help="Gate XY motion until z >= this fraction of lift_height")
-    parser.add_argument("--no_lower_dist", type=float, default=0.5,
+    parser.add_argument("--lift_start",    type=float, default=0.10,
+                        help="Fraction of trajectory where lift begins (data: ~10%%)")
+    parser.add_argument("--lift_end",      type=float, default=0.40,
+                        help="Fraction of trajectory where lift reaches peak (data: ~40%%)")
+    parser.add_argument("--walk_start_z",  type=float, default=0.25,
+                        help="Gate XY motion until z >= this fraction of lift_height (data: ~25%%)")
+    parser.add_argument("--no_lower_dist", type=float, default=0.75,
                         help="Lower z when XY distance to goal drops below this (metres)")
 
     # Output

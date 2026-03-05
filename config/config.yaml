@@ -1,7 +1,7 @@
 auto_conf: False
 
 data:
-  dir_path: "/home/pranish/pranav/diffusion-mp/simple_diffusion/"
+  dir_path: "/home/pranav/tu-munich/atari/diffusion-planner/"
   # train_path: "test_datasets/pick_place"
   train_path: "test_datasets/trial/cleanup"
   task_list_path: "test_datasets/chosen_tasks_test.yml"
@@ -84,7 +84,7 @@ training:
     always_keep_first: True # always keep t=0 as a full keyframe
     keep_last_partial: True # always keep t=T-1 as a keyframe
     waypoint_noise_fraction: 0.5  # max noise level for partial waypoint frames (fraction of total timesteps)
-    arrival_ratio: 0.85            # object reaches target in this fraction of remaining time
+    arrival_ratio: 0.70            # object reaches target in this fraction of total time (data: 90% XY by ~65%)
     partial_masking:
       enabled: True
       prob: 1.0             # probability a waypoint is partial (vs full)

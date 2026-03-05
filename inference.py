@@ -9,45 +9,54 @@ from datasets.flexible_dataset import yaw_to_rot_matrix, yaw_from_quat
 from utils.math.sbto_utils import reconstruct_sbto_trajectory, compute_task_params, build_feature_layout
 
 # Default lift height derived from dataset statistics:
-# median peak cumulative obj_delta_z across 1634 pick-and-place trajectories.
-DEFAULT_LIFT_HEIGHT = 0.5
+# median peak z_delta ≈ 0.617 across 231 pick-and-place trajectories.
+DEFAULT_LIFT_HEIGHT = 0.62
 
 
 def compute_z_profile(progress, lift_height=DEFAULT_LIFT_HEIGHT,
-                      lift_start=0.0, lift_end=0.20,):
+                      lift_start=0.10, lift_end=0.30,
+                      lower_start=0.60, lower_end=0.80):
     """
-    Compute the desired cumulative z-offset at a given progress fraction [0, 1]
-    using a smooth raised-cosine bell.
+    Compute the desired z-offset above rest at a given progress fraction [0, 1].
 
-    Profile phases:
-        [0, lift_start)        → 0            (no lift yet)
-        [lift_start, lift_end) → ramp up      (pick up)
-        [lift_end, lower_start)→ lift_height  (carry at full height)
-        [lower_start, lower_end)→ ramp down   (time-based lower; default disabled)
-        [lower_end, 1]         → 0            (settled)
+    Profile phases (calibrated from 231 training trajectories):
+        [0, lift_start)             → 0            (object at rest)
+        [lift_start, lift_end)      → ramp up      (raised cosine 0 → lift_height)
+        [lift_end, lower_start)     → lift_height  (carry at peak)
+        [lower_start, lower_end)    → ramp down    (raised cosine lift_height → 0)
+        [lower_end, 1]              → 0            (object placed)
 
-    Lowering is normally controlled by remaining XY distance in
-    build_last_frame_waypoints (lower_start=1.0 default disables time-based lower).
+    Data calibration:
+        lift_start=0.10  — z delta is ~0 at 5% progress
+        lift_end=0.40    — median peak z at 40% progress
+        lower_start=0.55 — z starts descending around 55%
+        lower_end=0.75   — z returns to rest by ~75%
 
     Args:
         progress: float in [0, 1]
-        lift_height: peak z-offset in meters
+        lift_height: peak z-offset in meters (data median ≈ 0.62)
         lift_start/lift_end: trajectory fraction for the lift ramp
-        lower_start/lower_end: trajectory fraction for the lower ramp (default disabled)
+        lower_start/lower_end: trajectory fraction for the descent ramp
     Returns:
-        float: desired cumulative delta_z at this progress
+        float: desired z-offset above rest at this progress
     """
     import math
     p = max(0.0, min(1.0, progress))
-    
+
     if p < lift_start:
-        return 0.18
+        return 0.0
     elif p < lift_end:
-        # Smooth ramp up (raised cosine: 0 → 1)
+        # Smooth ramp up (raised cosine: 0 → lift_height)
         t = (p - lift_start) / (lift_end - lift_start)
         return lift_height * 0.5 * (1.0 - math.cos(math.pi * t))
-    else:
+    elif p < lower_start:
         return lift_height  # carry phase — hold at peak
+    elif p < lower_end:
+        # Smooth ramp down (raised cosine: lift_height → 0)
+        t = (p - lower_start) / (lower_end - lower_start)
+        return lift_height * 0.5 * (1.0 + math.cos(math.pi * t))
+    else:
+        return 0.0  # placed
 
 
 def build_keyframes(normalized_window, keep_first=True, keep_last=True, num_samples=1):
@@ -150,28 +159,29 @@ def build_last_frame_waypoints(
     num_features,        # D
     total_steps,         # The initial total number of windows/steps for this task
     remaining_steps,     # how many windows remain to reach goal
-    arrival_ratio=0.85,  # finish in this fraction of total time
-    t_accel=0.35,        # fraction of time spent accelerating (data: peak XY velocity at ~40%)
-    t_decel=0.35,        # fraction of time spent decelerating (data: long tail, ~0 at 90%)
-    lift_height=DEFAULT_LIFT_HEIGHT,  # peak z-offset for pick-and-place
-    no_lower_dist=0.5,   # lower z only when remaining XY dist drops below this (metres)
-    lift_start=0.0,      # fraction of trajectory where lift begins (0 = immediately)
-    lift_end=0.20,       # fraction of trajectory where lift reaches peak
-    walk_start_z=0.80,   # don't move XY until cumulative z >= this fraction of lift_height
+    arrival_ratio=0.70,  # data: 90% of XY covered by ~65% progress; arrive by 70%
+    t_accel=0.35,        # fraction of time spent accelerating
+    t_decel=0.25,        # data: XY goes 50%→90% quickly; shorter decel
+    lift_height=DEFAULT_LIFT_HEIGHT,  # peak z-offset for pick-and-place (data: 0.62m)
+    no_lower_dist=0.75,  # lower z when remaining XY dist < this (data: lowering starts ~55%)
+    lift_start=0.10,     # data: z delta ~0 at 5%, starts rising by ~10%
+    lift_end=0.30,       # data: median peak z at 40% progress
+    walk_start_z=0.25,   # data: XY starts (>5%) at ~22% progress, z ≈ 25% of peak there
     rest_obj_z=None,     # (B,) or scalar: absolute object z at episode start (rest height)
 ):
     """
     Build a partial waypoint at the last frame (t=T-1) of the window.
 
-    Sequence:
-      1. Lift immediately (lift_start=0 → lift_end=0.20).
-      2. Walk only after z >= walk_start_z * lift_height (default 80% of peak).
-      3. Lower only when remaining XY dist < no_lower_dist (default 0.5 m).
-         Lowering uses a smooth raised-cosine ramp: lift_height at no_lower_dist, 0 at goal.
+    Sequence (calibrated from 231 training trajectories):
+      1. Lift starts at ~10% of trajectory, reaches peak at ~40%.
+      2. Walk starts after z >= 25% of lift_height (~22% progress).
+      3. XY arrives at ~70% of trajectory (data: 90% XY covered by 65%).
+      4. Lower when remaining XY dist < 0.75m (cosine ramp to 0 near goal).
+      5. Object placed by ~75% of trajectory.
 
     XY profile (data-calibrated):
-        t_accel=0.35  peak velocity at ~40% of walking phase
-        t_decel=0.35  long deceleration tail
+        t_accel=0.35  — XY 50% at 44% progress
+        t_decel=0.25  — XY 90% at 65% progress
     """
     if isinstance(task_params_raw, np.ndarray):
         task_params_raw = torch.from_numpy(task_params_raw).float()
@@ -338,12 +348,12 @@ def build_inference_waypoints(
     use_last_frame_wp=True,  # whether to add last-frame partial waypoint
     stitch_steps=1,
     remaining_steps=1,
-    arrival_ratio=0.85,
-    lift_height=DEFAULT_LIFT_HEIGHT,  # peak z-offset for pick-and-place profile
-    no_lower_dist=0.5,               # lower z only when remaining XY dist < this (metres)
-    lift_start=0.0,                  # z profile: lift start (fraction of total trajectory)
-    lift_end=0.20,                   # z profile: lift end
-    walk_start_z=0.80,               # gate XY walk until z >= this fraction of lift_height
+    arrival_ratio=0.70,
+    lift_height=DEFAULT_LIFT_HEIGHT,  # peak z-offset (data: median 0.62m)
+    no_lower_dist=0.75,              # lower z when remaining XY dist < this (metres)
+    lift_start=0.10,                 # z profile: lift start (data: ~10%)
+    lift_end=0.30,                   # z profile: lift peak (data: ~40%)
+    walk_start_z=0.25,               # gate XY walk until z >= this fraction of lift_height
     current_obj_z=None,              # (B,) absolute object z at t=0 of this window (for t=0 keyframe)
     rest_obj_z=None,                 # (B,) or scalar: episode-start rest z (for absolute z target)
 ):
@@ -498,15 +508,15 @@ def main():
     parser.add_argument("--guidance_goal", nargs="+", type=float, default=None, help="Target values for guidance (normalized)")
     parser.add_argument("--guidance_indices", nargs="+", type=int, default=None, help="Indices of the state vector to apply guidance on")
     parser.add_argument("--last_frame_waypoint", action="store_true", help="Add partial waypoint at last frame (obj_delta_xy + obj_z absolute)")
-    parser.add_argument("--arrival_ratio", type=float, default=0.85, help="Object arrives in this fraction of remaining time (0-1)")
+    parser.add_argument("--arrival_ratio", type=float, default=0.70, help="Object arrives in this fraction of total time (0-1; data: 90%% XY by 65%%)")
     parser.add_argument("--lift_height", type=float, default=DEFAULT_LIFT_HEIGHT,
                         help=f"Peak lift height in meters for pick-and-place z profile (default: {DEFAULT_LIFT_HEIGHT}m from dataset)")
-    parser.add_argument("--lift_start", type=float, default=0.0, help="Fraction of trajectory where lift begins (0=immediately)")
-    parser.add_argument("--lift_end", type=float, default=0.20, help="Fraction of trajectory where lift reaches peak")
-    parser.add_argument("--walk_start_z", type=float, default=0.80,
-                        help="Gate XY motion: don't walk until z >= this fraction of lift_height (default: 0.80)")
-    parser.add_argument("--no_lower_dist", type=float, default=0.4,
-                        help="Lower z when remaining XY distance drops below this value in metres (default: 0.3m)")
+    parser.add_argument("--lift_start", type=float, default=0.10, help="Fraction of trajectory where lift begins (data: ~10%%)")
+    parser.add_argument("--lift_end", type=float, default=0.40, help="Fraction of trajectory where lift reaches peak (data: ~40%%)")
+    parser.add_argument("--walk_start_z", type=float, default=0.25,
+                        help="Gate XY motion: don't walk until z >= this fraction of lift_height (data: ~25%%)")
+    parser.add_argument("--no_lower_dist", type=float, default=0.75,
+                        help="Lower z when remaining XY distance drops below this value in metres (default: 0.75m)")
     
     args = parser.parse_args()
 

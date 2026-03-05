@@ -114,16 +114,16 @@ def parse_args():
     # Waypoint arguments
     parser.add_argument("--last_frame_waypoint", action="store_true",
                         help="Add partial waypoint at last frame (obj_delta_xy + obj_z absolute) when inbetweening is enabled")
-    parser.add_argument("--arrival_ratio", type=float, default=0.85,
-                        help="Object arrives in this fraction of remaining time (0-1)")
+    parser.add_argument("--arrival_ratio", type=float, default=0.70,
+                        help="Object arrives in this fraction of total time (0-1; data: 90%% XY by 65%%)")
     parser.add_argument("--lift_height", type=float, default=DEFAULT_LIFT_HEIGHT,
                         help=f"Peak lift height in meters for pick-and-place z profile (default: {DEFAULT_LIFT_HEIGHT}m)")
-    parser.add_argument("--lift_start", type=float, default=0.0, help="Fraction of trajectory where lift begins (0=immediately)")
-    parser.add_argument("--lift_end", type=float, default=0.20, help="Fraction of trajectory where lift reaches peak")
-    parser.add_argument("--walk_start_z", type=float, default=0.80,
-                        help="Gate XY motion: don't walk until z >= this fraction of lift_height (default: 0.80)")
-    parser.add_argument("--no_lower_dist", type=float, default=0.5,
-                        help="Lower z when remaining XY distance drops below this value in metres (default: 0.5m)")
+    parser.add_argument("--lift_start", type=float, default=0.10, help="Fraction of trajectory where lift begins (data: ~10%%)")
+    parser.add_argument("--lift_end", type=float, default=0.40, help="Fraction of trajectory where lift reaches peak (data: ~40%%)")
+    parser.add_argument("--walk_start_z", type=float, default=0.25,
+                        help="Gate XY motion: don't walk until z >= this fraction of lift_height (data: ~25%%)")
+    parser.add_argument("--no_lower_dist", type=float, default=0.75,
+                        help="Lower z when remaining XY distance drops below this value in metres (default: 0.75m)")
     parser.add_argument("--visualize", action="store_true",
                         help="Render generated trajectories in MuJoCo after evaluation")
 
@@ -190,12 +190,12 @@ def run_evaluation_batch(
         and getattr(diffuser.model, 'inbetweening_enabled', False)
     )
     use_last_frame_wp = getattr(args, 'last_frame_waypoint', False)
-    arrival_ratio = getattr(args, 'arrival_ratio', 0.85)
+    arrival_ratio = getattr(args, 'arrival_ratio', 0.70)
     lift_height = getattr(args, 'lift_height', DEFAULT_LIFT_HEIGHT)
-    no_lower_dist = getattr(args, 'no_lower_dist', 0.5)
-    lift_start = getattr(args, 'lift_start', 0.0)
-    lift_end = getattr(args, 'lift_end', 0.20)
-    walk_start_z = getattr(args, 'walk_start_z', 0.80)
+    no_lower_dist = getattr(args, 'no_lower_dist', 0.75)
+    lift_start = getattr(args, 'lift_start', 0.10)
+    lift_end = getattr(args, 'lift_end', 0.40)
+    walk_start_z = getattr(args, 'walk_start_z', 0.25)
     num_features = dataset.num_features
     window_size = dataset.window_size
 

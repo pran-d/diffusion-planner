@@ -545,12 +545,12 @@ class MotionGenerator:
                             enable_goal_stop: bool = False,
                             enable_physics_stop: bool = False,
                             use_last_frame_wp: bool = True,
-                            arrival_ratio: float = 0.85,
-                            lift_height: float = 0.5,
-                            no_lower_dist: float = 0.5,
-                            lift_start: float = 0.0,
-                            lift_end: float = 0.20,
-                            walk_start_z: float = 0.80,
+                            arrival_ratio: float = 0.70,
+                            lift_height: float = 0.62,
+                            no_lower_dist: float = 0.75,
+                            lift_start: float = 0.10,
+                            lift_end: float = 0.40,
+                            walk_start_z: float = 0.25,
                             return_analysis: bool = False,):
         """
         Generate trajectory via autoregressive diffusion.

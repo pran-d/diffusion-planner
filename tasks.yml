@@ -1,0 +1,201 @@
+{"task_index": 0, "task": "[push] the box [forward] | [rotate] the box [counterclockwise]", "original_folder": "sub10_largebox_000_original"}
+{"task_index": 1, "task": "[push] the box [forward]", "original_folder": "sub10_largebox_001_original"}
+{"task_index": 2, "task": "[push] the box [forward]", "original_folder": "sub10_largebox_002_original"}
+{"task_index": 3, "task": "[push] the box [forward]", "original_folder": "sub10_largebox_003_original"}
+{"task_index": 4, "task": "[push] the box [forward]", "original_folder": "sub10_largebox_004_original"}
+{"task_index": 5, "task": "[rotate] the box [clockwise] | [push] the box [forward]", "original_folder": "sub10_largebox_005_original"}
+{"task_index": 6, "task": "[push] the box [forward] | [rotate] the box [clockwise]", "original_folder": "sub10_largebox_006_original"}
+{"task_index": 7, "task": "[push] the box [forward]", "original_folder": "sub10_largebox_007_original"}
+{"task_index": 8, "task": "[push] the box [forward]", "original_folder": "sub10_largebox_008_original"}
+{"task_index": 9, "task": "[push] the box [to right]", "original_folder": "sub10_largebox_009_original"}
+{"task_index": 10, "task": "[push] the box [forward]", "original_folder": "sub10_largebox_010_original"}
+{"task_index": 11, "task": "[hold] the box | [rotate] the box [clockwise] | [place] the box [on the floor]", "original_folder": "sub10_largebox_014_original"}
+{"task_index": 12, "task": "[hold] the box | [rotate] the box clockwise | [place] the box on the floor", "original_folder": "sub10_largebox_022_original"}
+{"task_index": 13, "task": "[hold] the box | [rotate] the box [counterclockwise] | [place] the box [on the floor]", "original_folder": "sub10_largebox_024_original"}
+{"task_index": 14, "task": "[hold] the box | [rotate] the box [counterclockwise] | [place] the box [on the floor]", "original_folder": "sub10_largebox_031_original"}
+{"task_index": 15, "task": "[hold] the box | [rotate] the box [counterclockwise] | [place] the box [on the floor]", "original_folder": "sub10_largebox_033_original"}
+{"task_index": 16, "task": "[hold] the box | [rotate] the box [clockwise] | [place] the box [on the floor]", "original_folder": "sub10_largebox_034_original"}
+{"task_index": 17, "task": "[hold] the box | [rotate] the box [counterclockwise] | [place] the box [on the floor]", "original_folder": "sub10_largebox_035_original"}
+{"task_index": 18, "task": "[pick] the box | [rotate] the box [clockwise] | [place] the box [on the floor]", "original_folder": "sub10_largebox_036_original"}
+{"task_index": 19, "task": "[rotate] the box [clockwise]", "original_folder": "sub10_largebox_038_original"}
+{"task_index": 20, "task": "[rotate] the box [counterclockwise]", "original_folder": "sub10_largebox_039_original"}
+{"task_index": 21, "task": "[rotate] the box [clockwise]", "original_folder": "sub10_largebox_040_original"}
+{"task_index": 22, "task": "[pick] the box | [rotate] the box [counterclockwise] | [hold] the box", "original_folder": "sub10_largebox_041_original"}
+{"task_index": 23, "task": "[kick] the box | [pick] the box | [hold] the box", "original_folder": "sub10_largebox_042_original"}
+{"task_index": 24, "task": "[kick] the box | [pick] the box | [hold] the box", "original_folder": "sub10_largebox_043_original"}
+{"task_index": 25, "task": "[kick] the box | [pick] the box | [hold] the box", "original_folder": "sub10_largebox_045_original"}
+{"task_index": 26, "task": "[kick] the box | [pick] the box | [hold] the box", "original_folder": "sub10_largebox_046_original"}
+{"task_index": 27, "task": "[kick] the box | [pick] the box | [rotate] the box [counterclockwise] | [hold] the box", "original_folder": "sub10_largebox_047_original"}
+{"task_index": 28, "task": "[kick] the box | [pick] the box | [rotate] the box [clockwise] | [hold] the box", "original_folder": "sub10_largebox_048_original"}
+{"task_index": 29, "task": "[kick] the box | [pick] the box | [rotate] the box [counterclockwise] | [hold] the box", "original_folder": "sub10_largebox_049_original"}
+{"task_index": 30, "task": "[kick] the box | [pick] the box | [hold] the box", "original_folder": "sub10_largebox_050_original"}
+{"task_index": 31, "task": "[pick] the box | [hold] the box | [place] the box [on the floor]", "original_folder": "sub10_largebox_051_original"}
+{"task_index": 32, "task": "[pick] the box | [hold] the box | [place] the box [on the floor]", "original_folder": "sub10_largebox_052_original"}
+{"task_index": 33, "task": "[pick] the box | [hold] the box | [place] the box [on the floor]", "original_folder": "sub10_largebox_053_original"}
+{"task_index": 34, "task": "[pick] the box | [hold] the box | [place] the box [on the floor]", "original_folder": "sub10_largebox_055_original"}
+{"task_index": 35, "task": "[pick] the box | [hold] the box | [place] the box [on the floor]", "original_folder": "sub10_largebox_056_original"}
+{"task_index": 36, "task": "[pick] the box | [rotate] the box [clockwise] | [place] the box [on the floor]", "original_folder": "sub10_largebox_057_original"}
+{"task_index": 37, "task": "[pick] the box | [carry] the box [forward] | [place] the box [on the floor]", "original_folder": "sub10_largebox_058_original"}
+{"task_index": 38, "task": "[pick] the box | [rotate] the box [clockwise] | [place] the box [on the floor]", "original_folder": "sub10_largebox_060_original"}
+{"task_index": 39, "task": "[kick] the box", "original_folder": "sub10_largebox_061_original"}
+{"task_index": 40, "task": "[kick] the box", "original_folder": "sub10_largebox_062_original"}
+{"task_index": 41, "task": "[kick] the box", "original_folder": "sub10_largebox_063_original"}
+{"task_index": 42, "task": "[kick] the box", "original_folder": "sub10_largebox_064_original"}
+{"task_index": 43, "task": "[kick] the box", "original_folder": "sub10_largebox_065_original"}
+{"task_index": 44, "task": "[kick] the box", "original_folder": "sub10_largebox_066_original"}
+{"task_index": 45, "task": "[kick] the box", "original_folder": "sub10_largebox_067_original"}
+{"task_index": 46, "task": "[kick] the box", "original_folder": "sub10_largebox_068_original"}
+{"task_index": 47, "task": "[kick] the box", "original_folder": "sub10_largebox_069_original"}
+{"task_index": 48, "task": "[kick] the box", "original_folder": "sub10_largebox_070_original"}
+{"task_index": 49, "task": "[drag] the box [to left]", "original_folder": "sub10_largebox_071_original"}
+{"task_index": 50, "task": "[drag] the box [to right]", "original_folder": "sub10_largebox_072_original"}
+{"task_index": 51, "task": "[drag] the box [to right] | [kick] the box", "original_folder": "sub10_largebox_073_original"}
+{"task_index": 52, "task": "[drag] the box [to left]", "original_folder": "sub10_largebox_074_original"}
+{"task_index": 53, "task": "[drag] the box [forward]", "original_folder": "sub10_largebox_075_original"}
+{"task_index": 54, "task": "[drag] the box [to left] | [kick] the box", "original_folder": "sub10_largebox_078_original"}
+{"task_index": 55, "task": "[drag] the box [to right]", "original_folder": "sub10_largebox_079_original"}
+{"task_index": 56, "task": "[drag] the box [forward]", "original_folder": "sub10_largebox_080_original"}
+{"task_index": 57, "task": "[pick] the box | [rotate] the box [clockwise] | [place] the box [on the floor]", "original_folder": "sub10_largebox_081_original"}
+{"task_index": 58, "task": "[pick] the box | [rotate] the box [clockwise] | [place] the box [on the floor]", "original_folder": "sub10_largebox_082_original"}
+{"task_index": 59, "task": "[pick] the box | [rotate] the box [clockwise] | [place] the box [on the floor]", "original_folder": "sub10_largebox_083_original"}
+{"task_index": 60, "task": "[pick] the box | [rotate] the box [clockwise] | [place] the box [on the floor]", "original_folder": "sub10_largebox_084_original"}
+{"task_index": 61, "task": "[pick] the box | [rotate] the box [clockwise] | [place] the box [on the floor]", "original_folder": "sub10_largebox_085_original"}
+{"task_index": 62, "task": "[pick] the box | [hold] the box [forward] | [place] the box [on the floor]", "original_folder": "sub10_largebox_086_original"}
+{"task_index": 63, "task": "[pick] the box | [hold] the box [forward] | [place] the box [on the floor]", "original_folder": "sub10_largebox_087_original"}
+{"task_index": 64, "task": "[pick] the box | [hold] the box [to right] | [place] the box [on the floor]", "original_folder": "sub10_largebox_088_original"}
+{"task_index": 65, "task": "[pick] the box | [hold] the box [to right] | [place] the box [on the floor]", "original_folder": "sub10_largebox_089_original"}
+{"task_index": 66, "task": "[pick] the box | [hold] the box [to left] | [place] the box [on the floor]", "original_folder": "sub10_largebox_090_original"}
+{"task_index": 67, "task": "[push] the box [forward] | [drag] the box [to left]", "original_folder": "sub10_largebox_091_original"}
+{"task_index": 68, "task": "[drag] the box [to right] | [drag] the box [forward]", "original_folder": "sub10_largebox_092_original"}
+{"task_index": 69, "task": "[drag] the box [to right]", "original_folder": "sub10_largebox_093_original"}
+{"task_index": 70, "task": "[push] the box [forward]", "original_folder": "sub10_largebox_094_original"}
+{"task_index": 71, "task": "[push] the box [forward] | [rotate] the box [clockwise]", "original_folder": "sub10_largebox_096_original"}
+{"task_index": 72, "task": "[push] the box [forward] | [drag] the box [backward]", "original_folder": "sub10_largebox_097_original"}
+{"task_index": 73, "task": "[push] the box [forward] | [drag] the box [backward]", "original_folder": "sub10_largebox_098_original"}
+{"task_index": 74, "task": "[push] the box [forward] | [drag] the box [backward]", "original_folder": "sub10_largebox_099_original"}
+{"task_index": 75, "task": "[drag] the box [to left]", "original_folder": "sub10_largebox_100_original"}
+{"task_index": 76, "task": "[push] the box [forward] | [kick] the box | [rotate] the box [clockwise]", "original_folder": "sub12_largebox_001_original"}
+{"task_index": 77, "task": "[drag] the box [forward]", "original_folder": "sub12_largebox_002_original"}
+{"task_index": 78, "task": "[drag] the box [to left] | [kick] the box", "original_folder": "sub12_largebox_003_original"}
+{"task_index": 79, "task": "[drag] the box [to left] | [kick] the box", "original_folder": "sub12_largebox_005_original"}
+{"task_index": 80, "task": "[drag] the box [to right] | [kick] the box", "original_folder": "sub12_largebox_006_original"}
+{"task_index": 81, "task": "[drag] the box", "original_folder": "sub12_largebox_007_original"}
+{"task_index": 82, "task": "[drag] the box | [kick] the box", "original_folder": "sub12_largebox_008_original"}
+{"task_index": 83, "task": "[kick] the box [forward]", "original_folder": "sub12_largebox_052_original"}
+{"task_index": 84, "task": "[kick] the box [forward]", "original_folder": "sub12_largebox_054_original"}
+{"task_index": 85, "task": "[drag] the box [backward]", "original_folder": "sub12_largebox_069_original"}
+{"task_index": 86, "task": "[pick] the box | [rotate] the box [clockwise] | [place] the box [on the floor]", "original_folder": "sub12_largebox_071_original"}
+{"task_index": 87, "task": "[pick] the box | [rotate] the box [counterclockwise] | [place] the box [on the floor]", "original_folder": "sub12_largebox_076_original"}
+{"task_index": 88, "task": "[pick] the box | [rotate] the box [counterclockwise] | [place] the box [on the floor]", "original_folder": "sub12_largebox_077_original"}
+{"task_index": 89, "task": "[push] the box [forward]", "original_folder": "sub16_largebox_000_original"}
+{"task_index": 90, "task": "[push] the box [forward]", "original_folder": "sub16_largebox_001_original"}
+{"task_index": 91, "task": "[push] the box [forward] | [kick] the box", "original_folder": "sub16_largebox_002_original"}
+{"task_index": 92, "task": "[drag] the box [counterclockwise] | [kick] the box", "original_folder": "sub16_largebox_004_original"}
+{"task_index": 93, "task": "[pick] the box | [rotate] the box [clockwise] | [place] the box [on the floor]", "original_folder": "sub16_largebox_007_original"}
+{"task_index": 94, "task": "[pick] the box | [rotate] the box [clockwise] | [place] the box [on the floor]", "original_folder": "sub16_largebox_010_original"}
+{"task_index": 95, "task": "[pick] the box | [rotate] the box [clockwise] | [place] the box [on the floor]", "original_folder": "sub16_largebox_011_original"}
+{"task_index": 96, "task": "[pick] the box | [rotate] the box [clockwise] | [place] the box [on the floor]", "original_folder": "sub16_largebox_013_original"}
+{"task_index": 97, "task": "[pick] the box | [rotate] the box [clockwise] | [place] the box [on the floor]", "original_folder": "sub16_largebox_015_original"}
+{"task_index": 98, "task": "[kick] the box | [pick] the box | [rotate] the box [counterclockwise]", "original_folder": "sub16_largebox_019_original"}
+{"task_index": 99, "task": "[kick] the box | [pick] the box", "original_folder": "sub16_largebox_020_original"}
+{"task_index": 100, "task": "[kick] the box | [pick] the box | [rotate] the box [clockwise]", "original_folder": "sub16_largebox_021_original"}
+{"task_index": 101, "task": "[kick] the box | [pick] the box", "original_folder": "sub16_largebox_022_original"}
+{"task_index": 102, "task": "[kick] the box | [pick] the box | [rotate] the box [clockwise]", "original_folder": "sub16_largebox_024_original"}
+{"task_index": 103, "task": "[kick] the box | [rotate] the box [clockwise] | [place] the box [on the floor]", "original_folder": "sub16_largebox_026_original"}
+{"task_index": 104, "task": "[kick] the box", "original_folder": "sub16_largebox_031_original"}
+{"task_index": 105, "task": "[kick] the box", "original_folder": "sub16_largebox_032_original"}
+{"task_index": 106, "task": "[kick] the box", "original_folder": "sub16_largebox_033_original"}
+{"task_index": 107, "task": "[kick] the box", "original_folder": "sub16_largebox_035_original"}
+{"task_index": 108, "task": "[drag] the box [backward]", "original_folder": "sub16_largebox_040_original"}
+{"task_index": 109, "task": "[pick] the box | [place] the box [on the floor]", "original_folder": "sub16_largebox_046_original"}
+{"task_index": 110, "task": "[pick] the box | [rotate] the box [clockwise] | [place] the box [on the floor]", "original_folder": "sub16_largebox_048_original"}
+{"task_index": 111, "task": "[push] the box [forward] | [drag] the box [backward]", "original_folder": "sub16_largebox_049_original"}
+{"task_index": 112, "task": "[drag] the box [counterclockwise]", "original_folder": "sub16_largebox_050_original"}
+{"task_index": 113, "task": "[drag] the box [to right] | [drag] the box [counterclockwise] | [drag] the box [forward]", "original_folder": "sub16_largebox_052_original"}
+{"task_index": 114, "task": "[push] the box [forward]", "original_folder": "sub3_largebox_000_original"}
+{"task_index": 115, "task": "[push] the box [to right]", "original_folder": "sub3_largebox_001_original"}
+{"task_index": 116, "task": "[drag] the box [forward]", "original_folder": "sub3_largebox_002_original"}
+{"task_index": 117, "task": "[pick] the box | [carry] the box [forward] | [place] the box [on the floor]", "original_folder": "sub3_largebox_003_original"}
+{"task_index": 118, "task": "[pick] the box | [carry] the box [forward] | [place] the box [on the floor]", "original_folder": "sub3_largebox_004_original"}
+{"task_index": 119, "task": "[pick] the box | [carry] the box [forward] | [place] the box [on the floor]", "original_folder": "sub3_largebox_005_original"}
+{"task_index": 120, "task": "[pick] the box | [place] the box [on the floor]", "original_folder": "sub3_largebox_009_original"}
+{"task_index": 121, "task": "[pick] the box | [carry] the box [forward] | [place] the box [on the floor]", "original_folder": "sub3_largebox_010_original"}
+{"task_index": 122, "task": "[kick] the box | [pick] the box", "original_folder": "sub3_largebox_012_original"}
+{"task_index": 123, "task": "[kick] the box | [pick] the box", "original_folder": "sub3_largebox_013_original"}
+{"task_index": 124, "task": "[pick] the box | [place] the box [on the floor]", "original_folder": "sub3_largebox_015_original"}
+{"task_index": 125, "task": "[pick] the box | [place] the box [on the floor]", "original_folder": "sub3_largebox_016_original"}
+{"task_index": 126, "task": "[pick] the box | [place] the box [on the floor]", "original_folder": "sub3_largebox_017_original"}
+{"task_index": 127, "task": "[kick] the box", "original_folder": "sub3_largebox_019_original"}
+{"task_index": 128, "task": "[drag] the box [forward]", "original_folder": "sub3_largebox_022_original"}
+{"task_index": 129, "task": "[drag] the box [backward]", "original_folder": "sub3_largebox_023_original"}
+{"task_index": 130, "task": "[kick] the box", "original_folder": "sub3_largebox_025_original"}
+{"task_index": 131, "task": "[kick] the box", "original_folder": "sub3_largebox_026_original"}
+{"task_index": 132, "task": "[kick] the box", "original_folder": "sub3_largebox_027_original"}
+{"task_index": 133, "task": "[pick] the box | [rotate] the box [counterclockwise] | [place] the box [on the floor]", "original_folder": "sub3_largebox_028_original"}
+{"task_index": 134, "task": "[pick] the box | [rotate] the box [counterclockwise] | [place] the box [on the floor]", "original_folder": "sub3_largebox_029_original"}
+{"task_index": 135, "task": "[pick] the box | [rotate] the box [counterclockwise] | [place] the box [on the floor]", "original_folder": "sub3_largebox_030_original"}
+{"task_index": 136, "task": "[push] the box [forward] | [drag] the box [backward]", "original_folder": "sub3_largebox_033_original"}
+{"task_index": 137, "task": "[pick] the box | [place] the box [on the floor]", "original_folder": "sub3_largebox_034_original"}
+{"task_index": 138, "task": "[pick] the box | [place] the box [on the floor]", "original_folder": "sub3_largebox_035_original"}
+{"task_index": 139, "task": "[pick] the box | [place] the box [on the floor]", "original_folder": "sub3_largebox_036_original"}
+{"task_index": 140, "task": "[push] the box [forward]", "original_folder": "sub7_largebox_001_original"}
+{"task_index": 141, "task": "[push] the box [to left]", "original_folder": "sub7_largebox_002_original"}
+{"task_index": 142, "task": "[push] the box [to left]", "original_folder": "sub7_largebox_003_original"}
+{"task_index": 143, "task": "[drag] the box [to left]", "original_folder": "sub7_largebox_004_original"}
+{"task_index": 144, "task": "[drag] the box [forward]", "original_folder": "sub7_largebox_005_original"}
+{"task_index": 145, "task": "[pick] the box | [place] the box [on the floor]", "original_folder": "sub7_largebox_012_original"}
+{"task_index": 146, "task": "[pick] the box | [place] the box [on the floor]", "original_folder": "sub7_largebox_013_original"}
+{"task_index": 147, "task": "[pick] the box | [place] the box [on the floor]", "original_folder": "sub7_largebox_014_original"}
+{"task_index": 148, "task": "[pick] the box | [place] the box [on the floor]", "original_folder": "sub7_largebox_016_original"}
+{"task_index": 149, "task": "[kick] the box | [pick] the box", "original_folder": "sub7_largebox_018_original"}
+{"task_index": 150, "task": "[kick] the box | [pick] the box | [rotate] the box [counterclockwise]", "original_folder": "sub7_largebox_019_original"}
+{"task_index": 151, "task": "[kick] the box | [pick] the box", "original_folder": "sub7_largebox_021_original"}
+{"task_index": 152, "task": "[kick] the box | [pick] the box | [rotate] the box [clockwise]", "original_folder": "sub7_largebox_022_original"}
+{"task_index": 153, "task": "[kick] the box | [pick] the box | [rotate] the box [counterclockwise]", "original_folder": "sub7_largebox_023_original"}
+{"task_index": 154, "task": "[pick] the box | [place] the box [on the floor]", "original_folder": "sub7_largebox_024_original"}
+{"task_index": 155, "task": "[pick] the box | [rotate] the box [clockwise] | [place] the box [on the floor]", "original_folder": "sub7_largebox_025_original"}
+{"task_index": 156, "task": "[pick] the box | [place] the box [on the floor]", "original_folder": "sub7_largebox_026_original"}
+{"task_index": 157, "task": "[pick] the box | [place] the box [on the floor]", "original_folder": "sub7_largebox_027_original"}
+{"task_index": 158, "task": "[pick] the box | [place] the box [on the floor]", "original_folder": "sub7_largebox_028_original"}
+{"task_index": 159, "task": "[kick] the box", "original_folder": "sub7_largebox_030_original"}
+{"task_index": 160, "task": "[kick] the box", "original_folder": "sub7_largebox_031_original"}
+{"task_index": 161, "task": "[kick] the box", "original_folder": "sub7_largebox_032_original"}
+{"task_index": 162, "task": "[kick] the box", "original_folder": "sub7_largebox_035_original"}
+{"task_index": 163, "task": "[drag] the box to right", "original_folder": "sub7_largebox_037_original"}
+{"task_index": 164, "task": "[drag] the box [to right]", "original_folder": "sub7_largebox_039_original"}
+{"task_index": 165, "task": "[drag] the box [to left]", "original_folder": "sub7_largebox_040_original"}
+{"task_index": 166, "task": "[pick] the box | [rotate] the box [clockwise] | [place] the box [on the floor]", "original_folder": "sub7_largebox_042_original"}
+{"task_index": 167, "task": "[pick] the box | [rotate] the box [counterclockwise] | [place] the box [on the floor]", "original_folder": "sub7_largebox_044_original"}
+{"task_index": 168, "task": "[pick] the box | [place] the box [on the floor]", "original_folder": "sub7_largebox_045_original"}
+{"task_index": 169, "task": "[pick] the box | [rotate] the box [counterclockwise] | [place] the box [on the floor]", "original_folder": "sub7_largebox_046_original"}
+{"task_index": 170, "task": "[pick] the box | [rotate] the box [clockwise] | [place] the box [on the floor]", "original_folder": "sub7_largebox_047_original"}
+{"task_index": 171, "task": "[push] the box [to left] | [drag] the box [to right]", "original_folder": "sub7_largebox_049_original"}
+{"task_index": 172, "task": "[push] the box [forward]", "original_folder": "sub7_largebox_052_original"}
+{"task_index": 173, "task": "[drag] the box", "original_folder": "sub7_largebox_053_original"}
+{"task_index": 174, "task": "[push] the box forward", "original_folder": "sub8_largebox_000_original"}
+{"task_index": 175, "task": "[push] the box [forward]", "original_folder": "sub8_largebox_001_original"}
+{"task_index": 176, "task": "[push] the box", "original_folder": "sub8_largebox_002_original"}
+{"task_index": 177, "task": "[push] the box [to left]", "original_folder": "sub8_largebox_003_original"}
+{"task_index": 178, "task": "[pick] the box | [rotate] the box [counterclockwise] | [place] the box [on the floor]", "original_folder": "sub8_largebox_006_original"}
+{"task_index": 179, "task": "[kick] the box | [pick] the box | [rotate] the box [clockwise]", "original_folder": "sub8_largebox_018_original"}
+{"task_index": 180, "task": "[kick] the box | [pick] the box | [rotate] the box [counterclockwise]", "original_folder": "sub8_largebox_019_original"}
+{"task_index": 181, "task": "[kick] the box | [pick] the box | [rotate] the box [counterclockwise]", "original_folder": "sub8_largebox_020_original"}
+{"task_index": 182, "task": "[kick] the box | [pick] the box", "original_folder": "sub8_largebox_022_original"}
+{"task_index": 183, "task": "[pick] the box | [place] the box [on the floor]", "original_folder": "sub8_largebox_024_original"}
+{"task_index": 184, "task": "[pick] the box | [place] the box [on the floor]", "original_folder": "sub8_largebox_025_original"}
+{"task_index": 185, "task": "[pick] the box | [place] the box [on the floor]", "original_folder": "sub8_largebox_028_original"}
+{"task_index": 186, "task": "[pick] the box | [place] the box [on the floor]", "original_folder": "sub8_largebox_029_original"}
+{"task_index": 187, "task": "[kick] the box", "original_folder": "sub8_largebox_030_original"}
+{"task_index": 188, "task": "[kick] the box", "original_folder": "sub8_largebox_031_original"}
+{"task_index": 189, "task": "[kick] the box", "original_folder": "sub8_largebox_032_original"}
+{"task_index": 190, "task": "[kick] the box", "original_folder": "sub8_largebox_033_original"}
+{"task_index": 191, "task": "[kick] the box", "original_folder": "sub8_largebox_034_original"}
+{"task_index": 192, "task": "[kick] the box", "original_folder": "sub8_largebox_035_original"}
+{"task_index": 193, "task": "[drag] the box [forward] | [kick] the box", "original_folder": "sub8_largebox_036_original"}
+{"task_index": 194, "task": "[drag] the box clockwise", "original_folder": "sub8_largebox_038_original"}
+{"task_index": 195, "task": "[drag] the box [to right]", "original_folder": "sub8_largebox_039_original"}
+{"task_index": 196, "task": "[drag] the box [to left]", "original_folder": "sub8_largebox_040_original"}
+{"task_index": 197, "task": "[drag] the box [clockwise]", "original_folder": "sub8_largebox_041_original"}
+{"task_index": 198, "task": "[pick] the box | [rotate] the box [counterclockwise] | [place] the box [on the floor]", "original_folder": "sub8_largebox_042_original"}
+{"task_index": 199, "task": "[pick] the box | [rotate] the box [clockwise] | [place] the box [on the floor]", "original_folder": "sub8_largebox_044_original"}
+{"task_index": 200, "task": "valid"}
