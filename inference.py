@@ -592,6 +592,16 @@ def main():
 
     print(f"Goal condition (pelvis-local displacement): {goal_condition}")
 
+    # Convert goal_condition (pelvis-local) back to world frame for visualization
+    _init_obj = anchor['ref_obj_pos'][:3].copy()
+    _yaw = yaw_from_quat(anchor['ref_quat'])
+    _R_fwd = yaw_to_rot_matrix(_yaw)  # pelvis-local -> world
+    _goal_3d = np.zeros(3)
+    _goal_3d[:len(goal_condition)] = goal_condition
+    goal_delta_world = (_R_fwd @ _goal_3d[:, None])[:, 0]
+    goal_pos_world = _init_obj + goal_delta_world
+    print(f"Goal position (world frame): {goal_pos_world}")
+
     # 4. Auto-compute stitch steps
     if args.stitch_steps is None:
         _eff = dataset.window_size - 1
@@ -648,17 +658,21 @@ def main():
         start_obj = full_trajectory[0, 0, 36:36 + data_cfg["num_task_params"]]
         end_obj = full_trajectory[0, -1, 36:36 + data_cfg["num_task_params"]]
         achieved_displacement = end_obj - start_obj
-        desired_displacement = (anchor["final_obj_pos"] - anchor["ref_obj_pos"])[:data_cfg["num_task_params"]]
+        target_displacement = goal_delta_world[:data_cfg["num_task_params"]]
+        gt_displacement = (anchor["final_obj_pos"] - anchor["ref_obj_pos"])[:data_cfg["num_task_params"]]
         print("-" * 30)
-        print(f"Desired (GT) Delta XY: {desired_displacement}")
-        print(f"Achieved (Gen) Delta XY: {achieved_displacement}")
-        err = np.linalg.norm(desired_displacement - achieved_displacement)
-        print(f"L2 Error: {err:.4f}")
+        print(f"Target Delta XY (specified): {target_displacement}")
+        print(f"GT Delta XY (dataset):       {gt_displacement}")
+        print(f"Achieved Delta XY:           {achieved_displacement}")
+        err = np.linalg.norm(target_displacement - achieved_displacement)
+        print(f"L2 Error vs target: {err:.4f}")
         print("-" * 30)
 
     # 8. Visualize
     if os.path.exists(xml_path):
-        run_visualization(vis, full_trajectory, final_obj_pos=anchor["final_obj_pos"])
+        run_visualization(vis, full_trajectory,
+                          goal_vectors=goal_delta_world,
+                          final_obj_pos=goal_pos_world)
     else:
         print("Could not find mj_model.xml for visualization.")
 
