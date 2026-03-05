@@ -821,7 +821,7 @@ def compute_task_params(current_robot_state, current_obj_state, desired_obj_pos,
     world_delta = goal_obj_pos - curr_obj_pos
     
     # 3. Extract Robot Yaw
-    if len(current_robot_state) >= 7:
+    if current_robot_state.shape[-1] >= 7:
         quat = current_robot_state[..., 3:7]
     else:
         quat = current_robot_state
