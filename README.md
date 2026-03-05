@@ -5,9 +5,26 @@ This folder contains a complete, standalone pipeline for training and evaluating
 ## 1. Setup & Data
 
 ### Installation
-Install the required dependencies:
+This project uses [uv](https://docs.astral.sh/uv/) for dependency management.
+
+1. **Install uv** (if not already installed):
+   ```bash
+   curl -LsSf https://astral.sh/uv/install.sh | sh
+   ```
+
+2. **Create the virtual environment and install dependencies:**
+   ```bash
+   uv sync
+   ```
+
+3. **Activate the environment:**
+   ```bash
+   source .venv/bin/activate
+   ```
+
+Alternatively, prefix any command with `uv run` to run it inside the managed environment without activating it:
 ```bash
-pip install -r requirements.txt
+uv run python train.py
 ```
 
 ### Data Setup
