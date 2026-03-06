@@ -7,7 +7,7 @@ import yaml
 from torch.utils.data import Dataset
 from tqdm import tqdm
 
-from utils.math.sbto_utils import compute_sbto_components, rot6d_to_rot, quat_to_rot, compute_task_params, rot_to_6d
+from utils.math.sbto_utils import compute_sbto_components, rot6d_to_rot, quat_to_rot, compute_task_params, rot_to_6d, yaw_to_rot_matrix, yaw_from_quat
 from utils.math.rotation_conversions import ( 
     axis_angle_to_quaternion, 
 )
@@ -59,6 +59,11 @@ class FlexibleWindowDataset(Dataset):
         # ---- Preload buffer into ram_cache ----
         self.ram_cache = []
         self.traj_lengths = []
+        # Per-file list of arrays (shape (B,)) giving the real (un-padded)
+        # trajectory length for each batch element *after* start_timestep and
+        # downsample.  Used to restrict window indices so the diffusion model
+        # never trains on last-frame-repeated padding.
+        self.real_traj_lengths: list[np.ndarray] = []
         self.indices = []
 
         self._preload_from_buffer()
@@ -226,6 +231,18 @@ class FlexibleWindowDataset(Dataset):
             if not raw_data:
                 continue
 
+            # ----------------------------------------------------------
+            # Extract per-trajectory real lengths *before* _convert_schema
+            # discards the metadata key.  Handles both single-trajectory
+            # ('traj_length', shape (1,)) and batched ('traj_lengths',
+            # shape (N,)) layouts produced by the FoLM pipeline.
+            # ----------------------------------------------------------
+            traj_length_raw = None
+            for tl_key in ('traj_length', 'traj_lengths'):
+                if tl_key in raw_data:
+                    traj_length_raw = np.asarray(raw_data[tl_key]).flatten()
+                    break
+
             # Schema detection & key conversion
             processed = self._convert_schema(raw_data)
             if not processed:
@@ -246,6 +263,28 @@ class FlexibleWindowDataset(Dataset):
                     processed[k] = processed[k][:, start_ts::ds]
 
             N_i = processed['base'].shape[0]
+            T_down = processed['base'].shape[1]  # total frames after ds
+
+            # Compute effective real length for each batch element
+            if traj_length_raw is not None:
+                real_T = np.array([
+                    len(range(start_ts, int(l), ds))
+                    for l in traj_length_raw
+                ])
+                # Clamp to actual data length
+                real_T = np.minimum(real_T, T_down)
+                # Ensure we have one value per batch element
+                if len(real_T) < N_i:
+                    real_T = np.concatenate([
+                        real_T,
+                        np.full(N_i - len(real_T), T_down, dtype=real_T.dtype),
+                    ])
+                real_T = real_T[:N_i]
+            else:
+                # No traj_length metadata — treat entire trajectory as real
+                real_T = np.full(N_i, T_down)
+
+            self.real_traj_lengths.append(real_T)
 
             self.ram_cache.append(processed)
             total_trajs += N_i
@@ -284,6 +323,11 @@ class FlexibleWindowDataset(Dataset):
         """
         Iterate through files to determine valid window start indices.
         Mimics create_dataset.py padding and windowing logic.
+
+        When per-trajectory real lengths are available (from
+        ``self.real_traj_lengths``), window starts are restricted so that no
+        window extends into the last-frame-repeated padding region.  This
+        prevents the diffusion model from training on duplicate/padded frames.
         """
         print("Indexing dataset...")
         for i in range(len(self.ram_cache)):
@@ -312,13 +356,27 @@ class FlexibleWindowDataset(Dataset):
                 self.traj_lengths.append(T_padded)
                 
                 w_size = self.window_size
-                max_start = T_padded - w_size
-                
-                if max_start > 0:
+
+                # Per-batch-element real lengths (after start_ts / ds)
+                real_lengths = (
+                    self.real_traj_lengths[i]
+                    if i < len(self.real_traj_lengths)
+                    else np.full(B, T_down)
+                )
+
+                for b in range(B):
+                    real_T_b = int(real_lengths[b]) if b < len(real_lengths) else T_down
+                    # Restrict: window must end within real data portion.
+                    # In the padded trajectory layout:
+                    #   [0 .. pad_start-1]  = edge-padded history
+                    #   [pad_start .. pad_start + real_T_b - 1] = real data
+                    #   [pad_start + real_T_b .. T_padded - 1]  = padding (skip)
+                    max_start = pad_start + real_T_b - w_size
+                    if max_start < 0:
+                        continue  # trajectory too short for even one window
                     starts = np.arange(0, max_start + 1, self.stride)
-                    for b in range(B):
-                        for s in starts:
-                            self.indices.append((i, b, s))
+                    for s in starts:
+                        self.indices.append((i, b, s))
 
             except Exception as e:
                 print(f"Error indexing file {i}: {e}")

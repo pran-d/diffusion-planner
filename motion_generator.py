@@ -142,6 +142,7 @@ class MotionGenerator:
         )
         
         self.dataset = None # To be initialized in fit or loaded
+        self._base_norm_stats = None  # Cached base-data stats; set on first calc_stats=True fit()
 
         # Try to load existing stats if available to be ready for inference
         self._setup_dataset_structure(load_stats=True)
@@ -215,13 +216,37 @@ class MotionGenerator:
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
 
+        # ---- Stats strategy ----
+        # Compute stats only on the FIRST call (base data).  All subsequent
+        # calls reuse these "base" stats so the normalisation never drifts.
+        need_stats = False
+        if calc_stats and self._base_norm_stats is None:
+            # First time: compute from this data and cache
+            need_stats = True
+            print("[Norm] Computing base normalization stats (first fit call)...")
+        elif self._base_norm_stats is not None:
+            print("[Norm] Reusing cached base normalization stats.")
+
         self.dataset = FlexibleWindowDataset(
             data_buffer=data_source,
             config=self.data_cfg, 
-            calculate_stats=calc_stats, 
+            calculate_stats=need_stats, 
             norm_path=norm_path,
             training_cfg=self.training_cfg,
         )
+
+        # Cache or restore base stats
+        if need_stats:
+            self._base_norm_stats = {k: v.clone() for k, v in self.dataset.stats.items()}
+        elif self._base_norm_stats is not None:
+            # Overwrite whatever the dataset loaded with the base stats
+            self.dataset.stats = {k: v.clone() for k, v in self._base_norm_stats.items()}
+            self.dataset._update_global_stats()
+            # Save base stats to norm_path so external inference.py picks them up
+            if norm_path:
+                os.makedirs(os.path.dirname(norm_path), exist_ok=True)
+                np_stats = {k: v.numpy() for k, v in self._base_norm_stats.items()}
+                np.savez(norm_path, **np_stats)
 
         # Task Density Balancing
         sampler = None
@@ -262,8 +287,8 @@ class MotionGenerator:
                 ckpt = self.diffuser.loadWeights(checkpoint)
                 if "optimizer" in ckpt:
                     optimizer.load_state_dict(ckpt["optimizer"])
-                if "scheduler" in ckpt:
-                    scheduler.load_state_dict(ckpt["scheduler"])
+                # if "scheduler" in ckpt:
+                #     scheduler.load_state_dict(ckpt["scheduler"])
                 if "scaler" in ckpt:
                     scaler.load_state_dict(ckpt["scaler"])
             else:
@@ -277,14 +302,17 @@ class MotionGenerator:
         
         print(f"Starting training for {epochs} epochs...")
         
+        max_batches = self.training_cfg.get("batches_per_epoch", None)
+
         for epoch in range(epochs):
             epoch_losses = []
-            pbar = tqdm(train_dataloader, desc=f"Epoch {epoch+1}/{epochs}")
+            total_steps = min(max_batches, len(train_dataloader)) if max_batches else len(train_dataloader)
+            pbar = tqdm(enumerate(train_dataloader), total=total_steps, desc=f"Epoch {epoch+1}/{epochs}")
             
-            for step, batch in enumerate(pbar):
+            for step, batch in pbar:
 
-                # if self.training_cfg.get("batches_per_epoch") and step >= self.training_cfg["batches_per_epoch"]:
-                #     break
+                if max_batches and step >= max_batches:
+                    break
                 
                 if batch[0].shape[0] < self.data_cfg["batch_size"]:
                     current_bs = batch[0].shape[0]
@@ -836,13 +864,14 @@ class MotionGenerator:
                     # 2. Detect trajectories newly reaching goal
                     _obj_end  = segment_world[:, -1, 36:39]                    # (B, 3)
                     _goal_err = np.linalg.norm(_obj_end - goal_world, axis=-1) # (B,)
-                    _newly    = (~_goal_reached) & (_goal_err < end_error_threshold)
+                    _robot_z = segment_world[:, -1, 2]                         # (B,)
+                    _newly    = (~_goal_reached) & (_goal_err < end_error_threshold) & (_robot_z > 0.71)  # only consider goal reached if pelvis is reasonably above ground
                     if _newly.any():
                         for _ni in np.where(_newly)[0]:
                             _goal_last_frame[_ni] = segment_world[_ni, -1, :]
                         _goal_reached |= _newly
-                        print(f"[goal] step {step+1}: sample {np.where(_newly)[0].tolist()} "
-                              f"reached goal (err={_goal_err[_newly].round(4).tolist()})")
+                        # print(f"[goal] step {step+1}: sample {np.where(_newly)[0].tolist()} "
+                        #       f"reached goal (err={_goal_err[_newly].round(4).tolist()})")
                 # ──────────────────────────────────────────────────────────────────────
 
                 stitched_segments.append(segment_world)

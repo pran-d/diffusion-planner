@@ -157,31 +157,25 @@ def build_last_frame_waypoints(
     dataset,             # for normalization
     feature_order,       # list of feature keys
     num_features,        # D
-    total_steps,         # The initial total number of windows/steps for this task
+    total_steps,         # total number of windows for the task (used for z-profile progress)
     remaining_steps,     # how many windows remain to reach goal
-    arrival_ratio=0.70,  # data: 90% of XY covered by ~65% progress; arrive by 70%
-    t_accel=0.35,        # fraction of time spent accelerating
-    t_decel=0.25,        # data: XY goes 50%→90% quickly; shorter decel
+    arrival_ratio=0.70,  # unused for XY; kept for API compatibility and z-profile
     lift_height=DEFAULT_LIFT_HEIGHT,  # peak z-offset for pick-and-place (data: 0.62m)
     no_lower_dist=0.75,  # lower z when remaining XY dist < this (data: lowering starts ~55%)
     lift_start=0.10,     # data: z delta ~0 at 5%, starts rising by ~10%
-    lift_end=0.30,       # data: median peak z at 40% progress
+    lift_end=0.40,       # data: median peak z at 40% progress
     walk_start_z=0.25,   # data: XY starts (>5%) at ~22% progress, z ≈ 25% of peak there
     rest_obj_z=None,     # (B,) or scalar: absolute object z at episode start (rest height)
 ):
     """
     Build a partial waypoint at the last frame (t=T-1) of the window.
 
-    Sequence (calibrated from 231 training trajectories):
-      1. Lift starts at ~10% of trajectory, reaches peak at ~40%.
-      2. Walk starts after z >= 25% of lift_height (~22% progress).
-      3. XY arrives at ~70% of trajectory (data: 90% XY covered by 65%).
-      4. Lower when remaining XY dist < 0.75m (cosine ramp to 0 near goal).
-      5. Object placed by ~75% of trajectory.
+    XY waypoint: per-window displacement = total_remaining_delta / remaining_steps.
+    This is purely local — it only depends on how far the object still needs to travel
+    and how many windows are left, not on the global trapezoidal profile.
 
-    XY profile (data-calibrated):
-        t_accel=0.35  — XY 50% at 44% progress
-        t_decel=0.25  — XY 90% at 65% progress
+    Z waypoint: absolute height target derived from the global z-profile (still uses
+    total_steps / current_step to place the lift/lower ramps correctly).
     """
     if isinstance(task_params_raw, np.ndarray):
         task_params_raw = torch.from_numpy(task_params_raw).float()
@@ -203,49 +197,12 @@ def build_last_frame_waypoints(
     else:
         total_remaining_delta = task_params_raw[:, :2]  
 
-    # --- INLINED TRAPEZOIDAL DISPLACEMENT LOGIC ---
-    effective_total_steps = max(total_steps * arrival_ratio, 1.0)
+    # --- PER-WINDOW XY DISPLACEMENT ---
+    # Divide the remaining displacement evenly across the remaining windows.
+    # This keeps the waypoint local: it depends only on the current remaining
+    # distance and the number of windows left, not on global trajectory progress.
     current_step = total_steps - remaining_steps
-    
-    tau_start = current_step / effective_total_steps
-    tau_end = (current_step + 1) / effective_total_steps
-
-    # Fallback to triangular if accel + decel > 1.0
-    if t_accel + t_decel > 1.0: 
-        t_accel, t_decel = 0.5, 0.5
-        
-    # Precompute curve constants
-    v_max = 1.0 / (1.0 - 0.5 * t_accel - 0.5 * t_decel)
-    p_ta = 0.5 * v_max * t_accel
-    p_td_start = p_ta + v_max * (1.0 - t_accel - t_decel)
-    
-    # Evaluate progress at tau_start and tau_end
-    progress = []
-    for tau in (tau_start, tau_end):
-        tau = max(0.0, min(1.0, tau))
-        if tau <= t_accel:
-            # Acceleration phase
-            s = 0.5 * (v_max / t_accel) * (tau ** 2) if t_accel > 0 else 0.0
-        elif tau <= 1.0 - t_decel:
-            # Cruise phase
-            s = p_ta + v_max * (tau - t_accel)
-        else:
-            # Deceleration phase
-            tau_prime = tau - (1.0 - t_decel)
-            if t_decel > 0:
-                s = p_td_start + v_max * tau_prime - 0.5 * (v_max / t_decel) * (tau_prime ** 2)
-            else:
-                s = p_td_start + v_max * tau_prime
-        progress.append(s)
-
-    s_start, s_end = progress
-    
-    # What fraction of the *remaining* distance should we cover in this window?
-    if s_start >= 1.0:
-        step_fraction = 0.0 # Already arrived
-    else:
-        step_fraction = (s_end - s_start) / (1.0 - s_start)
-        
+    step_fraction = 1.0 / max(remaining_steps, 1)
     per_window_delta = total_remaining_delta * step_fraction  # (B, 2)
 
     # --- Z-HEIGHT GATE ON XY MOTION ---
@@ -352,7 +309,7 @@ def build_inference_waypoints(
     lift_height=DEFAULT_LIFT_HEIGHT,  # peak z-offset (data: median 0.62m)
     no_lower_dist=0.75,              # lower z when remaining XY dist < this (metres)
     lift_start=0.10,                 # z profile: lift start (data: ~10%)
-    lift_end=0.30,                   # z profile: lift peak (data: ~40%)
+    lift_end=0.40,                   # z profile: lift peak (data: ~40%)
     walk_start_z=0.25,               # gate XY walk until z >= this fraction of lift_height
     current_obj_z=None,              # (B,) absolute object z at t=0 of this window (for t=0 keyframe)
     rest_obj_z=None,                 # (B,) or scalar: episode-start rest z (for absolute z target)
