@@ -793,7 +793,7 @@ def compute_guidance_vec(current_pos, target_pos, R_robot_yaw_inv, current_rot=N
 
     return np.concatenate([guidance_dir, dist], axis=-1).squeeze(1)
 
-def compute_task_params(current_robot_state, current_obj_state, desired_obj_pos, normalize_goal_vec=True, num_task_params=3, max_goal_dist=None):
+def compute_task_params(current_robot_state, current_obj_state, desired_obj_pos, normalize_goal_vec=True, num_task_params=3, max_goal_dist=1.0):
     """
     Computes the task parameters (local object displacement) for the diffusion model.
     Matches the normalization convention of FlexibleWindowDataset._compute_task_params.
@@ -805,6 +805,7 @@ def compute_task_params(current_robot_state, current_obj_state, desired_obj_pos,
                                         representing the current object position.
         desired_obj_pos (np.ndarray): Shape (3,) [x, y, z] 
                                       representing the GOAL object position in world frame.
+        max_goal_dist (float): Maximum allowed distance for the goal vector.
 
     Returns:
         np.ndarray: Shape (..., num_task_params).
@@ -821,7 +822,7 @@ def compute_task_params(current_robot_state, current_obj_state, desired_obj_pos,
     world_delta = goal_obj_pos - curr_obj_pos
     
     # 3. Extract Robot Yaw
-    if len(current_robot_state) >= 7:
+    if current_robot_state.shape[-1] >= 7:
         quat = current_robot_state[..., 3:7]
     else:
         quat = current_robot_state
@@ -859,7 +860,7 @@ def compute_task_params(current_robot_state, current_obj_state, desired_obj_pos,
         np.divide(vec_part, norm, out=normalized_vec, where=mask)
         
         # Clip distance magnitude
-        norm_clipped = np.clip(norm, a_min=None, a_max=1.0)
+        norm_clipped = np.clip(norm, a_min=None, a_max=max_goal_dist)
         
         # Concatenate: [normalized_dir, clipped_magnitude]
         # Ensure we concatenate along the last axis

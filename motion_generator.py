@@ -21,6 +21,7 @@ from datasets.flexible_dataset import FlexibleWindowDataset
 from utils.math.sbto_utils import reconstruct_sbto_trajectory, compute_task_params
 from utils.math.math_tools import yaw_from_quat, yaw_to_rot_matrix
 from inference import build_inference_waypoints
+from diffusers import EMAModel
 
 
 def compute_dataset_weights(dataset, sigma=0.2):
@@ -169,7 +170,6 @@ class MotionGenerator:
 
     def fit(self, 
         data_source: Union[str, List[Dict]], 
-        task_params: Optional[List[Dict]] = None,
         epochs: int = None, 
         save_path: str = None,
         checkpoint: Optional[str] = None,
@@ -181,7 +181,9 @@ class MotionGenerator:
         
         Args:
             data_source: Path to data folder (str) or list of trajectory dicts.
-            task_params: Optional list of task parameters (e.g. goals) aligned with data_source.
+                         The dataset internally computes task_params from each
+                         trajectory's final object position. No external goals
+                         need to be passed.
             epochs: Number of epochs to train. Overrides config if provided.
             save_path: Path to save model checkpoints. Overrides config if provided.
             checkpoint: Optional path to a checkpoint to resume from.
@@ -216,7 +218,6 @@ class MotionGenerator:
 
         self.dataset = FlexibleWindowDataset(
             data_buffer=data_source,
-            task_params=task_params,
             config=self.data_cfg, 
             calculate_stats=calc_stats, 
             norm_path=norm_path,
@@ -256,6 +257,12 @@ class MotionGenerator:
         )
         scaler = GradScaler()
 
+        ema = EMAModel(
+            self.diffuser.model.parameters(),
+            decay=self.training_cfg.get("ema_decay", 0.9995),
+            update_after_step=self.training_cfg.get("ema_update_after_step", 0),
+        )
+
         if checkpoint:
             if os.path.exists(checkpoint):
                 print(f"Loading diffusion weights from {checkpoint}...")
@@ -266,6 +273,9 @@ class MotionGenerator:
                     scheduler.load_state_dict(ckpt["scheduler"])
                 if "scaler" in ckpt:
                     scaler.load_state_dict(ckpt["scaler"])
+                if "ema" in ckpt:
+                    ema.load_state_dict(ckpt["ema"])
+                    print("  Loaded EMA state from checkpoint.")
             else:
                 print(f"Checkpoint {checkpoint} not found. Starting from scratch.")
         
@@ -277,14 +287,17 @@ class MotionGenerator:
         
         print(f"Starting training for {epochs} epochs...")
         
+        max_batches = self.training_cfg.get("batches_per_epoch", None)
+
         for epoch in range(epochs):
             epoch_losses = []
-            pbar = tqdm(train_dataloader, desc=f"Epoch {epoch+1}/{epochs}")
+            total_steps = min(max_batches, len(train_dataloader)) if max_batches else len(train_dataloader)
+            pbar = tqdm(enumerate(train_dataloader), total=total_steps, desc=f"Epoch {epoch+1}/{epochs}")
             
-            for step, batch in enumerate(pbar):
+            for step, batch in pbar:
 
-                # if self.training_cfg.get("batches_per_epoch") and step >= self.training_cfg["batches_per_epoch"]:
-                #     break
+                if max_batches and step >= max_batches:
+                    break
                 
                 if batch[0].shape[0] < self.data_cfg["batch_size"]:
                     current_bs = batch[0].shape[0]
@@ -342,6 +355,9 @@ class MotionGenerator:
                 nn.utils.clip_grad_norm_(self.diffuser.model.parameters(), 1.0)
                 scaler.step(optimizer)
                 scaler.update()
+
+                # EMA update (matches train.py)
+                ema.step(self.diffuser.model.parameters())
                 
                 epoch_losses.append(loss.item())
                 pbar.set_postfix({"loss": f"{loss.item():.4f}"})
@@ -359,23 +375,28 @@ class MotionGenerator:
                     if is_dir_like:
                         os.makedirs(save_path, exist_ok=True)
                         fpath = os.path.join(save_path, f"model_{epoch+1}.pth")
+                        ema_fpath = os.path.join(save_path, f"ema_model_{epoch+1}.pth")
                     else:
                         os.makedirs(os.path.dirname(save_path), exist_ok=True)
                         base, ext = os.path.splitext(save_path)
                         fpath = f"{base}_{epoch+1}{ext}"
+                        ema_fpath = f"{base}_ema_{epoch+1}{ext}"
                 else:
                     # Default save
                     save_dir = get_save_path(self.model_cfg, self.data_cfg, self.training_cfg)
                     os.makedirs(save_dir, exist_ok=True)
                     fpath = os.path.join(save_dir, f"model_{epoch}.pth")
+                    ema_fpath = os.path.join(save_dir, f"ema_model_{epoch}.pth")
                
                 checkpoint = {
                     "model": self.diffuser.model.state_dict(),
                     "optimizer": optimizer.state_dict(),
                     "scaler": scaler.state_dict(),
-                    "scheduler": scheduler.state_dict()
+                    "scheduler": scheduler.state_dict(),
+                    "ema": ema.state_dict(),
                 }
                 torch.save(checkpoint, fpath)
+                self.diffuser.save_ema_weights(ema.shadow_params, ema_fpath)
                 last_ckpt_path = fpath
 
         # --- Cleanup training objects to release GPU/CPU memory ---
@@ -550,15 +571,25 @@ class MotionGenerator:
                             no_lower_dist: float = 0.5,
                             lift_start: float = 0.0,
                             lift_end: float = 0.20,
-                            walk_start_z: float = 0.80,):
+                            walk_start_z: float = 0.80,
+                            return_analysis: bool = False,):
         """
-        Generate trajectory via autoregressive diffusion (mirrors inference.py).
+        Generate trajectory via autoregressive diffusion.
+        
+        This is the single unified entry point for trajectory generation, used by
+        both inference_mg.py and the evolutionary pipeline.
         
         Args:
             initial_condition: Dict with 'robot' (B, H, 36) or (H, 36) and 
                                'obj' (B, H, 7) or (H, 7) history in world frame.
-            goal_condition: np.ndarray (B, D_task) or (D_task,) — desired task params 
-                           (e.g. final object position) in world frame.
+                               Robot: [x, y, z, qw, qx, qy, qz, joint_1..joint_29].
+                               Object: [x, y, z, qw, qx, qy, qz].
+            goal_condition: np.ndarray (B, D) or (D,) — desired final object
+                           displacement from initial object position, expressed in
+                           the yaw-rotated initial robot pelvis frame.
+                           For pick_place_relative_box_pose: D=2, [relative_x, relative_y].
+                           Internally converted to world frame via:
+                             goal_world = R(yaw_init) @ goal_local + init_obj_pos
             target_traj_length: Desired output trajectory length (pre-interpolation).
                                 Used to auto-compute stitch_steps from the model window size.
                                 Ignored if stitch_steps is explicitly provided.
@@ -583,9 +614,20 @@ class MotionGenerator:
             lift_start: Fraction of trajectory where lift begins.
             lift_end: Fraction of trajectory where lift reaches peak.
             walk_start_z: Gate XY walk until z >= this fraction of lift_height.
+            return_analysis: If True, return (trajectory, analysis_dict) tuple.
             
         Returns:
-            np.ndarray of shape (B * num_samples, T_total, D) where D = 36 (robot) + 7 (object).
+            When return_analysis=False (default):
+                np.ndarray of shape (B * num_samples, T_total, D) where D = 36 (robot) + 7 (object).
+            When return_analysis=True:
+                Tuple (trajectory, analysis_dict) where analysis_dict has keys:
+                  'normalized_windows'    – (num_windows, B, T, D_feat)
+                  'denormalized_windows'  – (num_windows, B, T, D_feat)
+                  'waypoint_values'       – (num_windows, B, T, D_feat)
+                  'waypoint_masks'        – (num_windows, B, T, D_feat) bool
+                  'feature_order'         – list[str]
+                  'feature_dims'          – np.ndarray[int]
+                  'trajectory'            – same ndarray as the first return value
         """
         if self.dataset is None:
              raise RuntimeError("Dataset not initialized. Call fit() or setup.")
@@ -673,6 +715,13 @@ class MotionGenerator:
 
         stitched_segments = []
 
+        # Analysis collection (populated only when return_analysis=True)
+        if return_analysis:
+            _ana_norm = []       # normalized windows
+            _ana_denorm = []     # denormalized windows
+            _ana_wv = []         # waypoint values
+            _ana_wm = []         # waypoint masks
+
         # 4. Autoregressive Loop
         with torch.no_grad():
             for step in range(stitch_steps):
@@ -732,6 +781,17 @@ class MotionGenerator:
                 # D. Denormalize
                 denorm_btc = self.dataset.denormalize_global(normalized_sample)
                 future_traj_np = denorm_btc.detach().cpu().numpy()
+
+                # D2. Collect analysis data
+                if return_analysis:
+                    _ana_norm.append(normalized_sample.detach().cpu().numpy())
+                    _ana_denorm.append(future_traj_np.copy())
+                    if wv is not None:
+                        _ana_wv.append(wv.detach().cpu().numpy())
+                        _ana_wm.append(wm.detach().cpu().numpy().astype(bool))
+                    else:
+                        _ana_wv.append(None)
+                        _ana_wm.append(None)
                 
                 # E. Reconstruct World Frame from SBTO features
                 #    final_obj_pos in anchor must be in world frame for reconstruction
@@ -861,6 +921,18 @@ class MotionGenerator:
 
         # Smooth trajectory
         full_trajectory = self._smooth_trajectory(full_trajectory, sigma=2.0)
+
+        if return_analysis:
+            analysis_dict = {
+                'normalized_windows': _ana_norm,     # list of (B, T, D) arrays
+                'denormalized_windows': _ana_denorm,  # list of (B, T, D) arrays
+                'waypoint_values': _ana_wv,           # list of (B, T, D) arrays or None
+                'waypoint_masks': _ana_wm,            # list of (B, T, D) bool arrays or None
+                'feature_order': list(self.dataset.feature_order),
+                'feature_dims': self.dataset.feature_dims,
+                'trajectory': full_trajectory,
+            }
+            return full_trajectory, analysis_dict
 
         return full_trajectory
 

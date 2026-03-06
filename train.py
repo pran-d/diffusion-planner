@@ -305,7 +305,7 @@ for epoch in range(starting_epoch, num_epochs):
                     dims = [1] * item.dim()
                     dims[0] = repeats
                     new_batch.append(item.repeat(*dims)[:target_bs])
-            else:
+                else:
                     new_batch.append(item)
             batch = new_batch
 

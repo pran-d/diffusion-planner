@@ -916,7 +916,38 @@ class DFoTTrajectory(nn.Module):
                 leave=False,
             )
 
-        for m in range(scheduling_matrix.shape[0] - 1):
+        # ---- Pre-compute loop invariants (hoisted from inner loop) ----
+        external_conditions_mask = torch.zeros(
+            (batch_size, 1, self.external_cond_dim), dtype=torch.bool, device=xs_pred.device
+        )
+        external_conditions_mask[..., -self.task_dim:] = 1.0
+
+        use_indicator = waypoint_mask is not None and waypoint_mask.any()
+
+        def _do_sample_step(x_in, from_k, to_k):
+            if use_indicator:
+                return self._sample_step_with_indicator(
+                    x_in, from_k, to_k, conditions,
+                    external_cond_mask=external_conditions_mask,
+                    guidance_fn=guidance_fn, guidance_goal=guidance_goal,
+                    guidance_wt=guidance_wt, cfg_w=cfg_w,
+                    waypoint_mask=waypoint_mask,
+                )
+            else:
+                return self.diffusion_model.sample_step(
+                    x_in, from_k, to_k, conditions,
+                    external_conditions_mask,
+                    guidance_fn=guidance_fn, guidance_goal=guidance_goal,
+                    guidance_wt=guidance_wt, cfg_w=cfg_w,
+                )
+
+        if inpaint:
+            f_map = get_feature_indices(build_feature_layout())
+
+        # ---- Denoising loop (no_grad for speed; enable_grad inside
+        #      guidance_fn will override when needed) ----
+        with torch.no_grad():
+          for m in range(scheduling_matrix.shape[0] - 1):
             from_noise_levels = scheduling_matrix[m]
             to_noise_levels = scheduling_matrix[m + 1]
 
@@ -929,33 +960,6 @@ class DFoTTrajectory(nn.Module):
 
             if return_all:
                 record.append(xs_pred.clone())
-
-            external_conditions_mask = torch.zeros(
-                (batch_size, 1, self.external_cond_dim), dtype=torch.bool, device=xs_pred.device
-            )
-
-            external_conditions_mask[..., :self.task_dim] = 1.0
-
-            # Choose indicator-aware or standard sample step
-            # Must match training condition: use indicator whenever waypoint_mask is present
-            use_indicator = waypoint_mask is not None and waypoint_mask.any()
-
-            def _do_sample_step(x_in, from_k, to_k):
-                if use_indicator:
-                    return self._sample_step_with_indicator(
-                        x_in, from_k, to_k, conditions,
-                        external_cond_mask=external_conditions_mask,
-                        guidance_fn=guidance_fn, guidance_goal=guidance_goal,
-                        guidance_wt=guidance_wt, cfg_w=cfg_w,
-                        waypoint_mask=waypoint_mask,
-                    )
-                else:
-                    return self.diffusion_model.sample_step(
-                        x_in, from_k, to_k, conditions,
-                        external_conditions_mask,
-                        guidance_fn=guidance_fn, guidance_goal=guidance_goal,
-                        guidance_wt=guidance_wt, cfg_w=cfg_w,
-                    )
 
             xs_pred = _do_sample_step(xs_pred, from_noise_levels, to_noise_levels)
 
@@ -997,7 +1001,6 @@ class DFoTTrajectory(nn.Module):
                             )
                 
             if inpaint:
-                f_map = get_feature_indices(build_feature_layout())
                 xs_pred[..., 0, f_map['joints']] = self.state_cond[..., 0, :29]
                 xs_pred[..., 0, f_map['body_z']] = self.state_cond[..., 0, 29:30]
                 xs_pred[..., 0, f_map['body_rot6d']] = self.state_cond[..., 0, 30:36]
