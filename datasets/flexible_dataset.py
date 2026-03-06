@@ -137,11 +137,11 @@ class FlexibleWindowDataset(Dataset):
             if bp.ndim == 4:
                 bp = bp[:, :, 0, :]
             elif bp.ndim == 3:
-                bp = bp[:, 0, :]
+                bp = bp[:, :, :]
             if bq.ndim == 4:
                 bq = bq[:, :, 0, :]
             elif bq.ndim == 3:
-                bq = bq[:, 0, :]
+                bq = bq[:, :, :]
 
             processed['base'] = np.concatenate([bp, bq], axis=-1)
             processed['joints'] = np.asarray(raw_data[jp_key], dtype=np.float64)

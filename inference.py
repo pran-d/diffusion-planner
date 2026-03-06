@@ -491,6 +491,7 @@ def main():
     parser.add_argument("--end_error_threshold", type=float, default=0.1, help="End error threshold for stitching")
     parser.add_argument("--goal_multiplier", type=float, default=1.0, help="Scaling factor for goal (for testing different r for same theta)")
     parser.add_argument("--visualize_windows", action="store_true", help="Render and save each generated window as a video")
+    parser.add_argument("--enable_phys_stop", action="store_true", help="Stop trajectory when object reaches goal region (for pick-and-place)")
 
     # Guidance arguments
     parser.add_argument("--guidance_wt", type=float, default=0.0, help="Test-time gradient guidance strength")
@@ -731,7 +732,7 @@ def main():
         _rspike  = np.linalg.norm(_rxy - _rxy_p, axis=-1) > _MAX_ROBOT_STEP
         _ospike  = np.linalg.norm(_oxy - _oxy_p, axis=-1) > _MAX_OBJ_STEP
         _bad_t   = np.where((_floor | _rspike | _ospike).any(axis=0))[0]
-        _phys_stop = _bad_t.size > 0
+        _phys_stop = args.enable_phys_stop and _bad_t.size > 0
         if _phys_stop:
             _t_bad   = int(_bad_t[0])
             _t_clamp = max(_t_bad, 1)

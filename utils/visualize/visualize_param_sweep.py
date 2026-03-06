@@ -177,7 +177,7 @@ def run_evaluation_batch(
 
     # Per-trajectory goal-stop state
     enable_goal_stop     = getattr(args, 'enable_goal_stop', True)
-    enable_physics_stop  = getattr(args, 'enable_physics_stop', True)
+    enable_physics_stop  = getattr(args, 'enable_physics_stop', False)
     goal_stop_threshold  = getattr(args, 'goal_stop_threshold', 0.1)
     goal_reached         = np.zeros(num_samples, dtype=bool)
     _goal_last_frame     = np.zeros((num_samples, 43), dtype=np.float64)

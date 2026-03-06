@@ -6,3 +6,5 @@ results/
 *.npz
 *.png
 *.npy
+unitree_g1/
+essential/

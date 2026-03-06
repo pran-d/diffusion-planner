@@ -1,7 +1,7 @@
 auto_conf: False
 
 data:
-  dir_path: "/home/pranish/pranav/diffusion-mp/simple_diffusion/"
+  dir_path: "/home/pranav/workspace/diffusion-planner/"
   # train_path: "test_datasets/pick_place"
   train_path: "test_datasets/trial/cleanup"
   task_list_path: "test_datasets/chosen_tasks_test.yml"

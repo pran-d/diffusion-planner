@@ -1,0 +1,23 @@
+# paths.yaml — machine-local paths, not committed to version control.
+# Copy this file and adjust for your environment.
+
+paths:
+  # Root directory for all datasets
+  data_dir: "/home/pranav/workspace/diffusion-planner/test_datasets/"
+
+  # Sub-path within data_dir that selects the active dataset split
+  train_path: "trial/cleanup"
+
+  # YAML file listing which tasks/subdirectories to load (relative to data_dir)
+  # Set to null or remove to fall back to globbing all .npz files.
+  task_list_path: "/home/pranav/workspace/diffusion-planner/test_datasets/chosen_tasks_test.yml"
+
+  # Directory where checkpoints and norm stats are saved
+  save_dir: "/home/pranav/workspace/diffusion-planner/results/runs/"
+
+  # Directory where tensorboard / WandB logs are written
+  log_dir: "/home/pranav/workspace/diffusion-planner/results/logs/"
+
+  # MuJoCo XML model files (used for visualisation and FK evaluation)
+  mj_model_xml: "mj_model.xml"
+  mj_model_repeated_xml: "mj_model_repeated.xml"
