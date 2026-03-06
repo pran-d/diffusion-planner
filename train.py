@@ -1,4 +1,5 @@
 import argparse
+import random
 
 from matplotlib.pylab import cond, sample
 import torch
@@ -18,8 +19,23 @@ import mujoco
 from diffusers import EMAModel
 from datasets import BufferDataset, ConditionalStateDataset
 from models.model import RobotDiffuser
-from config.configure import load_config, get_data_path, get_save_path, get_log_path, get_norm_path
+from config.configure import load_config, get_data_path, get_save_path, get_log_path, get_norm_path, get_mj_xml_paths
 from utils.data.load_dataset import preload_dataset
+
+
+# ===============================
+# Reproducibility
+# ===============================
+def seed_everything(seed: int):
+    """Seed all RNGs for reproducible training."""
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+    # Deterministic algorithms may be slower but guarantee reproducibility
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
+    print(f"All RNGs seeded with seed={seed}")
 
 # ===============================
 # Helper Functions
@@ -110,8 +126,12 @@ def compute_dataset_weights(dataset, sigma=0.2):
 parser = argparse.ArgumentParser(description="Clean Inference & Stitching Pipeline")
 parser.add_argument("--resume", type=int, default=None, help="Resume from checkpoint epoch (int)")
 parser.add_argument("--save_every", type=int, default=50, help="Save checkpoint every N epochs")
+parser.add_argument("--seed", type=int, default=42, help="Random seed for reproducibility")
 
 args = parser.parse_args()
+
+# Seed everything for reproducibility
+seed_everything(args.seed)
 
 with open("config/config.yaml", 'r') as file:
     config = yaml.safe_load(file)
@@ -172,11 +192,13 @@ scaler = GradScaler()
 
 ema = EMAModel(
     diffuser.model.parameters(),
-    decay=0.9995,
-    update_after_step=0,
+    decay=training_cfg.get("ema_decay", 0.9995),
+    update_after_step=training_cfg.get("ema_update_after_step", 0),
 )
 
 starting_epoch = 0
+best_loss = float("inf")
+
 if args.resume is not None:
     starting_epoch = args.resume
     checkpoint = diffuser.loadWeights(starting_epoch)
@@ -187,6 +209,12 @@ if args.resume is not None:
             scheduler.load_state_dict(checkpoint["scheduler"])
         if "scaler" in checkpoint:
             scaler.load_state_dict(checkpoint["scaler"])
+        if "ema" in checkpoint:
+            ema.load_state_dict(checkpoint["ema"])
+            print("  Loaded EMA state from checkpoint.")
+        if "best_loss" in checkpoint:
+            best_loss = checkpoint["best_loss"]
+            print(f"  Restored best_loss = {best_loss:.6f}")
 
 if data_cfg.get("dataset_class", "flexible") == "conditional":
     dataset = ConditionalStateDataset(
@@ -206,11 +234,15 @@ elif data_cfg.get("dataset_class", "flexible") == "flexible":
 sampler = None
 shuffle = True
 
+# Seeded generator for reproducible data ordering
+dl_generator = torch.Generator()
+dl_generator.manual_seed(args.seed)
+
 # Task Density Balancing
 if training_cfg.get("balance_task_density", True): # Default to True as requested
     weights = compute_dataset_weights(dataset, sigma=training_cfg.get("density_sigma", 0.2))
     if weights is not None:
-        sampler = WeightedRandomSampler(weights, len(weights))
+        sampler = WeightedRandomSampler(weights, len(weights), generator=dl_generator)
         shuffle = False
         print("WeightedRandomSampler activated (Balance Task Density).")
 
@@ -223,10 +255,11 @@ train_dataloader = DataLoader(
     pin_memory=True,
     persistent_workers=True,
     prefetch_factor=2,
+    generator=dl_generator if sampler is None else None,  # only used when shuffle=True
 )
 
 # Load MuJoCo
-xml_path = "./mj_model.xml"
+xml_path, _ = get_mj_xml_paths()
 mj_model = mujoco.MjModel.from_xml_path(xml_path)
 mj_data = mujoco.MjData(mj_model)
 
@@ -346,7 +379,7 @@ for epoch in range(starting_epoch, num_epochs):
         scaler.update()
 
         # use ema to update the model average
-        # ema.step(diffuser.model.parameters())
+        ema.step(diffuser.model.parameters())
         
         losses.append(loss.item())
         epoch_losses.append(loss.item())
@@ -394,11 +427,37 @@ for epoch in range(starting_epoch, num_epochs):
                 "model": diffuser.model.state_dict(),
                 "optimizer": optimizer.state_dict(),
                 "scaler": scaler.state_dict(),
-                "scheduler": scheduler.state_dict()
+                "scheduler": scheduler.state_dict(),
+                "ema": ema.state_dict(),
+                "best_loss": best_loss,
+                "epoch": epoch,
+                "seed": args.seed,
             }
             torch.save(checkpoint, f"{save_dir}/model_{epoch}.pth")
+            
+            # Also save EMA weights for inference
+            diffuser.save_ema_weights(ema.shadow_params, f"{save_dir}/ema_model_{epoch}.pth")
             break
     
+    # ===============================
+    # Best Model Tracking
+    # ===============================
+    if mean_loss < best_loss:
+        best_loss = mean_loss
+        best_checkpoint = {
+            "model": diffuser.model.state_dict(),
+            "optimizer": optimizer.state_dict(),
+            "scaler": scaler.state_dict(),
+            "scheduler": scheduler.state_dict(),
+            "ema": ema.state_dict(),
+            "best_loss": best_loss,
+            "epoch": epoch,
+            "seed": args.seed,
+        }
+        torch.save(best_checkpoint, f"{save_dir}/model_best.pth")
+        diffuser.save_ema_weights(ema.shadow_params, f"{save_dir}/ema_model_best.pth")
+        print(f"  ★ New best model saved (loss={best_loss:.6f})")
+
     # ===============================
     # Regular Checkpoint Saving
     # ===============================
@@ -409,13 +468,17 @@ for epoch in range(starting_epoch, num_epochs):
             "model": diffuser.model.state_dict(),
             "optimizer": optimizer.state_dict(),
             "scaler": scaler.state_dict(),
-            "scheduler": scheduler.state_dict()
+            "scheduler": scheduler.state_dict(),
+            "ema": ema.state_dict(),
+            "best_loss": best_loss,
+            "epoch": epoch,
+            "seed": args.seed,
         }
 
         torch.save(checkpoint, f"{save_dir}/model_{epoch}.pth")
-    
-    # if epoch % 500 == 0:
-    #     diffuser.save_ema_weights(ema.shadow_params, f"{save_dir}/ema_model_{epoch}.pth")
+        
+        # Save EMA weights separately for direct inference loading
+        diffuser.save_ema_weights(ema.shadow_params, f"{save_dir}/ema_model_{epoch}.pth")
 
 # ===============================
 # Plot Loss Curve (after training)

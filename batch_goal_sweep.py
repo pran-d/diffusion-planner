@@ -15,6 +15,7 @@ Example usage:
 """
 
 import argparse
+import math
 import os
 import re
 import tempfile
@@ -23,7 +24,7 @@ import numpy as np
 import torch
 import yaml
 
-from config.configure import load_config, get_data_path, get_norm_path
+from config.configure import load_config, get_data_path, get_norm_path, get_mj_xml_paths
 from models.model import RobotDiffuser
 from datasets.flexible_dataset import FlexibleWindowDataset
 from utils.data.load_dataset import preload_dataset
@@ -63,6 +64,8 @@ def parse_args():
                         help="Scale every goal's displacement from ref_obj_pos by this factor")
     parser.add_argument("--seed",            type=int,   default=42,
                         help="Random seed for goal generation (default: 42)")
+    parser.add_argument("--ema",             action="store_true",   
+                        help="Use EMA weights for inference (default: False)")
 
     # Inference
     parser.add_argument("--stitch_steps",   type=int,   default=None,
@@ -76,21 +79,27 @@ def parse_args():
     parser.add_argument("--action_horizon", type=int,   default=None,
                         help="Truncate each segment to this many steps")
     parser.add_argument("--device",         type=str,   default="cuda")
+    parser.add_argument("--enable_goal_stop", action="store_true",
+                        help="Stop at the end goal (default: False)")
+    parser.add_argument("--enable_physics_stop", action="store_true",  
+                        help="Stop when physics violations are detected (default: False)")
+    parser.add_argument("--goal_stop_threshold", type=float, default=0.1,
+                        help="Distance threshold for stopping at each goal (default: 0.1)")
 
     # Waypoint / z-profile args (forwarded to run_evaluation_batch)
     parser.add_argument("--last_frame_waypoint", action="store_true",
                         help="Add last-frame partial waypoint (obj_delta_xy + obj_delta_z)")
-    parser.add_argument("--arrival_ratio", type=float, default=0.85,
-                        help="Object arrives in this fraction of remaining time (0-1)")
+    parser.add_argument("--arrival_ratio", type=float, default=0.70,
+                        help="Object arrives in this fraction of total time (0-1; data: 90%% XY by 65%%)")
     parser.add_argument("--lift_height",   type=float, default=DEFAULT_LIFT_HEIGHT,
                         help=f"Peak lift height in metres (default: {DEFAULT_LIFT_HEIGHT}m)")
-    parser.add_argument("--lift_start",    type=float, default=0.0,
-                        help="Fraction of trajectory where lift begins")
-    parser.add_argument("--lift_end",      type=float, default=0.20,
-                        help="Fraction of trajectory where lift reaches peak")
-    parser.add_argument("--walk_start_z",  type=float, default=0.80,
-                        help="Gate XY motion until z >= this fraction of lift_height")
-    parser.add_argument("--no_lower_dist", type=float, default=0.5,
+    parser.add_argument("--lift_start",    type=float, default=0.10,
+                        help="Fraction of trajectory where lift begins (data: ~10%%)")
+    parser.add_argument("--lift_end",      type=float, default=0.40,
+                        help="Fraction of trajectory where lift reaches peak (data: ~40%%)")
+    parser.add_argument("--walk_start_z",  type=float, default=0.25,
+                        help="Gate XY motion until z >= this fraction of lift_height (data: ~25%%)")
+    parser.add_argument("--no_lower_dist", type=float, default=0.75,
                         help="Lower z when XY distance to goal drops below this (metres)")
 
     # Output
@@ -109,39 +118,55 @@ def parse_args():
 def generate_goals(original_goal, ref_obj_pos, num_goals, goal_spread,
                    goal_multiplier, rng):
     """
-    Return an (N, 3) array of goal positions.
+    Return an (N, 3) array of goal positions arranged on two concentric circles
+    around ref_obj_pos, each goal at a unique, evenly-spaced theta.
 
-    Slot 0 is always the original goal (possibly scaled by goal_multiplier).
-    The remaining slots are random XY offsets within a disk of radius goal_spread
-    around the original goal, then scaled by goal_multiplier from ref_obj_pos.
+    The N goals are distributed as evenly as possible between an inner circle
+    (radius = goal_spread / 2) and an outer circle (radius = goal_spread).
+    Angles are evenly spaced over [0, 2π) across the full set so every goal
+    has a distinct direction from the robot.  Slot 0 is always the original
+    goal (scaled by goal_multiplier); the remaining N-1 slots are filled with
+    the two-circle layout.
 
     Args:
         original_goal : (3,) world-frame target object position from dataset
         ref_obj_pos   : (3,) world-frame object position at t=0 (scaling origin)
         num_goals     : total number of goals (int)
-        goal_spread   : radius of the random-goal disk in metres (float)
+        goal_spread   : outer circle radius in metres (float)
         goal_multiplier: scalar to amplify/shrink displacement from ref_obj_pos
-        rng           : np.random.Generator
+        rng           : np.random.Generator (unused, kept for API compatibility)
 
     Returns:
         goals : (N, 3)  world-frame goal positions
     """
-    base_goals = [original_goal.copy()]
-    for _ in range(num_goals - 1):
-        angle  = rng.uniform(0.0, 2.0 * np.pi)
-        radius = rng.uniform(0.0, goal_spread)
-        g = original_goal.copy()
-        g[0] += np.cos(angle) * radius
-        g[1] += np.sin(angle) * radius
-        base_goals.append(g)
+    center = ref_obj_pos.copy()
 
-    goals = []
-    for g in base_goals:
-        g_scaled = ref_obj_pos.copy()
-        g_scaled[:2] = ref_obj_pos[:2] + goal_multiplier * (g[:2] - ref_obj_pos[:2])
-        goals.append(g_scaled)
+    # Slot 0: original goal, scaled from ref_obj_pos
+    g0 = ref_obj_pos.copy()
+    g0[:2] = ref_obj_pos[:2] + goal_multiplier * (original_goal[:2] - ref_obj_pos[:2])
+    base_goals = [g0]
 
-    return np.stack(goals)  # (N, 3)
+    n_extra = num_goals - 1
+    if n_extra > 0:
+        # Evenly-spaced angles across all extra goals
+        thetas = np.linspace(0.0, 2.0 * np.pi, n_extra, endpoint=False)
+
+        # Split into two circles: inner gets ceil(n/2), outer gets floor(n/2)
+        n_inner = math.ceil(n_extra / 2)
+        n_outer = n_extra - n_inner
+
+        r_outer = goal_spread
+        r_inner = goal_spread / 2.0
+
+        for k in range(n_extra):
+            theta = thetas[k]
+            r = r_inner if k < n_inner else r_outer
+            g = ref_obj_pos.copy()
+            g[0] = center[0] + r * np.cos(theta)
+            g[1] = center[1] + r * np.sin(theta)
+            base_goals.append(g)
+
+    return np.stack(base_goals)  # (N, 3)
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -253,6 +278,11 @@ def extract_ref_trajectories(dataset, ref_pos, target_T):
         base_a       = base.copy();  base_a[:, :2] += xy_offset
         obj_a        = obj.copy();   obj_a[:, :2]  += xy_offset
 
+        # Guard: base / joints / obj may have different T when downsampling
+        # is applied unevenly across keys — trim to the common minimum.
+        T_min = min(base_a.shape[0], joints.shape[0], obj_a.shape[0])
+        base_a, joints, obj_a = base_a[:T_min], joints[:T_min], obj_a[:T_min]
+
         traj = np.concatenate([base_a, joints, obj_a], axis=-1).astype(np.float32)  # (T, 43)
 
         # Pad or trim to target_T
@@ -281,8 +311,7 @@ def visualize_results(full_traj, obj_traj_w, goals_arr, args, dataset=None, ref_
     XML template is unavailable.
     """
     N, T, _ = full_traj.shape
-    xml_path          = "mj_model.xml"
-    repeated_xml_path = "mj_model_repeated.xml"
+    xml_path, repeated_xml_path = get_mj_xml_paths()
 
     # ── Extract ground-truth reference trajectories ───────────────────────────
     ref_trajs = None
@@ -325,7 +354,7 @@ def visualize_results(full_traj, obj_traj_w, goals_arr, args, dataset=None, ref_
             vis.visualize_overlay(
                 x_trajs           = all_trajs,
                 repeated_xml_path = adaptive_xml,
-                timestep_delay    = 0.02,
+                timestep_delay    = 0.01,
                 loop              = True,
                 guidance_vec      = guidance_vecs,
                 world_goal_pos    = all_goals,

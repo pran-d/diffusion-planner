@@ -598,12 +598,8 @@ class MotionGenerator:
         # --- Auto-compute stitch_steps from target trajectory length ---
         if stitch_steps is None:
             if target_traj_length is not None:
-                _eff = window_size - 1   # frames contributed by steps 1+ (t=0 skipped)
-                # Step 0 contributes window_size frames; steps 1+ contribute _eff each.
-                # Total = window_size + (stitch_steps-1)*_eff  =  1 + stitch_steps*_eff.
-                # Ensure total >= target_traj_length:
-                #   stitch_steps >= (target_traj_length - 1) / _eff
-                stitch_steps = max(1, math.ceil((target_traj_length - 1) / _eff))
+                _eff = window_size - 1   # each step contributes (T-1) frames (t=0 always skipped)
+                stitch_steps = max(1, math.ceil(target_traj_length / _eff))
             else:
                 stitch_steps = 1
 
@@ -754,9 +750,9 @@ class MotionGenerator:
                 )
                 r_world, o_world = res[0], res[1]
 
-                if step > 0:
-                    r_world = r_world[:, 1:, :]  # skip t=0 (anchored to current state)
-                    o_world = o_world[:, 1:, :]
+                # Always skip t=0 (anchor frame) — matches inference.py
+                r_world = r_world[:, 1:, :]
+                o_world = o_world[:, 1:, :]
                 
                 # Store segment: Robot(36) + Object(7)
                 segment_world = np.concatenate([r_world[..., :36], o_world[..., :7]], axis=-1)

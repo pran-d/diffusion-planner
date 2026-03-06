@@ -692,12 +692,18 @@ class DFoTTrajectory(nn.Module):
         loss_weight = self.diffusion_model.add_shape_channels(loss_weight)
         loss = loss * loss_weight
 
-        # Zero out loss on known/pinned features so the model isn't
-        # penalised for predicting clean data it was given (esp. k=0 frames
-        # where the v-prediction target is pure noise → random loss).
-        fully_known = waypoint_mask.all(dim=-1)  # (B, T)
-        if fully_known.any():
-            loss = loss * (~fully_known).float().unsqueeze(-1)  
+        # Zero out loss on pinned features so the model isn't penalised for
+        # predicting values it was given as input (esp. k=0 full keyframes
+        # where the v-prediction target is pure noise → arbitrary loss, and
+        # partial waypoints where only the *known* features are injected).
+        #
+        #   • Full keyframes  (all features known)  → zero entire token's loss
+        #   • Partial keyframes (some features known) → zero only those features
+        #     The unknown features in a partial keyframe still contribute to loss.
+        if waypoint_mask is not None and waypoint_mask.any():
+            # Per-feature mask: True where feature was pinned/given to the model
+            # Cast to float so False→0 (keep loss), True→0 (zero loss).
+            loss = loss * (~waypoint_mask).float()
 
         # Apply frame-level validity masks
         loss = self._reweight_loss(loss, masks)

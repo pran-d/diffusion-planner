@@ -52,9 +52,10 @@ class RobotDiffuser():
         if isinstance(policy_num, str):
             path = policy_num
         else:
-            path=self.save_dir+f"model_{policy_num}.pth"
-        print(f"Loading diffusion model weights from {path}... \n")
-        weights = torch.load(path, map_location=self.device)
+            prefix = "ema_model" if ema else "model"
+            path = self.save_dir + f"{prefix}_{policy_num}.pth"
+        print(f"Loading {'EMA ' if ema else ''}diffusion model weights from {path}... \n")
+        weights = torch.load(path, map_location=self.device, weights_only=False)
         state = weights["model"] if "model" in weights else weights
         missing, unexpected = self.model.load_state_dict(state, strict=False)
         if missing:
@@ -66,7 +67,7 @@ class RobotDiffuser():
     def load_weights_from_file(self, path):
         """Load weights from a specific file path."""
         print(f"Loading model weights from {path}... \n")
-        weights = torch.load(path, map_location=self.device)
+        weights = torch.load(path, map_location=self.device, weights_only=False)
         state = weights["model"] if "model" in weights else weights
         missing, unexpected = self.model.load_state_dict(state, strict=False)
         if missing:

@@ -476,6 +476,7 @@ def run_visualization(vis, stitched_trajs, goal_vectors=None, final_obj_pos=None
 def main():
     parser = argparse.ArgumentParser(description="Clean Inference & Stitching Pipeline")
     parser.add_argument("--epoch", type=str, required=True, help="Checkpoint epoch or path")
+    parser.add_argument("--ema", action="store_true", help="Whether to use EMA weights")
     parser.add_argument("--num_samples", type=int, default=1)
     parser.add_argument("--stitch_steps", type=int, default=None, help="Number of autoregressive segments to generate")
     parser.add_argument("--save_path", type=str, default="results/inference.npy")
@@ -548,7 +549,7 @@ def main():
     if os.path.exists(args.epoch):
         diffuser.load_weights_from_file(args.epoch)
     else:
-        diffuser.loadWeights(int(args.epoch))
+        diffuser.loadWeights(int(args.epoch), ema=args.ema)
 
     # 4. Prepare Initial Condition
     if args.traj_idx is not None:
