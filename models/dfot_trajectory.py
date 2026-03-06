@@ -64,6 +64,48 @@ class MLP(nn.Module):
         return self.net(x)
 
 
+class HistoryAggregator(nn.Module):
+    """Compress (B, H, D) history embeddings into (B, 1, D).
+
+    Supports two modes:
+      - ``"attn"`` (default): learned attention pooling — a single-head
+        attention query that attends to all H frames.  Most expressive
+        and order-aware.
+      - ``"mean"``: simple mean pooling over the time axis.  Parameter-free,
+        useful as a lightweight baseline.
+
+    When ``H == 1`` both modes reduce to an identity reshape.
+    """
+
+    def __init__(self, hidden_dim: int, mode: str = "attn"):
+        super().__init__()
+        self.mode = mode
+        if mode == "attn":
+            # Learned query vector that attends to the H history tokens
+            self.query = nn.Parameter(torch.randn(1, 1, hidden_dim) * 0.02)
+            self.attn = nn.MultiheadAttention(
+                embed_dim=hidden_dim, num_heads=1, batch_first=True,
+            )
+        elif mode != "mean":
+            raise ValueError(f"Unknown history aggregation mode: {mode!r}")
+
+    def forward(self, h: torch.Tensor) -> torch.Tensor:
+        """
+        Args:
+            h: (B, H, D) embedded history frames.
+        Returns:
+            (B, 1, D) aggregated conditioning token.
+        """
+        if h.shape[1] == 1:
+            return h  # no-op when H == 1
+        if self.mode == "mean":
+            return h.mean(dim=1, keepdim=True)
+        # attn: query (B, 1, D) attends to h (B, H, D)
+        query = self.query.expand(h.shape[0], -1, -1)
+        out, _ = self.attn(query, h, h)  # (B, 1, D)
+        return out
+
+
 class DFoTTrajectory(nn.Module):
     def __init__(self, model_config, data_config, noise_scheduler_config=None, training_config=None):
         super().__init__()
@@ -80,11 +122,20 @@ class DFoTTrajectory(nn.Module):
         self.task_dim = model_config.get("hidden_size", 64) if self.task_condition else 0
 
         self.external_cond_dim = self.state_dim + self.task_dim
+
+        self.history_size = data_config.get("state_history", 1)
             
         if self.state_condition:
             self.state_embedding = MLP(
                 in_dim=data_config.get("num_observations", 86),
                 out_dim=model_config.get("hidden_size", 64)
+            )
+            # Aggregate multi-frame history (B, H, hidden) → (B, 1, hidden)
+            # When H == 1 the aggregator is a no-op reshape.
+            agg_mode = model_config.get("history_aggregation", "attn")
+            self.history_aggregator = HistoryAggregator(
+                hidden_dim=model_config.get("hidden_size", 64),
+                mode=agg_mode,
             )
 
         if self.task_condition:
@@ -594,9 +645,11 @@ class DFoTTrajectory(nn.Module):
         
         cond_list = []
         if self.state_condition and state_cond is not None:
-            s_cond = self.state_embedding(state_cond) 
+            s_cond = self.state_embedding(state_cond)  # (B, H, hidden) or (B, hidden)
             if s_cond.ndim == 2:
-                s_cond = s_cond.unsqueeze(1)
+                s_cond = s_cond.unsqueeze(1)            # (B, 1, hidden)
+            # Aggregate multi-frame history → single conditioning token
+            s_cond = self.history_aggregator(s_cond)    # (B, 1, hidden)
             s_cond = apply_condition_dropout(
                 s_cond, 
                 self.training_config.get("condition_dropout_prob", {}).get("state", 0.0),
@@ -701,9 +754,13 @@ class DFoTTrajectory(nn.Module):
         #   • Partial keyframes (some features known) → zero only those features
         #     The unknown features in a partial keyframe still contribute to loss.
         if waypoint_mask is not None and waypoint_mask.any():
-            # Per-feature mask: True where feature was pinned/given to the model
-            # Cast to float so False→0 (keep loss), True→0 (zero loss).
-            loss = loss * (~waypoint_mask).float()
+            # Per-feature mask (B,T,D): True where feature was pinned/given.
+            # ~waypoint_mask → True where unknown (keep loss), False where known (zero loss).
+            # This correctly handles:
+            #   - Fully known frames:    all D features True  → all loss zeroed
+            #   - Partially known frames: only known features → only those zeroed
+            #   - Unknown frames:         all D features False → full loss kept
+            loss = loss * (~fully_known.unsqueeze(-1)).float()
 
         # Apply frame-level validity masks
         loss = self._reweight_loss(loss, masks)
@@ -744,7 +801,11 @@ class DFoTTrajectory(nn.Module):
         cond_list = []
         if self.state_condition and state_cond_input is not None:
             self.state_cond = state_cond_input
-            s_cond = self.state_embedding(state_cond_input) # (B, C)
+            s_cond = self.state_embedding(state_cond_input) # (B, H, hidden) or (B, hidden)
+            if s_cond.ndim == 2:
+                s_cond = s_cond.unsqueeze(1)                # (B, 1, hidden)
+            # Aggregate multi-frame history → single conditioning token
+            s_cond = self.history_aggregator(s_cond)         # (B, 1, hidden)
             if no_state_cond:
                 s_cond = apply_condition_dropout(
                     s_cond, 
@@ -920,7 +981,7 @@ class DFoTTrajectory(nn.Module):
         external_conditions_mask = torch.zeros(
             (batch_size, 1, self.external_cond_dim), dtype=torch.bool, device=xs_pred.device
         )
-        external_conditions_mask[..., -self.task_dim:] = 1.0
+        external_conditions_mask[..., :self.task_dim] = 1.0
 
         use_indicator = waypoint_mask is not None and waypoint_mask.any()
 
@@ -1001,11 +1062,14 @@ class DFoTTrajectory(nn.Module):
                             )
                 
             if inpaint:
-                xs_pred[..., 0, f_map['joints']] = self.state_cond[..., 0, :29]
-                xs_pred[..., 0, f_map['body_z']] = self.state_cond[..., 0, 29:30]
-                xs_pred[..., 0, f_map['body_rot6d']] = self.state_cond[..., 0, 30:36]
-                xs_pred[..., 0, f_map['obj_rel_pos']] = self.state_cond[..., 0, 36:39]
-                xs_pred[..., 0, f_map['obj_rel_rot6d']] = self.state_cond[..., 0, 39:45]
+                # Pin t=0 of the output window to the current (most recent) history frame.
+                # state_cond is (B, H, obs_dim); index -1 is the latest observation.
+                _cur = self.state_cond[..., -1, :]  # (B, obs_dim)
+                xs_pred[..., 0, f_map['joints']] = _cur[..., :29]
+                xs_pred[..., 0, f_map['body_z']] = _cur[..., 29:30]
+                xs_pred[..., 0, f_map['body_rot6d']] = _cur[..., 30:36]
+                xs_pred[..., 0, f_map['obj_rel_pos']] = _cur[..., 36:39]
+                xs_pred[..., 0, f_map['obj_rel_rot6d']] = _cur[..., 39:45]
             
             pbar.update(1)
 

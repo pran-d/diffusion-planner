@@ -9,6 +9,7 @@ from diffusers import DDPMScheduler, DDIMScheduler
 # Import the existing Backbone
 from diffusion_forcing_transformer.dit1d import DiT1D
 from models.unet1d import UNet1D
+from models.dfot_trajectory import HistoryAggregator
 
 class MLP(nn.Module):
     def __init__(self, in_dim, out_dim):
@@ -116,6 +117,10 @@ class SimpleTrajectoryDiffuser(nn.Module):
         if self.state_condition:
             obs_dim = data_cfg.get("num_observations", 45)
             self.state_embedding = MLP(obs_dim, self.hidden_size)
+            agg_mode = model_cfg.get("history_aggregation", "attn")
+            self.history_aggregator = HistoryAggregator(
+                hidden_dim=self.hidden_size, mode=agg_mode,
+            )
         if self.history_condition:
             hist_dim = data_cfg.get("num_features", 48) # Approx
             self.history_embedding = MLP(hist_dim, self.hidden_size)
@@ -149,8 +154,9 @@ class SimpleTrajectoryDiffuser(nn.Module):
 
         cond_list = []
         if self.state_condition and state_cond is not None:
-            c = self.state_embedding(state_cond)
+            c = self.state_embedding(state_cond)  # (B, H, hidden) or (B, hidden)
             if c.ndim == 2: c = c.unsqueeze(1)
+            c = self.history_aggregator(c)          # (B, 1, hidden)
             cond_list.append(c)
             
         if self.history_condition and history_cond is not None:

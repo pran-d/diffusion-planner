@@ -22,6 +22,7 @@ from config.configure import load_config, get_data_path, get_norm_path
 from datasets.flexible_dataset import FlexibleWindowDataset
 from utils.data.load_dataset import preload_dataset
 from utils.math.sbto_utils import build_feature_layout
+from utils.math.math_tools import yaw_from_quat, yaw_to_rot_matrix
 from motion_generator import MotionGenerator
 from inference import DEFAULT_LIFT_HEIGHT
 
@@ -62,7 +63,6 @@ def extract_initial_condition(dataset, sample_idx, num_task_params):
     # Recover the relative goal displacement in the initial pelvis-local frame.
     # anchor gives world-frame final_obj_pos and ref_obj_pos.
     # We need to express (final_obj_pos - ref_obj_pos) in the yaw-rotated local frame.
-    from utils.math.math_tools import yaw_from_quat, yaw_to_rot_matrix
     init_base_quat = raw_traj['base'][h_start, 3:7]
     init_obj_pos = raw_traj['obj'][h_start, :3]
     final_obj_pos = anchor['final_obj_pos']
@@ -105,8 +105,10 @@ def main():
     parser.add_argument("--end_error_threshold", type=float, default=0.1)
     parser.add_argument("--goal_multiplier", type=float, default=1.0,
                         help="Scale goal displacement by this factor")
-    parser.add_argument("--enable_goal_stop", action="store_true",
-                        help="Stop when object reaches goal region")
+    parser.add_argument("--enable_goal_stop", action="store_true", default=True,
+                        help="Stop when object reaches goal region (default: True)")
+    parser.add_argument("--disable_goal_stop", action="store_true",
+                        help="Disable early stopping when goal is reached")
     parser.add_argument("--enable_phys_stop", action="store_true",
                         help="Stop on physics violation (floor penetration / spike)")
 
@@ -127,6 +129,10 @@ def main():
                         help="Skip MuJoCo visualisation")
 
     args = parser.parse_args()
+
+    # Handle mutually exclusive goal stop flags
+    if args.disable_goal_stop:
+        args.enable_goal_stop = False
 
     # ─── 1. Build MotionGenerator ──────────────────────────────────────────────
     mg = MotionGenerator(config_path="config/config.yaml", device=args.device)
@@ -177,17 +183,21 @@ def main():
         goal_local = np.array(args.task_params, dtype=np.float64)
         print(f"Using override goal (local frame): {goal_local}")
 
-    # Scale goal if requested
-    if args.goal_multiplier != 1.0:
-        goal_local = goal_local * args.goal_multiplier
-        print(f"Scaled goal by {args.goal_multiplier} → {goal_local}")
-
     # Auto-compute stitch_steps from dataset trajectory length if not provided
     if args.stitch_steps is None and args.target_traj_length is None:
         _eff = data_cfg["num_timesteps"] - 1
         traj_len = dataset.traj_lengths[args.traj_idx]
         args.stitch_steps = max(1, math.ceil(traj_len / _eff))
         print(f"Auto stitch_steps={args.stitch_steps} from traj length {traj_len}")
+
+    # Scale goal if requested (AFTER auto-computing stitch_steps so we can scale them too)
+    if args.goal_multiplier != 1.0:
+        goal_local = goal_local * args.goal_multiplier
+        # Scale stitch_steps to match the longer/shorter distance (matches inference.py)
+        if args.stitch_steps is not None:
+            args.stitch_steps = max(1, int(args.stitch_steps * abs(args.goal_multiplier)))
+        print(f"Scaled goal by {args.goal_multiplier} → {goal_local} "
+              f"(stitch_steps={args.stitch_steps})")
 
     print(f"Goal (local frame): {goal_local}")
     print(f"Initial robot pos: {initial_condition['robot'][0, :3]}")
@@ -243,12 +253,22 @@ def main():
         np.savez(analysis_path, **save_dict)
         print(f"Analysis saved to {analysis_path}")
 
-    # ─── 7. Report ────────────────────────────────────────────────────────────
+    # ─── 7. Compute goal world position from (possibly scaled) goal_local ───
+    init_base_quat = initial_condition['robot'][0, 3:7]
+    init_obj_pos = initial_condition['obj'][0, :3]
+    yaw = yaw_from_quat(init_base_quat)
+    R_local_to_world = yaw_to_rot_matrix(yaw)
+    goal_3d = np.zeros(3, dtype=np.float64)
+    goal_3d[:len(goal_local)] = goal_local
+    goal_world = (R_local_to_world @ goal_3d[:, None])[:, 0] + init_obj_pos
+    print(f"Goal world position: {goal_world}")
+
+    # ─── 8. Report ────────────────────────────────────────────────────────────
     if full_trajectory.shape[-1] >= 43:
         start_obj = full_trajectory[0, 0, 36:36 + num_task_params]
         end_obj = full_trajectory[0, -1, 36:36 + num_task_params]
         achieved = end_obj - start_obj
-        desired = (anchor['final_obj_pos'] - anchor['ref_obj_pos'])[:num_task_params]
+        desired = (goal_world - init_obj_pos)[:num_task_params]
         err = np.linalg.norm(desired - achieved)
         print("-" * 40)
         print(f"Desired displacement  (world): {desired}")
@@ -256,7 +276,17 @@ def main():
         print(f"L2 error: {err:.4f}")
         print("-" * 40)
 
-    # ─── 8. Visualize ─────────────────────────────────────────────────────────
+    # ─── 9. Build per-frame guidance vector for the arrow visualisation ───────
+    #   guidance_vec: (T_total, 2+) — world-frame direction from current object
+    #   to the goal at each frame, so the arrow tracks the remaining displacement.
+    traj_0 = full_trajectory[0] if full_trajectory.ndim == 3 else full_trajectory
+    T_total = traj_0.shape[0]
+    guidance_vec = np.zeros((T_total, 3), dtype=np.float64)
+    for t_idx in range(T_total):
+        obj_pos_t = traj_0[t_idx, 36:39]
+        guidance_vec[t_idx] = goal_world - obj_pos_t
+
+    # ─── 10. Visualize ────────────────────────────────────────────────────────
     if not args.no_visualize:
         try:
             from utils.visualize.visualize import MjVisualizer
@@ -265,12 +295,11 @@ def main():
                 xml_path = os.path.join(data_path, "mj_model.xml")
             if os.path.exists(xml_path):
                 vis = MjVisualizer(xml_path, close_on_enter=False)
-                traj = full_trajectory[0] if full_trajectory.ndim == 3 else full_trajectory
-                T_steps = traj.shape[0]
-                t = np.arange(T_steps) * 0.01
+                t = np.arange(T_total) * 0.01
                 vis.visualize_trajectory(
-                    t=t, x_traj=traj, repeat=True,
-                    goal_pos=anchor.get('final_obj_pos'),
+                    t=t, x_traj=traj_0, repeat=True,
+                    guidance_vec=guidance_vec,
+                    goal_pos=goal_world,
                 )
                 vis.close()
             else:
