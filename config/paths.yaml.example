@@ -1,0 +1,23 @@
+# paths.yaml.example — copy this to config/paths.yaml and adjust for your machine.
+# config/paths.yaml is listed in .gitignore and should NOT be committed.
+
+paths:
+  # Root directory containing training datasets
+  data_dir: "/path/to/datasets/"
+
+  # Sub-path within data_dir that selects the active dataset split
+  train_path: "my_dataset"
+
+  # YAML file listing which tasks/subdirectories to load (relative to data_dir)
+  # Set to null or remove to fall back to globbing all .npz files.
+  task_list_path: null
+
+  # Directory where model checkpoints and norm stats are saved
+  save_dir: "/path/to/logs/"
+
+  # Directory where tensorboard / WandB logs are written
+  log_dir: "/path/to/logs/"
+
+  # MuJoCo XML model files (relative to the project root, or absolute)
+  mj_model_xml: "mj_model.xml"
+  mj_model_repeated_xml: "mj_model_repeated.xml"

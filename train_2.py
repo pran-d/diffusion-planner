@@ -14,7 +14,7 @@ import mujoco
 from diffusers import EMAModel
 from datasets.conditional_dataset import ConditionalStateDataset
 from models.model import RobotDiffuser
-from config.configure import load_config, get_data_path, get_save_path, get_log_path, get_norm_path
+from config.configure import load_config, get_data_path, get_save_path, get_log_path, get_norm_path, get_mj_xml_paths
 
 def apply_condition_dropout(
     cond,
@@ -241,7 +241,7 @@ train_dataloader = DataLoader(
 )
 
 # Load MuJoCo
-xml_path = "./mj_model.xml"
+xml_path, _ = get_mj_xml_paths()
 mj_model = mujoco.MjModel.from_xml_path(xml_path)
 mj_data = mujoco.MjData(mj_model)
 

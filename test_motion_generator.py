@@ -6,6 +6,7 @@ import os
 import matplotlib.pyplot as plt
 from motion_generator import MotionGenerator
 from utils.visualize.visualize import MjVisualizer
+from config.configure import get_mj_xml_paths
 
 def run_visualization(stitched_trajs, xml_path):
     # Ensure visualizer can find the XML
@@ -188,7 +189,7 @@ def test_pipeline():
     # (1, T_total, D) -> D should be 36+7=43
     
     # Visualize in MuJoCo
-    model_xml = os.path.join(os.getcwd(), "mj_model.xml")
+    model_xml, _ = get_mj_xml_paths()
     if os.path.exists(model_xml):
         print(f"Visualizing with {model_xml}")
         try:

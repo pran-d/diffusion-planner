@@ -6,8 +6,8 @@ import torch
 import os
 import mujoco
 
-from config.configure import load_config, get_data_path, get_norm_path
-from datasets import BufferDataset
+from config.configure import load_config, get_data_path, get_norm_path, get_mj_xml_paths
+from datasets import FlexibleWindowDataset
 from utils.visualize.visualize import MjVisualizer
 from utils.data.load_dataset import preload_dataset
 from utils.math.sbto_utils import batch_rotation, quat_to_rot
@@ -15,7 +15,7 @@ from utils.data.load_dataset import preload_dataset
 
 def load_env_and_data():
     # Use config from file
-    model_cfg, data_cfg, training_cfg, noise_cfg = load_config("src/mjlab/scripts/diffusion_planner/config/config.yaml")
+    model_cfg, data_cfg, training_cfg, noise_cfg = load_config("config/config.yaml")
 
     data_path = get_data_path(data_cfg)
     norm_path = get_norm_path(model_cfg, training_cfg, data_cfg)
@@ -61,7 +61,7 @@ def main():
 
 
     # Initialize Visualizer
-    xml_path = "src/mjlab/scripts/diffusion_planner/mj_model.xml"
+    xml_path, _ = get_mj_xml_paths()
     if not os.path.exists(xml_path):
          print(f"Warning: {xml_path} not found. Visualization might fail.")
     

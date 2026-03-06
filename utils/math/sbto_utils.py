@@ -581,18 +581,18 @@ def reconstruct_sbto_trajectory(
     # Just continuous within traj for now
     obj_quat_world = enforce_quaternion_continuity(obj_quat_world)
 
-    if inpaint and has_obj_delta_xy:
-        # print("Inpainting object_xy...")
-        delta_obj_local = np.zeros((_, T, 3))
-        delta_obj_local[..., :2] = traj_delta_obj_xy
-        delta_obj_global = (R_ref_yaw[:, None, :, :] @ delta_obj_local[..., None]).squeeze(-1)
-        obj_pos_world[..., :2] = obj_global_anchor[:, None, :2] + delta_obj_global[..., :2]
+    # if inpaint and has_obj_delta_xy:
+    #     # print("Inpainting object_xy...")
+    #     delta_obj_local = np.zeros((_, T, 3))
+    #     delta_obj_local[..., :2] = traj_delta_obj_xy
+    #     delta_obj_global = (R_ref_yaw[:, None, :, :] @ delta_obj_local[..., None]).squeeze(-1)
+    #     obj_pos_world[..., :2] = obj_global_anchor[:, None, :2] + delta_obj_global[..., :2]
 
-    # Use the absolute obj_z feature for the object Z coordinate when available.
-    # Without this, the Z comes from obj_rel_pos (relative to pelvis), which is
-    # inconsistent with any obj_z waypoint constraints applied during inference.
-    if inpaint and IDX_OBJ_Z is not None:
-        obj_pos_world[..., 2] = future_traj[:, :, IDX_OBJ_Z.start]
+    # # Use the absolute obj_z feature for the object Z coordinate when available.
+    # # Without this, the Z comes from obj_rel_pos (relative to pelvis), which is
+    # # inconsistent with any obj_z waypoint constraints applied during inference.
+    # if inpaint and IDX_OBJ_Z is not None:
+    #     obj_pos_world[..., 2] = future_traj[:, :, IDX_OBJ_Z.start]
 
     # --------------------------------------------------
     # Velocities (optional)

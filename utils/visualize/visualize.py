@@ -3,6 +3,7 @@ import mujoco
 import mujoco.viewer
 import numpy as np
 import numpy.typing as npt
+from config.configure import get_mj_xml_paths
 import mujoco
 import numpy as np
 # import cv2
@@ -363,7 +364,7 @@ class DiffusionOverlayVisualizer:
     def visualize_overlay(
         self,
         x_trajs: np.ndarray,
-        repeated_xml_path: str = "./mj_model_repeated.xml",
+        repeated_xml_path: str = None,
         timestep_delay: float = 0.05,
         loop: bool = True,
         guidance_vec: np.ndarray = None,
@@ -375,6 +376,8 @@ class DiffusionOverlayVisualizer:
         """
         Visualizes multiple trajectories simultaneously using a repeated-robot XML scene.
         """
+        if repeated_xml_path is None:
+            _, repeated_xml_path = get_mj_xml_paths()
         if not os.path.exists(repeated_xml_path):
             print(f"Error: Repeated XML not found at {repeated_xml_path}")
             return

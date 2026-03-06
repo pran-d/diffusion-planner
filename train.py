@@ -18,7 +18,7 @@ import mujoco
 from diffusers import EMAModel
 from datasets import BufferDataset, ConditionalStateDataset
 from models.model import RobotDiffuser
-from config.configure import load_config, get_data_path, get_save_path, get_log_path, get_norm_path
+from config.configure import load_config, get_data_path, get_save_path, get_log_path, get_norm_path, get_mj_xml_paths
 from utils.data.load_dataset import preload_dataset
 from utils.math.sbto_utils import build_feature_layout, get_feature_indices
 
@@ -322,7 +322,7 @@ train_dataloader = DataLoader(
 )
 
 # Load MuJoCo
-xml_path = "./mj_model.xml"
+xml_path, _ = get_mj_xml_paths()
 mj_model = mujoco.MjModel.from_xml_path(xml_path)
 mj_data = mujoco.MjData(mj_model)
 

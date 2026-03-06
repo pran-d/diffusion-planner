@@ -1,16 +1,15 @@
 auto_conf: False
 
 data:
-  dir_path: "/home/kanish/workspace/mjlab2/motions/output/Merged_and_cleaned/"
-  train_path: "84_from_shafeef/final_trajs"
   normalization_type: "min_max"
   dataset_class: "flexible"
   batch_size: 1024
   num_features: 51
   num_task_params: 3
   num_observations: 45
-  start_timestep: 0
-  num_timesteps: 20
+  start_timestep: 5
+  end_timestep: -1
+  num_timesteps: 10
   state_history: 1
   stride: 2
   normalize_goal_vec: True
@@ -47,12 +46,10 @@ model:
   num_heads: 4
   mlp_ratio: 4.0
   pos_emb_type: "sinusoidal_1d"
-  attn_drop: 0.05
-  proj_drop: 0.05
+  attn_drop: 0.0
+  proj_drop: 0.0
 
 training:
-  save_dir: "/home/kanish/workspace/mjlab2/logs/rsl_rl/g1_object_tracking/"
-  log_dir: "/home/kanish/workspace/mjlab2/logs/rsl_rl/g1_object_tracking/data/"
   suffix: "_trajectory_goal"
   num_epochs: 5000
   balance_task_density: False
@@ -64,23 +61,23 @@ training:
   add_obs_noise: True
   add_goal_noise: True
   state_conditioning_noise_level:
-    joints: 0.025
-    body_rot6d: 0.005
-    obj_rel_pos: 0.005
-    obj_rel_rot6d: 0.005
-    task_params: 0.05
-    task_magnitude: 0.15
+    joints: 0.01
+    body_rot6d: 0.0025
+    obj_rel_pos: 0.0025
+    obj_rel_rot6d: 0.0025
+    task_params: 0.01
+    task_magnitude: 0.0
 
   # In-betweening (waypoint-masked trajectory completion)
   inbetweening:
     enabled: True
-    resample_steps: 2      # number of times to re-mask and re-predict waypoints during training
-    min_keyframes: 1        # minimum number of unmasked keyframes per window
+    resample_steps: 5      # number of times to re-mask and re-predict waypoints during training
+    min_keyframes: 0        # minimum number of unmasked keyframes per window
     max_keyframes: 3        # maximum number of unmasked keyframes per window
     always_keep_first: True # always keep t=0 as a full keyframe
     keep_last_partial: True # always keep t=T-1 as a keyframe
     waypoint_noise_fraction: 0.5  # max noise level for partial waypoint frames (fraction of total timesteps)
-    arrival_ratio: 0.70            # object reaches target in this fraction of total time (data: 90% XY by ~65%)
+    arrival_ratio: 0.80            # object reaches target in this fraction of total time (data: 90% XY by ~65%)
     partial_masking:
       enabled: True
       prob: 1.0             # probability a waypoint is partial (vs full)
@@ -95,7 +92,7 @@ training:
         robot_pos: [body_z, delta_xy, delta_yaw]
       group_keep_prob:      # per-group probability of being kept clean in a partial waypoint
         locomotion: 0.5
-        pick_place: 0.4
+        pick_place: 0.2
         lower_body: 0.15
         upper_body: 0.15
         object_pos: 0.0
@@ -103,7 +100,7 @@ training:
         robot_pos: 0.0
 
 noise_scheduler:
-  deterministic_inference: True
+  deterministic_inference: False
   train_timesteps: 200
   inference_timesteps: 10
   prediction_type: "v_prediction"

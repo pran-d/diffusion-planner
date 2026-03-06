@@ -744,6 +744,7 @@ class MotionGenerator:
                     num_task_params=self.data_cfg.get("num_task_params", 3),
                     max_goal_dist=self.dataset.max_obj_displacement,
                 )
+                print(task_cond_np)
                 # task_actual uses the real (unclipped) distance for waypoint planning
                 task_actual = task_cond_np.copy()
                 if actual_dist is not None:
@@ -932,7 +933,7 @@ class MotionGenerator:
         #      full_trajectory = self._interpolate_trajectory(full_trajectory)
 
         # Smooth trajectory
-        full_trajectory = self._smooth_trajectory(full_trajectory, sigma=2.0)
+        full_trajectory = self._smooth_trajectory(full_trajectory, sigma=1.25)
 
         if return_analysis:
             analysis_dict = {

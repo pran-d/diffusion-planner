@@ -6,3 +6,6 @@ results/
 *.npz
 *.png
 *.npy
+# Machine-local path overrides — each developer has their own copy
+config/paths.yaml
+unitree_g1/

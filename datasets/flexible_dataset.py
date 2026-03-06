@@ -34,6 +34,7 @@ class FlexibleWindowDataset(Dataset):
         self.stride = config.get("stride", 1)
         self.downsample = config.get("downsample", 1)
         self.start_timestep = config.get("start_timestep", 0)
+        self.end_timestep = config.get("end_timestep", None)
         self.normalize_goal_vec = config.get("normalize_goal_vec", True)
         self.num_task_params = config.get("num_task_params", 2)
         self.normalization_type = config.get("normalization_type", "mean_std")  # 'mean_std' or 'min_max'
@@ -134,16 +135,19 @@ class FlexibleWindowDataset(Dataset):
             bp = np.asarray(raw_data[bp_key], dtype=np.float64)
             bq = np.asarray(raw_data[bq_key], dtype=np.float64)
 
-            # body_pos_w may have a bodies dim — take pelvis (0):
-            #   batched:  (N, T, K, 3) -> (N, T, 3)
-            #   single:   (T, K, 3)    -> (T, 3)
+            # body_pos_w / body_quat_w may have a bodies dim — take pelvis (0):
+            #   batched with bodies:  (N, T, K, 3) -> (N, T, 3)
+            #   single with bodies:   (T, K, 3)    -> (T, 3)
+            # Key-mapped names (e.g. root_pos, root_rot) are already single-body
+            # and arrive as (N, T, 3) or (T, 3) — leave them untouched.
+            _MULTI_BODY_KEYS = {'body_pos_w', 'body_quat_w'}
             if bp.ndim == 4:
                 bp = bp[:, :, 0, :]
-            elif bp.ndim == 3:
+            elif bp.ndim == 3 and bp_key in _MULTI_BODY_KEYS:
                 bp = bp[:, 0, :]
             if bq.ndim == 4:
                 bq = bq[:, :, 0, :]
-            elif bq.ndim == 3:
+            elif bq.ndim == 3 and bq_key in _MULTI_BODY_KEYS:
                 bq = bq[:, 0, :]
 
             processed['base'] = np.concatenate([bp, bq], axis=-1)
@@ -218,6 +222,7 @@ class FlexibleWindowDataset(Dataset):
             return
 
         start_ts = self.start_timestep
+        end_ts = self.end_timestep
         ds = self.downsample
 
         # Ensure buffer is a list of dicts
@@ -260,7 +265,7 @@ class FlexibleWindowDataset(Dataset):
                 if (k not in self._NON_TEMPORAL_KEYS
                         and isinstance(processed[k], np.ndarray)
                         and processed[k].ndim == 3):
-                    processed[k] = processed[k][:, start_ts::ds]
+                    processed[k] = processed[k][:, start_ts:end_ts:ds]
 
             N_i = processed['base'].shape[0]
             T_down = processed['base'].shape[1]  # total frames after ds
@@ -273,16 +278,18 @@ class FlexibleWindowDataset(Dataset):
                 ])
                 # Clamp to actual data length
                 real_T = np.minimum(real_T, T_down)
-                # Ensure we have one value per batch element
-                if len(real_T) < N_i:
-                    real_T = np.concatenate([
-                        real_T,
-                        np.full(N_i - len(real_T), T_down, dtype=real_T.dtype),
-                    ])
-                real_T = real_T[:N_i]
             else:
-                # No traj_length metadata — treat entire trajectory as real
-                real_T = np.full(N_i, T_down)
+                real_T = np.array([], dtype=np.int64)
+
+            # Broadcast to exactly N_i elements:
+            #   - too few (incl. missing): fill remainder with T_down (full length)
+            #   - too many: truncate
+            if len(real_T) < N_i:
+                real_T = np.concatenate([
+                    real_T,
+                    np.full(N_i - len(real_T), T_down, dtype=np.int64),
+                ])
+            real_T = real_T[:N_i].astype(np.int64)
 
             self.real_traj_lengths.append(real_T)
 
@@ -296,12 +303,31 @@ class FlexibleWindowDataset(Dataset):
 
     def _get_single_traj(self, file_idx, batch_idx):
         """Get padded (T, D) dict for a specific trajectory.
-        Non-temporal keys (goal_obj_world, fps) are passed through without padding.
+
+        Each trajectory is first trimmed to its *real* length (from
+        ``traj_length`` metadata in the .npz) so that any bad trailing
+        frames are never seen by downstream code.  After trimming, the
+        standard history + end padding is applied so the windowing logic
+        works identically.
+
+        Non-temporal keys (goal_obj_world, fps) are passed through without
+        padding.
         """
         file_data = self.ram_cache[file_idx]
 
+        # Determine the real (un-padded) length for this batch element.
+        # Falls back to the full array length when traj_length metadata
+        # was absent or didn't cover this batch element.
+        full_T = file_data["base"][batch_idx].shape[0]
+        if (file_idx < len(self.real_traj_lengths)
+                and batch_idx < len(self.real_traj_lengths[file_idx])):
+            real_T = int(self.real_traj_lengths[file_idx][batch_idx])
+        else:
+            real_T = full_T
+        real_T = min(real_T, full_T)  # never exceed actual data
+
         pad_start = self.history_size
-        pad_end = self.traj_lengths[file_idx] - (file_data["base"][batch_idx].shape[0] + pad_start)
+        pad_end = self.traj_lengths[file_idx] - (real_T + pad_start)
 
         pad_kwargs = lambda arr: np.pad(
             arr,
@@ -315,7 +341,8 @@ class FlexibleWindowDataset(Dataset):
                 # Non-temporal — just index batch dim, no padding
                 result[k] = v[batch_idx] if hasattr(v, '__getitem__') and np.asarray(v).ndim >= 1 else v
             else:
-                result[k] = pad_kwargs(v[batch_idx])
+                # Trim to real length then pad
+                result[k] = pad_kwargs(v[batch_idx][:real_T])
         return result
         
 

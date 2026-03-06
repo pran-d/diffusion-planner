@@ -24,7 +24,7 @@ import numpy as np
 import torch
 import yaml
 
-from config.configure import load_config, get_data_path, get_norm_path
+from config.configure import load_config, get_data_path, get_norm_path, get_mj_xml_paths
 from models.model import RobotDiffuser
 from datasets.flexible_dataset import FlexibleWindowDataset
 from utils.data.load_dataset import preload_dataset
@@ -79,6 +79,8 @@ def parse_args():
     parser.add_argument("--device",         type=str,   default="cuda")
     parser.add_argument("--enable_goal_stop", action="store_true",
                         help="Stop at the end goal (default: False)")
+    parser.add_argument("--enable_physics_stop", action="store_true",  
+                        help="Stop when physics violations are detected (default: False)")
     parser.add_argument("--goal_stop_threshold", type=float, default=0.1,
                         help="Distance threshold for stopping at each goal (default: 0.1)")
 
@@ -307,8 +309,7 @@ def visualize_results(full_traj, obj_traj_w, goals_arr, args, dataset=None, ref_
     XML template is unavailable.
     """
     N, T, _ = full_traj.shape
-    xml_path          = "mj_model.xml"
-    repeated_xml_path = "mj_model_repeated.xml"
+    xml_path, repeated_xml_path = get_mj_xml_paths()
 
     # ── Extract ground-truth reference trajectories ───────────────────────────
     ref_trajs = None

@@ -3,7 +3,7 @@ import numpy as np
 import yaml
 import os
 import argparse
-from config.configure import load_config, get_data_path, get_norm_path
+from config.configure import load_config, get_data_path, get_norm_path, get_mj_xml_paths
 from utils.data.load_dataset import preload_dataset
 from datasets.flexible_dataset import yaw_to_rot_matrix, yaw_from_quat
 from utils.math.sbto_utils import reconstruct_sbto_trajectory, compute_task_params, build_feature_layout
@@ -502,7 +502,7 @@ def main():
     dataset = generator.dataset
 
     from utils.visualize.visualize import MjVisualizer
-    xml_path = "mj_model.xml"
+    xml_path, _ = get_mj_xml_paths()
     if not os.path.exists(xml_path):
         xml_path = os.path.join(data_path, "mj_model.xml")
     vis = MjVisualizer(xml_path, close_on_enter=False)

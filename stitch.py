@@ -19,7 +19,7 @@ import torch
 import matplotlib.pyplot as plt
 import yaml
 
-from config.configure import load_config, get_data_path, get_norm_path
+from config.configure import load_config, get_data_path, get_norm_path, get_mj_xml_paths
 from models.model import RobotDiffuser
 from datasets.flexible_dataset import FlexibleWindowDataset
 from utils.visualize.visualize import MjVisualizer, DiffusionOverlayVisualizer
@@ -329,7 +329,7 @@ if __name__ == "__main__":
 
     device, model_cfg, data_cfg, training_cfg, noise_cfg, dataset = load_env_and_data()
 
-    xml_path = "./mj_model.xml"
+    xml_path, _ = get_mj_xml_paths()
 
     visualizer = None
     if not args.headless:

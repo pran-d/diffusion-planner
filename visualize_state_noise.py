@@ -6,7 +6,7 @@ import os
 import copy
 from tqdm import tqdm
 
-from config.configure import load_config, get_data_path, get_norm_path
+from config.configure import load_config, get_data_path, get_norm_path, get_mj_xml_paths
 from datasets.flexible_dataset import FlexibleWindowDataset
 from utils.data.load_dataset import preload_dataset
 from utils.visualize.visualize import MjVisualizer
@@ -210,7 +210,7 @@ def main():
     torch.manual_seed(args.seed)
 
     # Load config
-    model_cfg, data_cfg, training_cfg, scheduler_cfg = load_config("src/mjlab/scripts/diffusion_planner/config/config.yaml")
+    model_cfg, data_cfg, training_cfg, scheduler_cfg = load_config("config/config.yaml")
     
     obs_noise_cfg = training_cfg.get("state_conditioning_noise_level", {})
     if not obs_noise_cfg:
@@ -233,7 +233,7 @@ def main():
     
     feature_dims = get_feature_dims(dataset)
     
-    xml_path = "src/mjlab/scripts/diffusion_planner/mj_model.xml"
+    xml_path, _ = get_mj_xml_paths()
     if not os.path.exists(xml_path):
          print(f"Warning: {xml_path} not found. Visualization might fail.")
     visualizer = MjVisualizer(xml_path)

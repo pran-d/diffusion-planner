@@ -7,7 +7,7 @@ from tqdm import tqdm
 import matplotlib.pyplot as plt
 import matplotlib.cm as cm
 
-from config.configure import load_config, get_data_path, get_norm_path
+from config.configure import load_config, get_data_path, get_norm_path, get_mj_xml_paths
 from models.model import RobotDiffuser
 from datasets.flexible_dataset import FlexibleWindowDataset, yaw_to_rot_matrix, yaw_from_quat
 from utils.data.load_dataset import preload_dataset
@@ -553,7 +553,7 @@ def main():
     # MuJoCo visualizer (created once, reused for all visualizations)
     vis = None
     if args.visualize:
-        xml_path = "mj_model.xml"
+        xml_path, _ = get_mj_xml_paths()
         if not os.path.exists(xml_path):
             xml_path = os.path.join(data_path, "mj_model.xml")
         if os.path.exists(xml_path):
