@@ -49,6 +49,7 @@ model:
   num_heads: 4
   mlp_ratio: 4.0
   pos_emb_type: "sinusoidal_1d"
+  group_wise_embedding: False  # per-semantic-group input projections (sum into hidden)
 
 training:
   save_dir: "./runs/ablations/masking/"
@@ -65,6 +66,15 @@ training:
     task: 0.2
   add_obs_noise: True
   add_goal_noise: True
+
+  # Auxiliary loss weights (set > 0 to enable)
+  smoothness_loss_weight: 0.0       # penalise frame-to-frame jitter in predicted trajectory
+  # smoothness_feature_groups: [joints, body_rot6d]  # optional: restrict to specific groups
+  grasp_consistency_loss_weight: 0.0 # penalise obj_rel_pos drift during grasping phases
+  feet_sliding_loss_weight: 0.0      # proxy: penalise ankle velocity during GT stance phases
+  grasp_distance_threshold: 0.35     # obj-body distance below which grasp gate activates
+  stance_velocity_threshold: 0.02    # ankle vel magnitude below which GT is considered stance
+
   state_conditioning_noise_level:
     joints: 0.025
     body_rot6d: 0.005

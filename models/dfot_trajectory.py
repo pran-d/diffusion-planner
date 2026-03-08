@@ -273,6 +273,23 @@ class DFoTTrajectory(nn.Module):
         self.group_keep_probs = partial_cfg.get("group_keep_prob", {})
         self.waypoint_noise_fraction = self.inbetweening_cfg.get("waypoint_noise_fraction", 0.25)
 
+        # Optional: group-wise input embeddings for the DiT1D backbone.
+        # Instead of a single nn.Linear(D, hidden) the backbone uses per-group
+        # projections whose outputs are summed → hidden, giving the model an
+        # inductive bias about the heterogeneous feature structure.
+        if model_config.get("group_wise_embedding", False) and backbone_type == "dit1d":
+            # Use the canonical feature_order groups (not the partial masking
+            # groups which merge multiple keys).  This gives one projection per
+            # semantic feature (delta_xy, delta_yaw, joints, …).
+            gw_slices = {
+                k: v for k, v in self.feature_index_map.items()
+                if k not in ("joints_lower", "joints_upper")  # avoid sub-slices
+            }
+            self.diffusion_model.model.set_group_wise_embedder(gw_slices)
+            # Recount params after replacement
+            total_params = sum(p.numel() for p in self.diffusion_model.model.parameters())
+            print(f"  Updated param count: {total_params/1e6:.2f}M parameters.")
+
         # Waypoint indicator embedding: projects per-feature binary mask (D) into
         # the backbone's hidden space so the model knows which features are constrained.
         # Added to token embeddings after input_embedder + pos_emb, before transformer blocks.
@@ -611,6 +628,135 @@ class DFoTTrajectory(nn.Module):
 
         return loss
 
+    # ------------------------------------------------------------------
+    # Auxiliary losses (computed on predicted clean trajectory x_pred)
+    # ------------------------------------------------------------------
+
+    def compute_auxiliary_losses(
+        self, x_pred: torch.Tensor, x_gt: torch.Tensor, masks: torch.Tensor
+    ) -> dict:
+        """Compute optional auxiliary losses on the predicted clean trajectory.
+
+        All losses are returned as *scalar* tensors (already reduced) so they
+        can be summed into the main objective with per-loss weight coefficients.
+
+        Args:
+            x_pred: (B, T, D) predicted clean x0 in feature space.
+            x_gt:   (B, T, D) ground-truth trajectory.
+            masks:  (B, T) boolean validity mask.
+
+        Returns:
+            dict  {loss_name: scalar tensor}  (empty if nothing is enabled).
+        """
+        aux = {}
+        tcfg = self.training_config or {}
+        fim = self.feature_index_map  # e.g. {"joints": slice(6,35), ...}
+
+        # Helper: frame-pair mask for consecutive-frame losses (B, T-1)
+        if masks is not None and masks.shape[1] > 1:
+            pair_mask = (masks[:, :-1] & masks[:, 1:]).float()   # (B, T-1)
+        else:
+            pair_mask = None
+
+        # ---- 1. Temporal smoothness loss ----
+        # Penalise large frame-to-frame changes in x_pred (encourages smooth
+        # trajectories).  Applied to all features by default, but can be
+        # restricted to specific groups via config.
+        w_smooth = tcfg.get("smoothness_loss_weight", 0.0)
+        if w_smooth > 0.0 and x_pred.shape[1] > 1:
+            diff_pred = x_pred[:, 1:] - x_pred[:, :-1]  # (B, T-1, D)
+            diff_gt   = x_gt[:, 1:]   - x_gt[:, :-1]
+
+            smooth_groups = tcfg.get("smoothness_feature_groups", None)
+            if smooth_groups and fim:
+                # Only apply to listed groups
+                slices = [fim[g] for g in smooth_groups if g in fim]
+                if slices:
+                    sel = torch.cat(
+                        [diff_pred[..., s] for s in slices], dim=-1
+                    )
+                    sel_gt = torch.cat(
+                        [diff_gt[..., s] for s in slices], dim=-1
+                    )
+                else:
+                    sel, sel_gt = diff_pred, diff_gt
+            else:
+                sel, sel_gt = diff_pred, diff_gt
+
+            # MSE between predicted and true consecutive differences
+            smooth_loss = F.mse_loss(sel, sel_gt, reduction="none")
+            if pair_mask is not None:
+                smooth_loss = smooth_loss * pair_mask.unsqueeze(-1)
+                smooth_loss = smooth_loss.sum() / (pair_mask.sum() * sel.shape[-1] + 1e-8)
+            else:
+                smooth_loss = smooth_loss.mean()
+            aux["smoothness"] = w_smooth * smooth_loss
+
+        # ---- 2. Object grasping consistency loss ----
+        # During carry phases (object close to body), obj_rel_pos should stay
+        # stable.  We penalise large frame-to-frame changes in obj_rel_pos
+        # weighted by a soft "grasp gate" = sigmoid(-dist + threshold).
+        w_grasp = tcfg.get("grasp_consistency_loss_weight", 0.0)
+        if w_grasp > 0.0 and "obj_rel_pos" in fim and x_pred.shape[1] > 1:
+            rel_sl = fim["obj_rel_pos"]                          # slice(42, 45)
+            pred_rel = x_pred[..., rel_sl]                       # (B, T, 3)
+            gt_rel   = x_gt[..., rel_sl]
+
+            # Grasp gate: use GT relative distance so the gate is stable
+            dist_gt = gt_rel.norm(dim=-1, keepdim=True)          # (B, T, 1)
+            grasp_thresh = tcfg.get("grasp_distance_threshold", 0.35)
+            # Soft gate: 1 when object is close, 0 when far
+            gate = torch.sigmoid(5.0 * (grasp_thresh - dist_gt)) # (B, T, 1)
+
+            delta_pred = pred_rel[:, 1:] - pred_rel[:, :-1]     # (B, T-1, 3)
+            delta_gt   = gt_rel[:, 1:]   - gt_rel[:, :-1]
+            gate_pairs = torch.minimum(gate[:, 1:], gate[:, :-1]) # conservative
+
+            grasp_loss = F.mse_loss(delta_pred, delta_gt, reduction="none") * gate_pairs
+            if pair_mask is not None:
+                grasp_loss = grasp_loss * pair_mask.unsqueeze(-1)
+                denom = (pair_mask.unsqueeze(-1) * gate_pairs).sum() + 1e-8
+                grasp_loss = grasp_loss.sum() / denom
+            else:
+                grasp_loss = (grasp_loss.sum()) / (gate_pairs.sum() + 1e-8)
+            aux["grasp_consistency"] = w_grasp * grasp_loss
+
+        # ---- 3. Feet-sliding proxy loss ----
+        # Without differentiable FK we use a joint-velocity proxy: penalise
+        # large ankle-joint velocity in the prediction when the GT also has
+        # low ankle velocity (i.e., stance phases).
+        # Ankle indices inside the 29-joint block:
+        #   left ankle  pitch/roll → 4, 5
+        #   right ankle pitch/roll → 10, 11
+        w_feet = tcfg.get("feet_sliding_loss_weight", 0.0)
+        if w_feet > 0.0 and "joints" in fim and x_pred.shape[1] > 1:
+            j_sl = fim["joints"]  # slice(6, 35)
+            ankle_local = [4, 5, 10, 11]  # indices within 29-joint block
+            ankle_global = [j_sl.start + i for i in ankle_local]
+
+            pred_ankles = x_pred[..., ankle_global]              # (B, T, 4)
+            gt_ankles   = x_gt[..., ankle_global]
+
+            vel_pred = pred_ankles[:, 1:] - pred_ankles[:, :-1]  # (B, T-1, 4)
+            vel_gt   = gt_ankles[:, 1:]   - gt_ankles[:, :-1]
+
+            # Stance gate: GT ankle velocity is small → foot likely on ground
+            vel_gt_mag = vel_gt.abs()
+            stance_thresh = tcfg.get("stance_velocity_threshold", 0.02)
+            stance_gate = (vel_gt_mag < stance_thresh).float()   # (B, T-1, 4)
+
+            # Penalise predicted ankle velocity during GT stance
+            feet_loss = (vel_pred ** 2) * stance_gate
+            if pair_mask is not None:
+                feet_loss = feet_loss * pair_mask.unsqueeze(-1)
+                denom = (pair_mask.unsqueeze(-1) * stance_gate).sum() + 1e-8
+                feet_loss = feet_loss.sum() / denom
+            else:
+                feet_loss = feet_loss.sum() / (stance_gate.sum() + 1e-8)
+            aux["feet_sliding"] = w_feet * feet_loss
+
+        return aux
+
     def forward(self, x, model_cond=None, masks=None, timesteps=None):
         """
         Forward pass for training.
@@ -765,7 +911,10 @@ class DFoTTrajectory(nn.Module):
         # Apply frame-level validity masks
         loss = self._reweight_loss(loss, masks)
 
-        return {"loss": loss, "xs_pred": x_pred, "xs": x}
+        # Compute optional auxiliary losses on the predicted clean trajectory
+        aux_losses = self.compute_auxiliary_losses(x_pred, x, masks)
+
+        return {"loss": loss, "xs_pred": x_pred, "xs": x, "aux_losses": aux_losses}
 
     def sample(self, num_trajectories, model_cond=None, cfg_w=0.0, guidance_wt=1.0, guidance_goal=None, inpaint=False, no_state_cond=False, waypoint_values=None, waypoint_mask=None):
         """

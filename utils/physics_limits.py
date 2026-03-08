@@ -76,6 +76,19 @@ BODY_Z_MAX = 0.80    # data max ≈ 0.7923, allow small margin
 # ═══════════════════════════════════════════════════════════════════════════════
 ROBOT_XY_VEL_MAX = 1.50  # data max ≈ 1.37 m/s, with ~10% margin
 
+# ═══════════════════════════════════════════════════════════════════════════════
+# Yaw velocity limit (rad/s) — from training data at stride=2
+# p99.9 = 4.35, true physical max (excluding wrapping artifacts) ~6-9 rad/s
+# ═══════════════════════════════════════════════════════════════════════════════
+YAW_VEL_MAX = 5.0  # rad/s — generous limit that covers p99.9 (4.35)
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Object relative position bounds (body frame, metres) — from training data
+# These define the feasible workspace envelope around the robot pelvis.
+# ═══════════════════════════════════════════════════════════════════════════════
+OBJ_REL_POS_LO = np.array([0.10, -0.40, -0.55], dtype=np.float64)   # [x, y, z] min
+OBJ_REL_POS_HI = np.array([0.75,  0.35,  0.40], dtype=np.float64)   # [x, y, z] max
+
 
 def apply_physics_clamp(
     future_traj: np.ndarray,
@@ -84,6 +97,8 @@ def apply_physics_clamp(
     clamp_joint_vel: bool = True,
     clamp_body_z: bool = True,
     clamp_xy_vel: bool = True,
+    clamp_yaw_vel: bool = True,
+    clamp_obj_rel_pos: bool = True,
     vel_margin: float = 1.0,
     verbose: bool = False,
 ) -> np.ndarray:
@@ -96,8 +111,10 @@ def apply_physics_clamp(
     Clamping order (important — position clamps first, then velocity):
         1. Joint position clamp  (hard XML limits)
         2. Body-Z clamp          (data-derived height range)
-        3. Joint velocity clamp   (data-derived per-joint limits, iterative forward pass)
-        4. Robot XY velocity clamp (data-derived, via delta_xy increments)
+        3. Object rel_pos clamp  (data-derived workspace envelope)
+        4. Joint velocity clamp   (data-derived per-joint limits, iterative forward pass)
+        5. Robot XY velocity clamp (data-derived, via delta_xy increments)
+        6. Yaw velocity clamp    (data-derived, via delta_yaw increments)
 
     Args:
         future_traj: (B, T, D) denormalized SBTO features.
@@ -106,6 +123,8 @@ def apply_physics_clamp(
         clamp_joint_vel: Whether to clamp per-joint velocities.
         clamp_body_z: Whether to clamp pelvis height.
         clamp_xy_vel: Whether to clamp robot XY velocity.
+        clamp_yaw_vel: Whether to clamp robot yaw velocity.
+        clamp_obj_rel_pos: Whether to clamp object relative position to workspace envelope.
         vel_margin: Multiplier on data-max velocity limits (1.0 = exact data max).
         verbose: Print clamping statistics.
 
@@ -126,6 +145,8 @@ def apply_physics_clamp(
     IDX_JOINTS = indices["joints"]       # slice for 29 joints
     IDX_BODY_Z = indices["body_z"]       # slice for 1-dim body z
     IDX_DELTA_XY = indices["delta_xy"]   # slice for 2-dim delta_xy
+    IDX_DELTA_YAW = indices["delta_yaw"] # slice for 1-dim delta_yaw
+    IDX_OBJ_REL_POS = indices["obj_rel_pos"]  # slice for 3-dim obj_rel_pos
 
     stats = {}
 
@@ -146,14 +167,21 @@ def apply_physics_clamp(
         traj[:, :, IDX_BODY_Z] = bz
         stats["body_z_clamps"] = int(bz_viol)
 
-    # ─── 3. Joint velocity clamp (iterative forward pass) ───────────────────
+    # ─── 3. Object relative position clamp ──────────────────────────────────
+    if clamp_obj_rel_pos:
+        orp = traj[:, :, IDX_OBJ_REL_POS]  # (B, T, 3)
+        orp_viol = ((orp < OBJ_REL_POS_LO) | (orp > OBJ_REL_POS_HI)).sum()
+        np.clip(orp, OBJ_REL_POS_LO, OBJ_REL_POS_HI, out=orp)
+        traj[:, :, IDX_OBJ_REL_POS] = orp
+        stats["obj_rel_pos_clamps"] = int(orp_viol)
+
+    # ─── 4. Joint velocity clamp (iterative forward pass) ───────────────────
     if clamp_joint_vel and T > 1:
         max_delta = JOINT_VEL_MAX * vel_margin * dt  # (29,) max allowed change per step
         joints = traj[:, :, IDX_JOINTS]  # (B, T, 29)
         vel_clamps = 0
         for t in range(1, T):
             delta = joints[:, t, :] - joints[:, t - 1, :]  # (B, 29)
-            # Per-joint: clamp delta to [-max_delta, +max_delta]
             clamped = np.clip(delta, -max_delta, max_delta)
             n_clamped = (clamped != delta).sum()
             vel_clamps += int(n_clamped)
@@ -164,7 +192,7 @@ def apply_physics_clamp(
         traj[:, :, IDX_JOINTS] = joints
         stats["joint_vel_clamps"] = vel_clamps
 
-    # ─── 4. Robot XY velocity clamp (via cumulative delta_xy) ───────────────
+    # ─── 5. Robot XY velocity clamp (via cumulative delta_xy) ───────────────
     if clamp_xy_vel and T > 1:
         max_step = ROBOT_XY_VEL_MAX * vel_margin * dt  # max XY displacement per frame
         dxy = traj[:, :, IDX_DELTA_XY]  # (B, T, 2) — cumulative from anchor
@@ -180,6 +208,20 @@ def apply_physics_clamp(
             dxy[:, t, :] = dxy[:, t - 1, :] + inc
         traj[:, :, IDX_DELTA_XY] = dxy
         stats["xy_vel_clamps"] = xy_clamps
+
+    # ─── 6. Yaw velocity clamp (via cumulative delta_yaw) ──────────────────
+    if clamp_yaw_vel and T > 1:
+        max_yaw_step = YAW_VEL_MAX * vel_margin * dt  # max yaw change per frame
+        dyaw = traj[:, :, IDX_DELTA_YAW]  # (B, T, 1) — cumulative from anchor
+        yaw_clamps = 0
+        for t in range(1, T):
+            inc = dyaw[:, t, :] - dyaw[:, t - 1, :]  # (B, 1)
+            clamped = np.clip(inc, -max_yaw_step, max_yaw_step)
+            n_clamped = int((clamped != inc).sum())
+            yaw_clamps += n_clamped
+            dyaw[:, t, :] = dyaw[:, t - 1, :] + clamped
+        traj[:, :, IDX_DELTA_YAW] = dyaw
+        stats["yaw_vel_clamps"] = yaw_clamps
 
     if verbose and any(v > 0 for v in stats.values()):
         parts = [f"{k}={v}" for k, v in stats.items() if v > 0]

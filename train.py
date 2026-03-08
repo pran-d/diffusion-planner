@@ -348,6 +348,7 @@ for epoch in range(starting_epoch, num_epochs):
             )
             model_pred = diff_output["xs_pred"]
             pred_loss = diff_output["loss"]
+            aux_losses = diff_output.get("aux_losses", {})
 
             if model_pred.shape[-1] > 50 and training_cfg.get("geom_loss_weight", 0.0) > 0.0:
                 pred_ee_pos = model_pred[..., 50:56].reshape(*model_pred.shape[:-1], 2, 3)
@@ -361,7 +362,10 @@ for epoch in range(starting_epoch, num_epochs):
             else:
                 geom_loss = 0.0
 
-            loss = pred_loss.mean() + geom_loss
+            # Sum auxiliary losses (smoothness, grasp consistency, feet sliding)
+            aux_total = sum(aux_losses.values()) if aux_losses else 0.0
+
+            loss = pred_loss.mean() + geom_loss + aux_total
 
         optimizer.zero_grad()
         
@@ -388,6 +392,8 @@ for epoch in range(starting_epoch, num_epochs):
         global_step = epoch * len(train_dataloader) + step
         writer.add_scalar("Loss/train_step", loss.item(), global_step)
         writer.add_scalar("Loss/pred_loss", pred_loss.mean().item(), global_step)
+        for aux_name, aux_val in aux_losses.items():
+            writer.add_scalar(f"Loss/{aux_name}", aux_val.item(), global_step)
 
         pbar.set_postfix({
             "Mean loss": f"{np.mean(epoch_losses).item():.5f}"
