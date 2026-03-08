@@ -320,13 +320,13 @@ def run_evaluation_batch(
                 )
 
             if args.action_horizon is not None:
-                robot_world = robot_world[:, 1:, :]  # skip t=0 then apply horizon
-                obj_world   = obj_world[:, 1:, :]
+                robot_world = robot_world[:, history_size:, :]  # skip t=0 then apply horizon
+                obj_world   = obj_world[:, history_size:, :]
                 robot_world = robot_world[:, :args.action_horizon, :]
                 obj_world = obj_world[:, :args.action_horizon, :]
             else:
-                robot_world = robot_world[:, 1:, :]  # skip t=0 (anchored to current state)
-                obj_world   = obj_world[:, 1:, :]
+                robot_world = robot_world[:, history_size:, :]  # skip t=0 (anchored to current state)
+                obj_world   = obj_world[:, history_size:, :]
 
             # Store (B, T, D)
             segment = np.concatenate([robot_world[..., :36], obj_world[..., :7]], axis=-1)

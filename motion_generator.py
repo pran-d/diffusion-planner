@@ -20,6 +20,7 @@ from models.model import RobotDiffuser
 from datasets.flexible_dataset import FlexibleWindowDataset
 from utils.math.sbto_utils import reconstruct_sbto_trajectory, compute_task_params
 from utils.math.math_tools import yaw_from_quat, yaw_to_rot_matrix
+from utils.physics_limits import apply_physics_clamp
 from inference import build_inference_waypoints
 from diffusers import EMAModel
 
@@ -565,6 +566,7 @@ class MotionGenerator:
                             end_error_threshold: float = 0.1,
                             enable_goal_stop: bool = False,
                             enable_physics_stop: bool = False,
+                            enable_physics_clamp: bool = False,
                             use_last_frame_wp: bool = True,
                             arrival_ratio: float = 0.85,
                             lift_height: float = 0.5,
@@ -572,7 +574,8 @@ class MotionGenerator:
                             lift_start: float = 0.0,
                             lift_end: float = 0.20,
                             walk_start_z: float = 0.80,
-                            return_analysis: bool = False,):
+                            return_analysis: bool = False,
+                            verbose: bool = False,):
         """
         Generate trajectory via autoregressive diffusion.
         
@@ -606,6 +609,8 @@ class MotionGenerator:
             enable_physics_stop: If True, truncate and pad when a physical consistency
                                  violation is detected (ground penetration / position spike).
                                  Set to False to continue generating regardless.
+            enable_physics_clamp: If True, apply data-derived physics clamping after
+                                  denormalization (joint pos/vel limits, body_z, XY vel).
             use_last_frame_wp: If True and model supports inbetweening, add a partial
                                waypoint at the last frame with obj_delta_xy + obj_z.
             arrival_ratio: Object should arrive within this fraction of total time (0-1).
@@ -782,7 +787,14 @@ class MotionGenerator:
                 denorm_btc = self.dataset.denormalize_global(normalized_sample)
                 future_traj_np = denorm_btc.detach().cpu().numpy()
 
-                # D2. Collect analysis data
+                # D2. Physics-informed clamping (joint pos/vel, body_z, XY vel)
+                if enable_physics_clamp:
+                    dt_eff = self.data_cfg.get("raw_dt", 0.01) * self.data_cfg.get("stride", 2)
+                    future_traj_np = apply_physics_clamp(
+                        future_traj_np, dt=dt_eff, verbose=verbose,
+                    )
+
+                # D3. Collect analysis data
                 if return_analysis:
                     _ana_norm.append(normalized_sample.detach().cpu().numpy())
                     _ana_denorm.append(future_traj_np.copy())
@@ -811,8 +823,8 @@ class MotionGenerator:
                 r_world, o_world = res[0], res[1]
 
                 # Always skip t=0 (anchor frame) — matches inference.py
-                r_world = r_world[:, 1:, :]
-                o_world = o_world[:, 1:, :]
+                r_world = r_world[:, history_size:, :]
+                o_world = o_world[:, history_size:, :]
                 
                 # Store segment: Robot(36) + Object(7)
                 segment_world = np.concatenate([r_world[..., :36], o_world[..., :7]], axis=-1)

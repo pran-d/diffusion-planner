@@ -9,6 +9,7 @@ from datasets import BufferDataset
 from utils.data.load_dataset import preload_dataset
 from datasets.flexible_dataset import yaw_to_rot_matrix, yaw_from_quat
 from utils.math.sbto_utils import reconstruct_sbto_trajectory, compute_task_params, build_feature_layout
+from utils.physics_limits import apply_physics_clamp
 
 # Default lift height derived from dataset statistics:
 # median peak cumulative obj_delta_z across 1634 pick-and-place trajectories.
@@ -493,6 +494,8 @@ def main():
     parser.add_argument("--goal_multiplier", type=float, default=1.0, help="Scaling factor for goal (for testing different r for same theta)")
     parser.add_argument("--visualize_windows", action="store_true", help="Render and save each generated window as a video")
     parser.add_argument("--enable_phys_stop", action="store_true", help="Stop trajectory when object reaches goal region (for pick-and-place)")
+    parser.add_argument("--enable_physics_clamp", action="store_true", help="Apply data-derived physics clamping (joint pos/vel, body_z, XY vel)")
+    parser.add_argument("--verbose_physics", action="store_true", help="Print physics clamping statistics per window")
 
     # Guidance arguments
     parser.add_argument("--guidance_wt", type=float, default=0.0, help="Test-time gradient guidance strength")
@@ -687,6 +690,13 @@ def main():
         denorm_btc = dataset.denormalize_global(normalized_sample)
         future_traj_np = denorm_btc.cpu().numpy()
 
+        # B2. Physics-informed clamping (joint pos/vel, body_z, XY vel)
+        if args.enable_physics_clamp:
+            dt_eff = data_cfg.get("raw_dt", 0.01) * data_cfg.get("stride", 2)
+            future_traj_np = apply_physics_clamp(
+                future_traj_np, dt=dt_eff, verbose=args.verbose_physics,
+            )
+
         # Store unreconstructed segment for debugging   
         unreconstructed_segments.append(future_traj_np)
 
@@ -709,8 +719,8 @@ def main():
         res = reconstruct_sbto_trajectory(anchor_arr, future_traj_np, inpaint=diffuser.model_cfg.get("inpaint", False))
         r_world, o_world = res[0], res[1]
 
-        r_world = r_world[:, 1:, :]
-        o_world = o_world[:, 1:, :]
+        r_world = r_world[:, history_size:, :]
+        o_world = o_world[:, history_size:, :]
 
         if args.action_horizon is not None:
             r_world = r_world[:, :args.action_horizon, :]
