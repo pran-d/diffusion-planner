@@ -61,6 +61,7 @@ class FlexibleWindowDataset(Dataset):
         # ---- Preload buffer into ram_cache ----
         self.ram_cache = []
         self.traj_lengths = []
+        self.real_traj_lengths = []  # actual (pre-padding) lengths per file
         self.indices = []
 
         self._preload_from_buffer()
@@ -80,6 +81,13 @@ class FlexibleWindowDataset(Dataset):
         if self.max_obj_displacement is None:
             self.max_obj_displacement = self.stats.get("max_task_params")[2]
             print("Using max_obj_displacement =", self.max_obj_displacement)
+
+    @property
+    def feature_dims(self):
+        """Return an array of per-feature dimensions matching feature_order."""
+        from utils.math.sbto_utils import build_feature_layout
+        layout = build_feature_layout()
+        return np.array([layout[k] for k in self.feature_order])
 
 
     def get_k(self, key):
@@ -136,11 +144,11 @@ class FlexibleWindowDataset(Dataset):
             #   single:   (T, K, 3)    -> (T, 3)
             if bp.ndim == 4:
                 bp = bp[:, :, 0, :]
-            elif bp.ndim == 3:
+            elif bp.ndim == 3 and bp_key in ['body_pos_w']:
                 bp = bp[:, 0, :]
             if bq.ndim == 4:
                 bq = bq[:, :, 0, :]
-            elif bq.ndim == 3:
+            elif bq.ndim == 3 and bq_key in ['body_quat_w']:
                 bq = bq[:, 0, :]
 
             processed['base'] = np.concatenate([bp, bq], axis=-1)
@@ -276,18 +284,29 @@ class FlexibleWindowDataset(Dataset):
 
     def _get_single_traj(self, file_idx, batch_idx):
         """Get padded (T, D) dict for a specific trajectory.
+        Trims to real (pre-padding) length before padding so that
+        windows near the tail of short trajectories see edge-padded
+        copies of the last real frame rather than garbage.
         Non-temporal keys (goal_obj_world, fps) are passed through without padding.
         """
         file_data = self.ram_cache[file_idx]
 
-        pad_start = self.history_size
-        pad_end = self.traj_lengths[file_idx] - (file_data["base"][batch_idx].shape[0] + pad_start)
+        # Real (non-padded) length for this specific trajectory
+        real_T = self.real_traj_lengths[file_idx][batch_idx] if self.real_traj_lengths else None
 
-        pad_kwargs = lambda arr: np.pad(
-            arr,
-            ((pad_start, pad_end), (0, 0)) if arr.ndim == 2 else ((0, 0),),
-            mode='edge',
-        )
+        pad_start = self.history_size
+        target_padded = self.traj_lengths[file_idx]
+
+        def _trim_and_pad(arr):
+            # Trim to real length, then pad to target_padded
+            if real_T is not None and arr.shape[0] > real_T:
+                arr = arr[:real_T]
+            pad_end = target_padded - (arr.shape[0] + pad_start)
+            pad_end = max(pad_end, 0)
+            if arr.ndim == 2:
+                return np.pad(arr, ((pad_start, pad_end), (0, 0)), mode='edge')
+            else:
+                return np.pad(arr, ((0, 0),), mode='edge')
 
         result = {}
         for k, v in file_data.items():
@@ -295,7 +314,7 @@ class FlexibleWindowDataset(Dataset):
                 # Non-temporal — just index batch dim, no padding
                 result[k] = v[batch_idx] if hasattr(v, '__getitem__') and np.asarray(v).ndim >= 1 else v
             else:
-                result[k] = pad_kwargs(v[batch_idx])
+                result[k] = _trim_and_pad(v[batch_idx])
         return result
         
 
@@ -303,6 +322,7 @@ class FlexibleWindowDataset(Dataset):
         """
         Iterate through files to determine valid window start indices.
         Mimics create_dataset.py padding and windowing logic.
+        Restricts window starts so each window overlaps real (non-padded) data.
         """
         print("Indexing dataset...")
         for i in range(len(self.ram_cache)):
@@ -321,6 +341,20 @@ class FlexibleWindowDataset(Dataset):
                     print("Warning: 'joints' key not found in data. Skipping indexing for this file.")
                     continue 
                 
+                # Check for per-trajectory real lengths from metadata
+                if 'traj_length' in data:
+                    _tl = np.asarray(data['traj_length'])
+                    if _tl.ndim == 0:
+                        real_lengths = [int(_tl)] * B
+                    else:
+                        real_lengths = [int(_tl[b]) for b in range(B)]
+                elif 'traj_lengths' in data:
+                    _tl = np.asarray(data['traj_lengths'])
+                    real_lengths = [int(_tl[b]) for b in range(B)]
+                else:
+                    real_lengths = [T] * B
+                self.real_traj_lengths.append(real_lengths)
+                
                 # Data is already downsampled in _preload_from_buffer
                 T_down = T
 
@@ -331,11 +365,15 @@ class FlexibleWindowDataset(Dataset):
                 self.traj_lengths.append(T_padded)
                 
                 w_size = self.window_size
-                max_start = T_padded - w_size
                 
-                if max_start > 0:
-                    starts = np.arange(0, max_start + 1, self.stride)
-                    for b in range(B):
+                for b in range(B):
+                    # Restrict to real data: window must start before real data ends
+                    real_T = real_lengths[b]
+                    max_start = min(T_padded - w_size, real_T + pad_start - w_size)
+                    max_start = max(max_start, 0)
+                    
+                    if max_start >= 0:
+                        starts = np.arange(0, max_start + 1, self.stride)
                         for s in starts:
                             self.indices.append((i, b, s))
 
