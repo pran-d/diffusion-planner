@@ -487,6 +487,8 @@ def main():
     parser.add_argument("--start_time", type=int, default=0, help="Window start timestep")
     parser.add_argument("--device", type=str, default="cuda", help="Device for inference (cuda or cpu)")
     parser.add_argument("--cfg_w", type=float, default=1.0, help="Classifier-free guidance weight")
+    parser.add_argument("--blend_w", type=float, default=0.0,
+                        help="Blended denoising weight (PARC-style, 0=off, 0.35=moderate, 0.65=PARC default)")
     parser.add_argument("--task_params", nargs="+", type=float, default=None, help="Custom task parameters (e.g., --task_params 0.5 -0.2)")
     parser.add_argument("--visualize_dataset", action="store_true", help="Whether to visualize the original dataset trajectory instead of the generated one")
     parser.add_argument("--action_horizon", type=int, default=None, help="Number of future steps to visualize/control (for dataset visualization)")
@@ -673,6 +675,7 @@ def main():
                 goal_cond=task_tens.to(device),
                 deterministic=True,
                 cfg_w=args.cfg_w,
+                blend_w=args.blend_w,
                 guidance_wt=args.guidance_wt,
                 guidance_goal=args.guidance_goal,
                 waypoint_values=wv,

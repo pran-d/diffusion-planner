@@ -100,6 +100,8 @@ def main():
     parser.add_argument("--device", type=str, default="cuda")
     parser.add_argument("--cfg_w", type=float, default=1.0,
                         help="Classifier-free guidance weight")
+    parser.add_argument("--blend_w", type=float, default=0.0,
+                        help="Blended denoising weight (PARC-style, 0=off, 0.35=moderate, 0.65=PARC default)")
     parser.add_argument("--task_params", nargs="+", type=float, default=None,
                         help="Override goal as local-frame displacement (e.g. --task_params 0.5 -0.2)")
     parser.add_argument("--end_error_threshold", type=float, default=0.1)
@@ -212,6 +214,7 @@ def main():
         stitch_steps=args.stitch_steps,
         num_samples=args.num_samples,
         cfg_w=args.cfg_w,
+        blend_w=args.blend_w,
         end_error_threshold=args.end_error_threshold,
         enable_goal_stop=args.enable_goal_stop,
         enable_physics_stop=args.enable_phys_stop,

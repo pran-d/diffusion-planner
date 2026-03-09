@@ -367,6 +367,8 @@ class DiscreteDiffusion(nn.Module):
         guidance_goal: Optional[torch.Tensor] = None,
         guidance_wt: float = 1.0,
         cfg_w: float = 1.0,
+        blend_w: float = 0.0,
+        state_cond_mask: Optional[torch.Tensor] = None,
     ):
         if self.is_ddim_sampling:
             return self.ddim_sample_step(
@@ -379,6 +381,8 @@ class DiscreteDiffusion(nn.Module):
                 guidance_goal=guidance_goal,
                 guidance_wt=guidance_wt,
                 cfg_w=cfg_w,
+                blend_w=blend_w,
+                state_cond_mask=state_cond_mask,
             )
         # FIXME: temporary code for checking ddpm sampling
         assert torch.all(
@@ -452,6 +456,8 @@ class DiscreteDiffusion(nn.Module):
         guidance_goal: Optional[torch.Tensor] = None,
         guidance_wt: float = 1.0,
         cfg_w: float = 1.0,
+        blend_w: float = 0.0,
+        state_cond_mask: Optional[torch.Tensor] = None,
     ):
         clipped_curr_noise_level = torch.clamp(curr_noise_level, min=0)
 
@@ -550,6 +556,32 @@ class DiscreteDiffusion(nn.Module):
                 external_cond_mask=None,
             )
 
+            # ── Blended denoising (PARC-style state-axis CFG) ──────────
+            # When blend_w > 0 we run an extra pass with state conditioning
+            # zeroed out (task-only) and blend the predictions:
+            #   x_blend = blend_w * pred_task_only + (1-blend_w) * pred_full
+            # This trades temporal smoothness for goal compliance.
+            if blend_w > 0.0 and state_cond_mask is not None and external_cond is not None:
+                task_only_cond = state_cond_mask * external_cond  # keeps task, zeros state
+                model_pred_task_only = self.model_predictions(
+                    x=x,
+                    k=clipped_curr_noise_level,
+                    external_cond=task_only_cond,
+                    external_cond_mask=None,
+                )
+                blended_x_start = (
+                    blend_w * model_pred_task_only.pred_x_start
+                    + (1 - blend_w) * model_pred_cond.pred_x_start
+                )
+                blended_noise = (
+                    blend_w * model_pred_task_only.pred_noise
+                    + (1 - blend_w) * model_pred_cond.pred_noise
+                )
+            else:
+                blended_x_start = model_pred_cond.pred_x_start
+                blended_noise = model_pred_cond.pred_noise
+            # ───────────────────────────────────────────────────────────
+
             masked_external_cond = external_cond_mask * external_cond if external_cond is not None else None
             model_pred_uncond = self.model_predictions(
                 x=x,
@@ -558,12 +590,12 @@ class DiscreteDiffusion(nn.Module):
                 external_cond_mask=None,
             )
             
-            # Classifier-Free Guidance
+            # Classifier-Free Guidance (task axis)
             x_start = model_pred_uncond.pred_x_start + cfg_w * (
-                model_pred_cond.pred_x_start - model_pred_uncond.pred_x_start
+                blended_x_start - model_pred_uncond.pred_x_start
             )
             pred_noise = model_pred_uncond.pred_noise + cfg_w * (
-                model_pred_cond.pred_noise - model_pred_uncond.pred_noise
+                blended_noise - model_pred_uncond.pred_noise
             )
             
             # Dynamic Thresholding (Clamp gen values to [-1, 1] then scale)

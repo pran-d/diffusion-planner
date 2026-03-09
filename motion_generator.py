@@ -563,6 +563,7 @@ class MotionGenerator:
                             stitch_steps: int = None, 
                             num_samples: int = 1,
                             cfg_w: float = 1.0,
+                            blend_w: float = 0.0,
                             end_error_threshold: float = 0.1,
                             enable_goal_stop: bool = False,
                             enable_physics_stop: bool = False,
@@ -600,7 +601,10 @@ class MotionGenerator:
                           target_traj_length and model window size (minimum 1).
             num_samples: Number of parallel samples **per input condition**.
                          When input is already batched (B > 1), set to 1.
-            cfg_w: Classifier-free guidance weight.
+            cfg_w: Classifier-free guidance weight (task axis).
+            blend_w: Blended denoising weight (state axis, PARC-style). 0 = fully
+                     state-conditioned, 0.35 = moderate, 0.65 = PARC default.
+                     Blends task-only and full predictions at every denoising step.
             end_error_threshold: Stop stitching early if goal reached within this L2 error
                                  (per trajectory). Only used when enable_goal_stop=True.
             enable_goal_stop: If True, each trajectory independently stops generating and
@@ -779,6 +783,7 @@ class MotionGenerator:
                     goal_cond=task_cond,
                     deterministic=self.noise_cfg.get("deterministic_inference", False),
                     cfg_w=cfg_w,
+                    blend_w=blend_w,
                     waypoint_values=wv,
                     waypoint_mask=wm,
                 )  # (B, T, D_out)

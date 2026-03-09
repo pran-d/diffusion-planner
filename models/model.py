@@ -75,7 +75,7 @@ class RobotDiffuser():
         if unexpected:
             print(f"  [Warning] Unexpected keys (ignored): {unexpected}")
 
-    def getSample(self, num_trajectories=1, state_cond=None, goal_cond=None, deterministic=False, cfg_w=1.0, guidance_wt=0.0, guidance_goal=None, no_state_cond=False, waypoint_values=None, waypoint_mask=None):
+    def getSample(self, num_trajectories=1, state_cond=None, goal_cond=None, deterministic=False, cfg_w=1.0, guidance_wt=0.0, guidance_goal=None, no_state_cond=False, waypoint_values=None, waypoint_mask=None, blend_w=0.0):
         """
         Run reverse diffusion to generate trajectories.
         """
@@ -102,6 +102,7 @@ class RobotDiffuser():
             'no_state_cond': no_state_cond,
             'waypoint_values': waypoint_values,
             'waypoint_mask': waypoint_mask,
+            'blend_w': blend_w,
         }
 
         sample = self.model.sample(

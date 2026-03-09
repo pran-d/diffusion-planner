@@ -553,10 +553,13 @@ class DFoTTrajectory(nn.Module):
         self, x, curr_noise_level, next_noise_level, external_cond,
         external_cond_mask=None, guidance_fn=None, guidance_goal=None,
         guidance_wt=1.0, cfg_w=1.0, waypoint_mask=None,
+        blend_w=0.0, state_cond_mask=None,
     ):
         """
         DDIM sample step that uses the waypoint indicator embedding.
         Mirrors DiscreteDiffusion.ddim_sample_step but with the indicator injected.
+        Supports blended denoising (blend_w > 0): blends state-conditioned
+        and task-only predictions at each denoising step.
         """
         dm = self.diffusion_model
         clipped_curr = torch.clamp(curr_noise_level, min=0)
@@ -586,6 +589,26 @@ class DFoTTrajectory(nn.Module):
             waypoint_mask=waypoint_mask,
         )
 
+        # ── Blended denoising (PARC-style state-axis CFG) ──────────
+        if blend_w > 0.0 and state_cond_mask is not None and external_cond is not None:
+            task_only_cond = state_cond_mask * external_cond  # keeps task, zeros state
+            pred_task_only = self._model_predictions_with_indicator(
+                x, clipped_curr, task_only_cond, external_cond_mask=None,
+                waypoint_mask=waypoint_mask,
+            )
+            blended_x_start = (
+                blend_w * pred_task_only.pred_x_start
+                + (1 - blend_w) * pred_cond.pred_x_start
+            )
+            blended_noise = (
+                blend_w * pred_task_only.pred_noise
+                + (1 - blend_w) * pred_cond.pred_noise
+            )
+        else:
+            blended_x_start = pred_cond.pred_x_start
+            blended_noise = pred_cond.pred_noise
+        # ───────────────────────────────────────────────────────────
+
         # Unconditional prediction (with indicator but masked external cond)
         masked_ext = external_cond_mask * external_cond if external_cond is not None else None
         pred_uncond = self._model_predictions_with_indicator(
@@ -593,12 +616,12 @@ class DFoTTrajectory(nn.Module):
             waypoint_mask=waypoint_mask,
         )
 
-        # CFG
+        # Task-axis CFG (applied on top of blended prediction)
         x_start = pred_uncond.pred_x_start + cfg_w * (
-            pred_cond.pred_x_start - pred_uncond.pred_x_start
+            blended_x_start - pred_uncond.pred_x_start
         )
         pred_noise = pred_uncond.pred_noise + cfg_w * (
-            pred_cond.pred_noise - pred_uncond.pred_noise
+            blended_noise - pred_uncond.pred_noise
         )
 
         if cfg_w > 1.0:
@@ -916,7 +939,7 @@ class DFoTTrajectory(nn.Module):
 
         return {"loss": loss, "xs_pred": x_pred, "xs": x, "aux_losses": aux_losses}
 
-    def sample(self, num_trajectories, model_cond=None, cfg_w=0.0, guidance_wt=1.0, guidance_goal=None, inpaint=False, no_state_cond=False, waypoint_values=None, waypoint_mask=None):
+    def sample(self, num_trajectories, model_cond=None, cfg_w=0.0, guidance_wt=1.0, guidance_goal=None, inpaint=False, no_state_cond=False, waypoint_values=None, waypoint_mask=None, blend_w=0.0):
         """
         Sampling method. Supports optional feature-level waypoint injection for
         guided generation. When waypoint_values/waypoint_mask are provided,
@@ -996,6 +1019,7 @@ class DFoTTrajectory(nn.Module):
             cfg_w=cfg_w,
             waypoint_values=waypoint_values,
             waypoint_mask=waypoint_mask,
+            blend_w=blend_w,
         )
         
         # Return (B, T, C)
@@ -1068,6 +1092,7 @@ class DFoTTrajectory(nn.Module):
         cfg_w: float = 1.0,
         waypoint_values: Optional[torch.Tensor] = None,
         waypoint_mask: Optional[torch.Tensor] = None,
+        blend_w: float = 0.0,
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
         
         x_shape = self.x_shape
@@ -1127,10 +1152,22 @@ class DFoTTrajectory(nn.Module):
             )
 
         # ---- Pre-compute loop invariants (hoisted from inner loop) ----
+        # Task-axis CFG mask: keeps state embedding, zeros task embedding.
+        # When multiplied with external_cond → "unconditional" = state-only.
         external_conditions_mask = torch.zeros(
             (batch_size, 1, self.external_cond_dim), dtype=torch.bool, device=xs_pred.device
         )
         external_conditions_mask[..., :self.task_dim] = 1.0
+
+        # State-axis blended-denoising mask: keeps task embedding, zeros state.
+        # When multiplied with external_cond → "task-only" prediction.
+        state_cond_mask = None
+        if blend_w > 0.0:
+            state_cond_mask = torch.zeros(
+                (batch_size, 1, self.external_cond_dim), dtype=torch.bool, device=xs_pred.device
+            )
+            # State occupies [0 : state_dim], task occupies [state_dim : state_dim+task_dim]
+            state_cond_mask[..., self.state_dim:] = 1.0  # keep task part, zero state part
 
         use_indicator = waypoint_mask is not None and waypoint_mask.any()
 
@@ -1142,6 +1179,7 @@ class DFoTTrajectory(nn.Module):
                     guidance_fn=guidance_fn, guidance_goal=guidance_goal,
                     guidance_wt=guidance_wt, cfg_w=cfg_w,
                     waypoint_mask=waypoint_mask,
+                    blend_w=blend_w, state_cond_mask=state_cond_mask,
                 )
             else:
                 return self.diffusion_model.sample_step(
@@ -1149,6 +1187,7 @@ class DFoTTrajectory(nn.Module):
                     external_conditions_mask,
                     guidance_fn=guidance_fn, guidance_goal=guidance_goal,
                     guidance_wt=guidance_wt, cfg_w=cfg_w,
+                    blend_w=blend_w, state_cond_mask=state_cond_mask,
                 )
 
         if inpaint:
