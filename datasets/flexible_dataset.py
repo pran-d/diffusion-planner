@@ -144,12 +144,12 @@ class FlexibleWindowDataset(Dataset):
             #   single:   (T, K, 3)    -> (T, 3)
             if bp.ndim == 4:
                 bp = bp[:, :, 0, :]
-            elif bp.ndim == 3:
-                bp = bp[:, :, :]
+            elif bp.ndim == 3 and bp_key in ['body_pos_w']:
+                bp = bp[:, 0, :]
             if bq.ndim == 4:
                 bq = bq[:, :, 0, :]
-            elif bq.ndim == 3:
-                bq = bq[:, :, :]
+            elif bq.ndim == 3 and bq_key in ['body_quat_w']:
+                bq = bq[:, 0, :]
 
             processed['base'] = np.concatenate([bp, bq], axis=-1)
             processed['joints'] = np.asarray(raw_data[jp_key], dtype=np.float64)

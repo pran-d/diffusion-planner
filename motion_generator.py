@@ -268,15 +268,16 @@ class MotionGenerator:
             if os.path.exists(checkpoint):
                 print(f"Loading diffusion weights from {checkpoint}...")
                 ckpt = self.diffuser.loadWeights(checkpoint)
-                if "optimizer" in ckpt:
-                    optimizer.load_state_dict(ckpt["optimizer"])
-                if "scheduler" in ckpt:
-                    scheduler.load_state_dict(ckpt["scheduler"])
-                if "scaler" in ckpt:
-                    scaler.load_state_dict(ckpt["scaler"])
-                if "ema" in ckpt:
-                    ema.load_state_dict(ckpt["ema"])
-                    print("  Loaded EMA state from checkpoint.")
+                if ckpt is not None:
+                    if "optimizer" in ckpt:
+                        optimizer.load_state_dict(ckpt["optimizer"])
+                    if "scheduler" in ckpt:
+                        scheduler.load_state_dict(ckpt["scheduler"])
+                    if "scaler" in ckpt:
+                        scaler.load_state_dict(ckpt["scaler"])
+                    if "ema" in ckpt:
+                        ema.load_state_dict(ckpt["ema"])
+                        print("  Loaded EMA state from checkpoint.")
             else:
                 print(f"Checkpoint {checkpoint} not found. Starting from scratch.")
         
@@ -399,6 +400,17 @@ class MotionGenerator:
                 torch.save(checkpoint, fpath)
                 self.diffuser.save_ema_weights(ema.shadow_params, ema_fpath)
                 last_ckpt_path = fpath
+
+        # Apply EMA weights to model for inference.
+        # After training, self.diffuser.model holds the regular (non-EMA) weights.
+        # The EMA shadow params are a smoothed average that generalise better.
+        # Copy them into the model so that generate_trajectory() uses EMA weights.
+        # (The next fit() call will reload from the regular checkpoint anyway.)
+        if epochs > 0:
+            with torch.no_grad():
+                for model_p, ema_p in zip(self.diffuser.model.parameters(), ema.shadow_params):
+                    model_p.copy_(ema_p.detach())
+            print("  [EMA] Applied EMA weights to model for inference.")
 
         # --- Cleanup training objects to release GPU/CPU memory ---
         # Note: optimizer, scheduler, scaler are kept on self for reuse across fit() calls
@@ -875,8 +887,8 @@ class MotionGenerator:
                         for _ni in np.where(_newly)[0]:
                             _goal_last_frame[_ni] = segment_world[_ni, -1, :]
                         _goal_reached |= _newly
-                        print(f"[goal] step {step+1}: sample {np.where(_newly)[0].tolist()} "
-                              f"reached goal (err={_goal_err[_newly].round(4).tolist()})")
+                        # print(f"[goal] step {step+1}: sample {np.where(_newly)[0].tolist()} "
+                        #       f"reached goal (err={_goal_err[_newly].round(4).tolist()})")
                 # ──────────────────────────────────────────────────────────────────────
 
                 stitched_segments.append(segment_world)
@@ -905,8 +917,8 @@ class MotionGenerator:
                         ])
                         for _ in range(_steps_to_pad):
                             stitched_segments.append(_all_pad.copy())
-                        print(f"[goal] All {effective_batch} samples reached goal after "
-                              f"step {step+1}. Padding {_steps_to_pad} remaining steps.")
+                        # print(f"[goal] All {effective_batch} samples reached goal after "
+                        #       f"step {step+1}. Padding {_steps_to_pad} remaining steps.")
                     break
                 # ──────────────────────────────────────────────────────────────────────
 
