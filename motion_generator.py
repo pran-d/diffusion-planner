@@ -20,7 +20,9 @@ from models.model import RobotDiffuser
 from datasets.flexible_dataset import FlexibleWindowDataset
 from utils.math.sbto_utils import reconstruct_sbto_trajectory, compute_task_params
 from utils.math.math_tools import yaw_from_quat, yaw_to_rot_matrix
+from utils.physics_limits import apply_physics_clamp
 from inference import build_inference_waypoints
+from diffusers import EMAModel
 
 
 def compute_dataset_weights(dataset, sigma=0.2):
@@ -169,7 +171,6 @@ class MotionGenerator:
 
     def fit(self, 
         data_source: Union[str, List[Dict]], 
-        task_params: Optional[List[Dict]] = None,
         epochs: int = None, 
         save_path: str = None,
         checkpoint: Optional[str] = None,
@@ -181,7 +182,6 @@ class MotionGenerator:
         
         Args:
             data_source: Path to data folder (str) or list of trajectory dicts.
-            task_params: Optional list of task parameters (e.g. goals) aligned with data_source.
             epochs: Number of epochs to train. Overrides config if provided.
             save_path: Path to save model checkpoints. Overrides config if provided.
             checkpoint: Optional path to a checkpoint to resume from.
@@ -216,7 +216,6 @@ class MotionGenerator:
 
         self.dataset = FlexibleWindowDataset(
             data_buffer=data_source,
-            task_params=task_params,
             config=self.data_cfg, 
             calculate_stats=calc_stats, 
             norm_path=norm_path,
@@ -256,16 +255,26 @@ class MotionGenerator:
         )
         scaler = GradScaler()
 
+        ema = EMAModel(
+            self.diffuser.model.parameters(),
+            decay=self.training_cfg.get("ema_decay", 0.9995),
+            update_after_step=self.training_cfg.get("ema_update_after_step", 0),
+        )
+
         if checkpoint:
             if os.path.exists(checkpoint):
                 print(f"Loading diffusion weights from {checkpoint}...")
                 ckpt = self.diffuser.loadWeights(checkpoint)
-                if "optimizer" in ckpt:
-                    optimizer.load_state_dict(ckpt["optimizer"])
-                if "scheduler" in ckpt:
-                    scheduler.load_state_dict(ckpt["scheduler"])
-                if "scaler" in ckpt:
-                    scaler.load_state_dict(ckpt["scaler"])
+                if ckpt is not None:
+                    if "optimizer" in ckpt:
+                        optimizer.load_state_dict(ckpt["optimizer"])
+                    if "scheduler" in ckpt:
+                        scheduler.load_state_dict(ckpt["scheduler"])
+                    if "scaler" in ckpt:
+                        scaler.load_state_dict(ckpt["scaler"])
+                    if "ema" in ckpt:
+                        ema.load_state_dict(ckpt["ema"])
+                        print("Loaded EMA state from checkpoint.")
             else:
                 print(f"Checkpoint {checkpoint} not found. Starting from scratch.")
         
@@ -342,7 +351,9 @@ class MotionGenerator:
                 nn.utils.clip_grad_norm_(self.diffuser.model.parameters(), 1.0)
                 scaler.step(optimizer)
                 scaler.update()
-                
+                # EMA update (matches train.py)
+                ema.step(self.diffuser.model.parameters())
+
                 epoch_losses.append(loss.item())
                 pbar.set_postfix({"loss": f"{loss.item():.4f}"})
             
@@ -359,24 +370,41 @@ class MotionGenerator:
                     if is_dir_like:
                         os.makedirs(save_path, exist_ok=True)
                         fpath = os.path.join(save_path, f"model_{epoch+1}.pth")
+                        ema_fpath = os.path.join(save_path, f"ema_model_{epoch+1}.pth")
                     else:
                         os.makedirs(os.path.dirname(save_path), exist_ok=True)
                         base, ext = os.path.splitext(save_path)
                         fpath = f"{base}_{epoch+1}{ext}"
+                        ema_fpath = f"{base}_{epoch+1}_ema{ext}"
                 else:
                     # Default save
                     save_dir = get_save_path(self.model_cfg, self.data_cfg, self.training_cfg)
                     os.makedirs(save_dir, exist_ok=True)
                     fpath = os.path.join(save_dir, f"model_{epoch}.pth")
-               
+                    ema_fpath = os.path.join(save_dir, f"ema_model_{epoch}.pth")
+
                 checkpoint = {
                     "model": self.diffuser.model.state_dict(),
                     "optimizer": optimizer.state_dict(),
                     "scaler": scaler.state_dict(),
+                    "ema": ema.state_dict(),
                     "scheduler": scheduler.state_dict()
                 }
                 torch.save(checkpoint, fpath)
+                self.diffuser.save_ema_weights(ema.shadow_params, ema_fpath)
                 last_ckpt_path = fpath
+
+        # Apply EMA weights to model for inference.
+        # After training, self.diffuser.model holds the regular (non-EMA) weights.
+        # The EMA shadow params are a smoothed average that generalise better.
+        # Copy them into the model so that generate_trajectory() uses EMA weights.
+        # (The next fit() call will reload from the regular checkpoint anyway.)
+        if epochs > 0:
+            with torch.no_grad():
+                for model_p, ema_p in zip(self.diffuser.model.parameters(), ema.shadow_params):
+                    model_p.copy_(ema_p.detach())
+            print("  [EMA] Applied EMA weights to model for inference.")
+            
 
         # --- Cleanup training objects to release GPU/CPU memory ---
         # Note: optimizer, scheduler, scaler are kept on self for reuse across fit() calls
@@ -544,12 +572,14 @@ class MotionGenerator:
                             end_error_threshold: float = 0.1,
                             enable_goal_stop: bool = False,
                             enable_physics_stop: bool = False,
+                            enable_physics_clamp: bool = True,
                             use_last_frame_wp: bool = True,
                             arrival_ratio: float = 0.85,
                             lift_height: float = 0.5,
                             no_lower_dist: float = 0.5,
                             lift_start: float = 0.0,
                             lift_end: float = 0.20,
+                            verbose: bool = False,
                             walk_start_z: float = 0.80,):
         """
         Generate trajectory via autoregressive diffusion (mirrors inference.py).
@@ -575,6 +605,7 @@ class MotionGenerator:
             enable_physics_stop: If True, truncate and pad when a physical consistency
                                  violation is detected (ground penetration / position spike).
                                  Set to False to continue generating regardless.
+            enable_physics_clamp: If True, apply physics-based constraints to clamp joint positions and velocities.
             use_last_frame_wp: If True and model supports inbetweening, add a partial
                                waypoint at the last frame with obj_delta_xy + obj_z.
             arrival_ratio: Object should arrive within this fraction of total time (0-1).
@@ -742,6 +773,13 @@ class MotionGenerator:
                 # D. Denormalize
                 denorm_btc = self.dataset.denormalize_global(normalized_sample)
                 future_traj_np = denorm_btc.detach().cpu().numpy()
+
+                # D2. Physics-informed clamping (joint pos/vel, body_z, XY vel)
+                if enable_physics_clamp:
+                    dt_eff = self.data_cfg.get("raw_dt", 0.01) * self.data_cfg.get("stride", 2)
+                    future_traj_np = apply_physics_clamp(
+                        future_traj_np, dt=dt_eff, verbose=verbose,
+                    )
                 
                 # E. Reconstruct World Frame from SBTO features
                 #    final_obj_pos in anchor must be in world frame for reconstruction
