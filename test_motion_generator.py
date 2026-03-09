@@ -177,14 +177,14 @@ def test_pipeline():
     print(f"Goal Condition: {goal_cond}")
     
     # Generate
-    traj = mg.generate_trajectory(
+    traj, real_lengths = mg.generate_trajectory(
         initial_condition=init_cond,
         goal_condition=goal_cond,
         stitch_steps=24,
         num_samples=1
     )
     
-    print(f"Generated Trajectory Shape: {traj.shape}")
+    print(f"Generated Trajectory Shape: {traj.shape}, Real Lengths: {real_lengths}")
     # (1, T_total, D) -> D should be 36+7=43
     
     # Visualize in MuJoCo

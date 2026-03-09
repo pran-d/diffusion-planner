@@ -1,0 +1,23 @@
+# paths.yaml — machine-local paths, not committed to version control.
+# Copy this file and adjust for your environment.
+
+paths:
+  # Root directory for all datasets
+  data_dir: "/home/kanish/workspace/mjlab2/motions/output/Merged_and_cleaned/84_from_shafeef/"
+
+  # Sub-path within data_dir that selects the active dataset split
+  train_path: "final_trajs"
+
+  # YAML file listing which tasks/subdirectories to load (relative to data_dir)
+  # Set to null or remove to fall back to globbing all .npz files.
+  # task_list_path: "/home/kanish/workspace/mjlab2/src/mjlab/scripts/diffusion_planner/test_datasets/chosen_tasks_test.yml"
+
+  # Directory where checkpoints and norm stats are saved
+  save_dir: "/home/kanish/workspace/mjlab2/src/mjlab/scripts/diffusion_planner/results/runs/"
+
+  # Directory where tensorboard / WandB logs are written
+  log_dir: "/home/kanish/workspace/mjlab2/src/mjlab/scripts/diffusion_planner/results/logs/"
+
+  # MuJoCo XML model files (used for visualisation and FK evaluation)
+  mj_model_xml: "/home/kanish/workspace/mjlab2/src/mjlab/scripts/diffusion_planner/mj_model.xml"
+  mj_model_repeated_xml: "/home/kanish/workspace/mjlab2/src/mjlab/scripts/diffusion_planner/mj_model_repeated.xml"

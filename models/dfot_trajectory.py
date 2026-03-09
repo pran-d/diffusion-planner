@@ -928,7 +928,7 @@ class DFoTTrajectory(nn.Module):
                 (batch_size, 1, self.external_cond_dim), dtype=torch.bool, device=xs_pred.device
             )
 
-            external_conditions_mask[..., -self.task_dim:] = 1.0
+            external_conditions_mask[..., :self.task_dim] = 1.0
 
             # Choose indicator-aware or standard sample step
             # Must match training condition: use indicator whenever waypoint_mask is present

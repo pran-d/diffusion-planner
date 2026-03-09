@@ -671,6 +671,12 @@ class MotionGenerator:
         # Per-trajectory goal-stop state
         _goal_reached     = np.zeros(effective_batch, dtype=bool)
         _goal_last_frame  = np.zeros((effective_batch, 43), dtype=np.float64)
+        _newly            = np.zeros(effective_batch, dtype=bool)  # tracks newly-reached samples per step
+
+        # Per-sample real trajectory length (frames before padding started).
+        # Initialised to the full output length; updated when goal/physics stop fires.
+        _real_lengths = np.full(effective_batch, -1, dtype=np.int64)  # -1 = not yet set
+        _frames_so_far = 0  # cumulative frames appended across stitch steps
 
         # Episode-start object z — absolute baseline for the z-waypoint target.
         _rest_obj_z = float(current_anchors['ref_obj_pos'][0, 2])
@@ -807,11 +813,19 @@ class MotionGenerator:
                 # ──────────────────────────────────────────────────────────────────────
 
                 stitched_segments.append(segment_world)
+                _frames_so_far += segment_world.shape[1]
+
+                # Record real length for samples that just reached goal
+                if enable_goal_stop and _newly.any():
+                    for _si in np.where(_newly & (_real_lengths < 0))[0]:
+                        _real_lengths[_si] = _frames_so_far
 
                 _prev_robot_xyz = segment_world[:, -1, :3].copy()
                 _prev_obj_xyz   = segment_world[:, -1, 36:39].copy()
 
                 if _phys_stop:
+                    # Mark all samples as stopped at current frame count
+                    _real_lengths[_real_lengths < 0] = _frames_so_far
                     _steps_to_pad = stitch_steps - step - 1
                     if _steps_to_pad > 0:
                         _last_frame = segment_world[:, -1:, :]
@@ -823,6 +837,8 @@ class MotionGenerator:
 
                 # ── Early-exit when all samples have reached their goal ────────────────
                 if enable_goal_stop and _goal_reached.all():
+                    # All reached — finalise any still-unset lengths
+                    _real_lengths[_real_lengths < 0] = _frames_so_far
                     _steps_to_pad = stitch_steps - step - 1
                     if _steps_to_pad > 0:
                         _seg_T   = segment_world.shape[1]
@@ -849,6 +865,9 @@ class MotionGenerator:
         
         full_trajectory = np.concatenate(stitched_segments, axis=1)
 
+        # Finalise real lengths for samples that never triggered goal/physics stop
+        _real_lengths[_real_lengths < 0] = full_trajectory.shape[1]
+
         # Trim or pad to exactly target_traj_length frames
         if target_traj_length is not None:
             T_actual = full_trajectory.shape[1]
@@ -858,6 +877,8 @@ class MotionGenerator:
                 deficit = target_traj_length - T_actual
                 pad = np.repeat(full_trajectory[:, -1:, :], deficit, axis=1)
                 full_trajectory = np.concatenate([full_trajectory, pad], axis=1)
+            # Clamp real lengths to the output length
+            np.clip(_real_lengths, 1, full_trajectory.shape[1], out=_real_lengths)
 
         # # Interpolate if needed (based on dataset downsample config)
         # if self.dataset is not None:
@@ -866,5 +887,5 @@ class MotionGenerator:
         # Smooth trajectory
         full_trajectory = self._smooth_trajectory(full_trajectory, sigma=2.0)
 
-        return full_trajectory
+        return full_trajectory, _real_lengths
 
