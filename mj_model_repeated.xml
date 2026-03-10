@@ -4,9 +4,9 @@
   <option timestep="0.01" integrator="implicitfast" iterations="8" ls_iterations="8" />
 
   <visual>
-    <global azimuth="140" elevation="-20" />
+    <global azimuth="135" elevation="-30" />
     <quality shadowsize="8192" />
-    <headlight diffuse="0.6 0.6 0.6" specular="0.9 0.9 0.9" />
+    <headlight diffuse="0.3 0.3 0.3" specular="0.2 0.2 0.2" ambient="0.2 0.2 0.2" />
     <map force="0.01" />
     <scale forcewidth="0.3" contactwidth="0.5" contactheight="0.2" />
     <rgba haze="0.15 0.25 0.35 1" force="1 0 0 1" />
@@ -138,7 +138,11 @@
   </asset>
 
   <worldbody>
-    <light name="spotlight" target="pelvis_0" pos="0 0 4" dir="0 0 -1" exponent="20" mode="targetbodycom" />
+    <!-- 4 symmetric directional fills — even illumination across the whole scene -->
+    <light name="fill_ne" directional="true" dir="-1 -1 -2" diffuse="0.35 0.35 0.35" specular="0.02 0.02 0.02" />
+    <light name="fill_nw" directional="true" dir=" 1 -1 -2" diffuse="0.35 0.35 0.35" specular="0.02 0.02 0.02" />
+    <light name="fill_se" directional="true" dir="-1  1 -2" diffuse="0.35 0.35 0.35" specular="0.02 0.02 0.02" />
+    <light name="fill_sw" directional="true" dir=" 1  1 -2" diffuse="0.35 0.35 0.35" specular="0.02 0.02 0.02" />
     <body name="static">
       <geom name="floor" size="0 0 0.01" type="plane" material="groundplane" />
     </body>
