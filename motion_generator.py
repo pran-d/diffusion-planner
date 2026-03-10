@@ -570,6 +570,8 @@ class MotionGenerator:
                             num_samples: int = 1,
                             cfg_w: float = 1.0,
                             end_error_threshold: float = 0.1,
+                            end_ground_num_frames: int = 2,
+                            end_ground_z_tol: float = 0.05,
                             enable_goal_stop: bool = False,
                             enable_physics_stop: bool = False,
                             enable_physics_clamp: bool = True,
@@ -597,10 +599,16 @@ class MotionGenerator:
             num_samples: Number of parallel samples **per input condition**.
                          When input is already batched (B > 1), set to 1.
             cfg_w: Classifier-free guidance weight.
-            end_error_threshold: Stop stitching early if goal reached within this L2 error
-                                 (per trajectory). Only used when enable_goal_stop=True.
+            end_error_threshold: XY-plane radius (metres) around the goal within which
+                                 the object must lie.  Only used when enable_goal_stop=True.
+            end_ground_num_frames: Minimum consecutive frames the object must be on
+                                   the ground before the trajectory is considered done.
+            end_ground_z_tol: Tolerance (metres) for the object z to be considered
+                              "on the ground" (|obj_z − rest_z| < tol).
             enable_goal_stop: If True, each trajectory independently stops generating and
-                              pads once its goal is reached within end_error_threshold.
+                              pads once (a) the object XY is within end_error_threshold of
+                              the goal AND (b) the object has been on the ground for at
+                              least end_ground_num_frames consecutive frames.
                               Set to False to always run the full stitch_steps.
             enable_physics_stop: If True, truncate and pad when a physical consistency
                                  violation is detected (ground penetration / position spike).
@@ -703,6 +711,7 @@ class MotionGenerator:
         _goal_reached     = np.zeros(effective_batch, dtype=bool)
         _goal_last_frame  = np.zeros((effective_batch, 43), dtype=np.float64)
         _newly            = np.zeros(effective_batch, dtype=bool)  # tracks newly-reached samples per step
+        _ground_counter   = np.zeros(effective_batch, dtype=np.int64)  # consecutive on-ground frames
 
         # Per-sample real trajectory length (frames before padding started).
         # Initialised to the full output length; updated when goal/physics stop fires.
@@ -831,23 +840,52 @@ class MotionGenerator:
 
                 # ── Per-trajectory goal-stop ───────────────────────────────────────────
                 if enable_goal_stop:
+                    _seg_T = segment_world.shape[1]
+                    segment_world = segment_world.copy()
+
                     # 1. Overwrite segments for trajectories already at goal
                     if _goal_reached.any():
-                        _seg_T = segment_world.shape[1]
-                        segment_world = segment_world.copy()
                         for _di in np.where(_goal_reached)[0]:
                             segment_world[_di] = np.tile(_goal_last_frame[_di], (_seg_T, 1))
 
-                    # 2. Detect trajectories newly reaching goal
-                    _obj_end  = segment_world[:, -1, 36:39]                    # (B, 3)
-                    _goal_err = np.linalg.norm(_obj_end - goal_world, axis=-1) # (B,)
-                    _newly    = (~_goal_reached) & (_goal_err < end_error_threshold)
+                    # 2. Detect trajectories newly reaching goal (frame-by-frame)
+                    #    Condition: XY within circle AND on ground for N consecutive frames
+                    _newly = np.zeros(effective_batch, dtype=bool)
+                    _trigger_frame = np.full(effective_batch, -1, dtype=np.int64)
+                    _active = ~_goal_reached  # only check trajectories not yet reached
+                    for _t in range(_seg_T):
+                        _obj_xyz_t = segment_world[:, _t, 36:39]  # (B, 3)
+                        # Update ground counter: on-ground if |obj_z - rest_z| < tol
+                        _on_ground = np.abs(_obj_xyz_t[:, 2] - _rest_obj_z) < end_ground_z_tol
+                        _ground_counter = np.where(_on_ground, _ground_counter + 1, 0)
+                        # XY distance to goal
+                        _xy_err = np.linalg.norm(
+                            _obj_xyz_t[:, :2] - goal_world[:, :2], axis=-1
+                        )  # (B,)
+                        # Check both conditions
+                        _hit = (
+                            _active & ~_newly
+                            & (_xy_err < end_error_threshold)
+                            & (_ground_counter >= end_ground_num_frames)
+                        )
+                        if _hit.any():
+                            for _ni in np.where(_hit)[0]:
+                                _goal_last_frame[_ni] = segment_world[_ni, _t, :]
+                                _trigger_frame[_ni] = _t
+                            _newly |= _hit
+                            print(
+                                f"[goal] step {step+1}, frame {_t}: "
+                                f"sample {np.where(_hit)[0].tolist()} reached goal "
+                                f"(xy_err={_xy_err[_hit].round(4).tolist()}, "
+                                f"ground_frames={_ground_counter[_hit].astype(int).tolist()})"
+                            )
+                    # Pad remainder of current segment for newly-reached trajectories
                     if _newly.any():
                         for _ni in np.where(_newly)[0]:
-                            _goal_last_frame[_ni] = segment_world[_ni, -1, :]
+                            _tf = _trigger_frame[_ni]
+                            if _tf + 1 < _seg_T:
+                                segment_world[_ni, _tf + 1:, :] = _goal_last_frame[_ni]
                         _goal_reached |= _newly
-                        print(f"[goal] step {step+1}: sample {np.where(_newly)[0].tolist()} "
-                              f"reached goal (err={_goal_err[_newly].round(4).tolist()})")
                 # ──────────────────────────────────────────────────────────────────────
 
                 stitched_segments.append(segment_world)
@@ -855,8 +893,9 @@ class MotionGenerator:
 
                 # Record real length for samples that just reached goal
                 if enable_goal_stop and _newly.any():
+                    _frames_before_seg = _frames_so_far - segment_world.shape[1]
                     for _si in np.where(_newly & (_real_lengths < 0))[0]:
-                        _real_lengths[_si] = _frames_so_far
+                        _real_lengths[_si] = _frames_before_seg + _trigger_frame[_si] + 1
 
                 _prev_robot_xyz = segment_world[:, -1, :3].copy()
                 _prev_obj_xyz   = segment_world[:, -1, 36:39].copy()

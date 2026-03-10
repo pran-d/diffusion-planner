@@ -104,7 +104,12 @@ def main():
                         help="Blended denoising weight (PARC-style, 0=off, 0.35=moderate, 0.65=PARC default)")
     parser.add_argument("--task_params", nargs="+", type=float, default=None,
                         help="Override goal as local-frame displacement (e.g. --task_params 0.5 -0.2)")
-    parser.add_argument("--end_error_threshold", type=float, default=0.1)
+    parser.add_argument("--end_error_threshold", type=float, default=0.1,
+                        help="XY-plane radius (m) for goal-reached check")
+    parser.add_argument("--end_ground_num_frames", type=int, default=5,
+                        help="Consecutive on-ground frames required before stopping")
+    parser.add_argument("--end_ground_z_tol", type=float, default=0.05,
+                        help="Z tolerance (m) for object to be considered on the ground")
     parser.add_argument("--goal_multiplier", type=float, default=1.0,
                         help="Scale goal displacement by this factor")
     parser.add_argument("--enable_goal_stop", action="store_true", default=True,
@@ -216,6 +221,8 @@ def main():
         cfg_w=args.cfg_w,
         blend_w=args.blend_w,
         end_error_threshold=args.end_error_threshold,
+        end_ground_num_frames=args.end_ground_num_frames,
+        end_ground_z_tol=args.end_ground_z_tol,
         enable_goal_stop=args.enable_goal_stop,
         enable_physics_stop=args.enable_phys_stop,
         use_last_frame_wp=args.last_frame_waypoint,

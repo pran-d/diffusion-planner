@@ -488,7 +488,12 @@ def main():
     parser.add_argument("--task_params", nargs="+", type=float, default=None, help="Custom task parameters (e.g., --task_params 0.5 -0.2)")
     parser.add_argument("--visualize_dataset", action="store_true", help="Whether to visualize the original dataset trajectory instead of the generated one")
     parser.add_argument("--action_horizon", type=int, default=None, help="Number of future steps to visualize/control (for dataset visualization)")
-    parser.add_argument("--end_error_threshold", type=float, default=0.1, help="End error threshold for stitching")
+    parser.add_argument("--end_error_threshold", type=float, default=0.1,
+                        help="XY-plane radius (m) for goal-reached check")
+    parser.add_argument("--end_ground_num_frames", type=int, default=5,
+                        help="Consecutive on-ground frames required before stopping")
+    parser.add_argument("--end_ground_z_tol", type=float, default=0.05,
+                        help="Z tolerance (m) for object to be considered on the ground")
     parser.add_argument("--goal_multiplier", type=float, default=1.0, help="Scaling factor for goal (for testing different r for same theta)")
     parser.add_argument("--visualize_windows", action="store_true", help="Render and save each generated window as a video")
 
@@ -619,6 +624,7 @@ def main():
     _MAX_OBJ_STEP   = 0.25    # max object XY step per frame at 100 Hz (m)
     _prev_robot_xyz = current_anchors['ref_pos'][:, :3].copy()    # (B, 3)
     _prev_obj_xyz   = current_anchors['ref_obj_pos'][:, :3].copy() # (B, 3)
+    _ground_counter = 0  # consecutive on-ground frames (scalar, single-batch)
 
     # 5. Autoregressive Loop
     for step in range(args.stitch_steps):
@@ -782,11 +788,24 @@ def main():
             except Exception as e:
                 print(f"Warning: interactive visualization failed for window {step}: {e}")
 
-        # Desired Displacement (From Ground Truth Full Trajectory)
-        err = np.linalg.norm(current_anchors["final_obj_pos"][..., :data_cfg["num_task_params"]] - segment_world[:, -1, 36 : 36 + data_cfg["num_task_params"]])
-        if err < args.end_error_threshold and not args.visualize_dataset:
-            print(f"Segment {step+1} successfully reached the goal (Error: {err:.4f}).")
-            break
+        # Goal-reached check: XY within circle + object on ground for N frames
+        if not args.visualize_dataset:
+            _seg_T = segment_world.shape[1]
+            _goal_triggered = False
+            for _t in range(_seg_T):
+                _obj_z_t = segment_world[0, _t, 38]  # object z (single batch)
+                _on_ground = abs(_obj_z_t - _rest_obj_z) < args.end_ground_z_tol
+                _ground_counter = (_ground_counter + 1) if _on_ground else 0
+                _xy_err = np.linalg.norm(
+                    segment_world[0, _t, 36:38] - current_anchors["final_obj_pos"][0, :2]
+                )
+                if _xy_err < args.end_error_threshold and _ground_counter >= args.end_ground_num_frames:
+                    print(f"Segment {step+1}, frame {_t}: reached goal "
+                          f"(xy_err={_xy_err:.4f}, ground_frames={_ground_counter})")
+                    _goal_triggered = True
+                    break
+            if _goal_triggered:
+                break
 
         # D. Update Condition
         if step < args.stitch_steps - 1:
