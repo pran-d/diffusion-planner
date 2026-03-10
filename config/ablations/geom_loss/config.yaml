@@ -3,7 +3,6 @@ resume: False
 resume_checkpoint: 200
 
 data:
-  dir_path: "/home/pranish/pranav/diffusion-mp/simple_diffusion/"
   train_path: "test_datasets/SBTO_OmniRetarget_diffusion"
   # train_path: "datasets/xml_29dof/rl_test"
   task_list_path: "test_datasets/chosen_tasks.yml"

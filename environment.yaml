@@ -213,4 +213,3 @@ dependencies:
       - widgetsnbextension==4.0.14
       - xxhash==3.6.0
       - yarl==1.22.0
-prefix: /home/pranish/miniconda3/envs/diffusers

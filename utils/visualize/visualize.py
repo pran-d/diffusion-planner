@@ -363,7 +363,7 @@ class DiffusionOverlayVisualizer:
     def visualize_overlay(
         self,
         x_trajs: np.ndarray,
-        repeated_xml_path: str = "./mj_model_repeated.xml",
+        repeated_xml_path: str = "./unitree_g1/mj_model_repeated.xml",
         timestep_delay: float = 0.05,
         loop: bool = True,
         guidance_vec: np.ndarray = None,

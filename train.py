@@ -319,7 +319,7 @@ train_dataloader = DataLoader(
 )
 
 # Load MuJoCo
-xml_path = "./mj_model.xml"
+xml_path = "./unitree_g1/mj_model.xml"
 mj_model = mujoco.MjModel.from_xml_path(xml_path)
 mj_data = mujoco.MjData(mj_model)
 

@@ -3,6 +3,8 @@
 logs/
 runs/
 results/
-*.npz
+test_datasets/
 *.png
 *.npy
+*.npz
+config/paths.yaml

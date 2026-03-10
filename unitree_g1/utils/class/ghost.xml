@@ -1,0 +1,7 @@
+<mujoco>
+    <default>
+        <default class="ghost">
+            <geom group="5" type="box" contype="0" conaffinity="0" rgba="0.8 0.8 0.8 0.3"/>
+        </default>
+    </default>
+</mujoco>
