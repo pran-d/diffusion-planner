@@ -108,7 +108,8 @@ def main():
             # If it's a .npz file, pass its parent dir and let the dataset find it
             # But we need to bypass task_list logic
             data_cfg_copy = dict(data_cfg)
-            data_cfg_copy.pop("task_list_path", None)  # Don't use task list for explicit paths
+            data_cfg_copy.pop("
+                              , None)  # Don't use task list for explicit paths
             data_buf = preload_dataset(data_cfg_copy, dp)
             ds = BufferDataset(
                 data_buffer=data_buf,

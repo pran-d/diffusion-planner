@@ -86,6 +86,7 @@ def plot_comparison(files, labels=None):
         axes[i].axis('off')
         
     plt.tight_layout()
+    plt.savefig('comparison_plot.png')
     plt.show()
 
 if __name__ == "__main__":

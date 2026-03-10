@@ -33,7 +33,10 @@ def extract_initial_condition(dataset, sample_idx, num_task_params):
 
     Returns:
         initial_condition: dict with 'robot' (H, 36) and 'obj' (H, 7)
-        goal_local:        (num_task_params,) — relative goal displacement in local frame
+        goal_local:        (num_task_params,) — object displacement (final − initial)
+                           expressed in the yaw-rotated initial robot frame.
+                           Axes: (dx_forward, dy_left, dz_up) aligned with the
+                           pelvis at t=0 after stripping pitch/roll (yaw-only rotation).
         anchor:            dict with ref_pos, ref_quat, ref_obj_pos, final_obj_pos
         file_idx, batch_idx, start_time: dataset index triple
     """
@@ -60,9 +63,9 @@ def extract_initial_condition(dataset, sample_idx, num_task_params):
     # Task params: dataset already computes the anchor with final_obj_pos
     _, _, task_params_norm, anchor = dataset[sample_idx]
 
-    # Recover the relative goal displacement in the initial pelvis-local frame.
-    # anchor gives world-frame final_obj_pos and ref_obj_pos.
-    # We need to express (final_obj_pos - ref_obj_pos) in the yaw-rotated local frame.
+    # Recover the object displacement in the yaw-rotated initial robot frame.
+    # We rotate (final_obj_pos - init_obj_pos) from world frame into the frame
+    # aligned with the pelvis yaw at t=0 (pitch/roll stripped).
     init_base_quat = raw_traj['base'][h_start, 3:7]
     init_obj_pos = raw_traj['obj'][h_start, :3]
     final_obj_pos = anchor['final_obj_pos']
@@ -103,7 +106,13 @@ def main():
     parser.add_argument("--blend_w", type=float, default=0.0,
                         help="Blended denoising weight (PARC-style, 0=off, 0.35=moderate, 0.65=PARC default)")
     parser.add_argument("--task_params", nargs="+", type=float, default=None,
-                        help="Override goal as local-frame displacement (e.g. --task_params 0.5 -0.2)")
+                        help=(
+                            "Override goal as object displacement in the yaw-rotated initial robot "
+                            "frame: (dx_forward, dy_left, dz_up) in metres.  The axes are aligned "
+                            "with the robot pelvis at t=0 after stripping pitch/roll "
+                            "(i.e. rotating by the pelvis yaw only).  "
+                            "Example: --task_params 1.0 0.5  (1 m forward, 0.5 m left)"
+                        ))
     parser.add_argument("--end_error_threshold", type=float, default=0.1)
     parser.add_argument("--goal_multiplier", type=float, default=1.0,
                         help="Scale goal displacement by this factor")
@@ -113,6 +122,8 @@ def main():
                         help="Disable early stopping when goal is reached")
     parser.add_argument("--enable_phys_stop", action="store_true",
                         help="Stop on physics violation (floor penetration / spike)")
+    parser.add_argument("--enable_phys_clamp", action="store_true",
+                        help="Clamp to valid state if physics violation detected (instead of stopping)")
 
     # Waypoint / z-profile arguments
     parser.add_argument("--last_frame_waypoint", action="store_true",
@@ -183,14 +194,31 @@ def main():
     # Override goal if provided via CLI
     if args.task_params is not None:
         goal_local = np.array(args.task_params, dtype=np.float64)
-        print(f"Using override goal (local frame): {goal_local}")
+        print(f"Using CLI goal (yaw-rotated robot frame): {goal_local}")
 
-    # Auto-compute stitch_steps from dataset trajectory length if not provided
+    # Auto-compute stitch_steps from dataset trajectory length if not provided.
+    # When the user supplied --task_params we calibrate from the goal distance
+    # so the trajectory is long enough to actually reach it.
     if args.stitch_steps is None and args.target_traj_length is None:
         _eff = data_cfg["num_timesteps"] - 1
         traj_len = dataset.traj_lengths[args.traj_idx]
-        args.stitch_steps = max(1, math.ceil(traj_len / _eff))
-        print(f"Auto stitch_steps={args.stitch_steps} from traj length {traj_len}")
+        base_steps = max(1, math.ceil(traj_len / _eff))
+
+        if args.task_params is not None:
+            # Calibrate speed from the *dataset* sample's original goal distance,
+            # then use it to size steps for the user-supplied goal.
+            orig_dist = np.linalg.norm(anchor['final_obj_pos'][:2] - anchor['ref_obj_pos'][:2])
+            goal_dist = np.linalg.norm(goal_local[:2])  # XY distance
+            if orig_dist > 0.1 and goal_dist > 0:
+                metres_per_step = max(orig_dist / base_steps, 0.05)
+                args.stitch_steps = max(base_steps, math.ceil(goal_dist / metres_per_step))
+            else:
+                args.stitch_steps = base_steps
+            print(f"Auto stitch_steps={args.stitch_steps} from goal distance "
+                  f"{goal_dist:.2f}m (base={base_steps})")
+        else:
+            args.stitch_steps = base_steps
+            print(f"Auto stitch_steps={args.stitch_steps} from traj length {traj_len}")
 
     # Scale goal if requested (AFTER auto-computing stitch_steps so we can scale them too)
     if args.goal_multiplier != 1.0:
@@ -201,7 +229,7 @@ def main():
         print(f"Scaled goal by {args.goal_multiplier} → {goal_local} "
               f"(stitch_steps={args.stitch_steps})")
 
-    print(f"Goal (local frame): {goal_local}")
+    print(f"Goal displacement (yaw-rotated robot frame): {goal_local}")
     print(f"Initial robot pos: {initial_condition['robot'][0, :3]}")
     print(f"Initial obj pos:   {initial_condition['obj'][0, :3]}")
     print(f"Anchor final_obj_pos (world): {anchor['final_obj_pos']}")
@@ -218,6 +246,7 @@ def main():
         end_error_threshold=args.end_error_threshold,
         enable_goal_stop=args.enable_goal_stop,
         enable_physics_stop=args.enable_phys_stop,
+        enable_physics_clamp=args.enable_phys_clamp,  # clamp if stopping on physics violation
         use_last_frame_wp=args.last_frame_waypoint,
         arrival_ratio=args.arrival_ratio,
         lift_height=args.lift_height,

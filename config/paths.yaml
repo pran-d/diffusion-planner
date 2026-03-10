@@ -6,6 +6,7 @@ paths:
   data_dir: "/home/pranav/workspace/diffusion-planner/test_datasets/"
 
   # Sub-path within data_dir that selects the active dataset split
+  # train_path: "SBTO_OmniRetarget_diffusion"
   train_path: "trial/cleanup"
 
   # YAML file listing which tasks/subdirectories to load (relative to data_dir)

@@ -40,7 +40,7 @@ def preload_dataset(config: dict, data_root: str) -> list:
             
         for t in tasks:
             file_names = ["best_trajectory_rand_filtered.npz"]
-            # file_names = ["top_trajectories.npz", "motion.npz"]
+            # file_names = ["top_trajectories.npz"]
             
             file_found = False
             for file_name in file_names:
@@ -74,8 +74,21 @@ def preload_dataset(config: dict, data_root: str) -> list:
     return ram_cache
 
 
+def _is_lfs_pointer(fpath):
+    """Return True if the file is a Git LFS pointer stub (not the real data)."""
+    try:
+        with open(fpath, 'rb') as f:
+            header = f.read(20)
+        return header.startswith(b'version https://git-')
+    except OSError:
+        return False
+
+
 def _load_npz_raw(fpath):
     """Load a .npz file and return a plain dict of numpy arrays."""
+    if _is_lfs_pointer(fpath):
+        print(f"Skipping LFS pointer (not downloaded): {fpath}")
+        return {}
     try:
         data = dict(np.load(fpath, allow_pickle=True))
         return data

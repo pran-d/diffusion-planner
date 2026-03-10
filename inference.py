@@ -496,7 +496,7 @@ def main():
     parser.add_argument("--goal_multiplier", type=float, default=1.0, help="Scaling factor for goal (for testing different r for same theta)")
     parser.add_argument("--visualize_windows", action="store_true", help="Render and save each generated window as a video")
     parser.add_argument("--enable_phys_stop", action="store_true", help="Stop trajectory when object reaches goal region (for pick-and-place)")
-    parser.add_argument("--enable_physics_clamp", action="store_true", help="Apply data-derived physics clamping (joint pos/vel, body_z, XY vel)")
+    parser.add_argument("--enable_phys_clamp", action="store_true", help="Apply data-derived physics clamping (joint pos/vel, body_z, XY vel)")
     parser.add_argument("--verbose_physics", action="store_true", help="Print physics clamping statistics per window")
 
     # Guidance arguments
@@ -694,7 +694,7 @@ def main():
         future_traj_np = denorm_btc.cpu().numpy()
 
         # B2. Physics-informed clamping (joint pos/vel, body_z, XY vel)
-        if args.enable_physics_clamp:
+        if args.enable_phys_clamp:
             dt_eff = data_cfg.get("raw_dt", 0.01) * data_cfg.get("stride", 2)
             future_traj_np = apply_physics_clamp(
                 future_traj_np, dt=dt_eff, verbose=args.verbose_physics,

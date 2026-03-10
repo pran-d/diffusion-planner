@@ -24,7 +24,6 @@ data:
     - body_rot6d
     - obj_rel_pos
     - obj_rel_rot6d
-    # ee_rel_pos
 
   key_mapping:
     body_pos_w: "root_pos"
@@ -50,13 +49,11 @@ model:
 training:
   save_dir: "./runs/ablations/physics_loss/"
   log_dir: "./logs/ablations/physics_loss/"
-  # suffix: ""
-  # suffix: "_partial_keepall"
   suffix: ""
-  num_epochs: 750
+  num_epochs: 250
   balance_task_density: False
   learning_rate: 0.0005
-  save_every: 50
+  save_every: 20
   condition_dropout_prob: 
     state: 0.1
     task: 0.2
@@ -64,9 +61,9 @@ training:
   add_goal_noise: True
 
   # Auxiliary loss weights (set > 0 to enable)
-  smoothness_loss_weight: 0.0 #0.1      # penalise frame-to-frame jitter in predicted trajectory
-  grasp_consistency_loss_weight: 0.0 #0.75 # penalise obj_rel_pos drift during grasping phases
-  feet_sliding_loss_weight: 0.0 #0.2      # proxy: penalise ankle velocity during GT stance phases
+  smoothness_loss_weight: 0.0     # penalise frame-to-frame jitter in predicted trajectory
+  grasp_consistency_loss_weight: 0.0 # penalise obj_rel_pos drift during grasping phases
+  feet_sliding_loss_weight: 0.0 # proxy: penalise ankle velocity during GT stance phases
     # smoothness_feature_groups: [joints, body_rot6d]  # optional: restrict to specific groups
   grasp_distance_threshold: 0.35     # obj-body distance below which grasp gate activates
   stance_velocity_threshold: 0.02    # ankle vel magnitude below which GT is considered stance
