@@ -280,8 +280,6 @@ if args.resume is not None:
         if "ema" in checkpoint:
             ema.load_state_dict(checkpoint["ema"])
             print("Loaded EMA state from checkpoint.")
-        else:
-            print("No EMA state found in checkpoint — starting EMA fresh.")
 
 if data_cfg.get("dataset_class", "flexible") == "conditional":
     dataset = ConditionalStateDataset(
@@ -496,6 +494,7 @@ for epoch in range(starting_epoch, num_epochs):
                 "ema": ema.state_dict(),
             }
             torch.save(checkpoint, f"{save_dir}/model_{epoch}.pth")
+            diffuser.save_ema_weights(ema.shadow_params, f"{save_dir}/ema_model_{epoch}.pth")
             break
     
     # ===============================
@@ -512,38 +511,7 @@ for epoch in range(starting_epoch, num_epochs):
             "ema": ema.state_dict(),
         }
         torch.save(checkpoint, f"{save_dir}/model_{epoch}.pth")
-
-    # ===============================
-    # Generative Physics Eval (EMA)
-    # ===============================
-    eval_every = args.eval_every if args.eval_every else 0
-    if eval_every > 0 and epoch > 0 and epoch % eval_every == 0:
-        print(f"\n[PhysicsEval] Epoch {epoch}: running generative evaluation "
-              f"({args.num_eval_samples} samples)…")
-        viols, frames = check_physical_consistency(
-            diffuser, dataset, ema, device,
-            state_condition, task_condition, data_cfg,
-            num_eval_samples=args.num_eval_samples,
-            eval_batch_size=min(16, args.num_eval_samples),
-        )
-        viol_rate = viols / max(frames, 1)
-        print(f"[PhysicsEval] violations={viols}/{frames}  rate={viol_rate:.4f}")
-        writer.add_scalar("PhysicsEval/violation_count", viols, epoch)
-        writer.add_scalar("PhysicsEval/violation_rate",  viol_rate, epoch)
-
-        if viols < best_phys_violations:
-            best_phys_violations = viols
-            best_phys_epoch      = epoch
-            best_ckpt = {
-                "model": diffuser.model.state_dict(),
-                "optimizer": optimizer.state_dict(),
-                "scaler": scaler.state_dict(),
-                "scheduler": scheduler.state_dict(),
-                "ema": ema.state_dict(),
-            }
-            torch.save(best_ckpt, f"{save_dir}/model_best_phys.pth")
-            print(f"[PhysicsEval] ✓ New best checkpoint saved "
-                  f"(violations={viols}, epoch={epoch})")
+        diffuser.save_ema_weights(ema.shadow_params, f"{save_dir}/ema_model_{epoch}.pth")
 
 # ===============================
 # Plot Loss Curve (after training)

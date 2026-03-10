@@ -52,15 +52,22 @@ class RobotDiffuser():
         if isinstance(policy_num, str):
             path = policy_num
         else:
-            path=self.save_dir+f"model_{policy_num}.pth"
-        print(f"Loading diffusion model weights from {path}... \n")
+            if ema:
+                path = self.save_dir + f"ema_model_{policy_num}.pth"
+            else:
+                path = self.save_dir + f"model_{policy_num}.pth"
+        print(f"Loading diffusion model weights from {path}{'  [EMA]' if ema else ''}... \n")
         weights = torch.load(path, map_location=self.device)
+        # EMA weight files are saved as plain state_dicts (no "model" key)
         state = weights["model"] if "model" in weights else weights
         missing, unexpected = self.model.load_state_dict(state, strict=False)
         if missing:
             print(f"  [Warning] Missing keys (will use init values): {missing}")
         if unexpected:
             print(f"  [Warning] Unexpected keys (ignored): {unexpected}")
+        # Return the full checkpoint dict only for non-EMA files that have it
+        if ema:
+            return None
         return weights if "model" in weights else None
 
     def load_weights_from_file(self, path):

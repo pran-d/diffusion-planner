@@ -1,5 +1,5 @@
 <mujoco model="g1 mjx flat terrain scene">
-  <compiler angle="radian" meshdir="/home/pranish/pranav/diffusion-mp/unitree_g1/assets/" />
+  <compiler angle="radian" meshdir="/home/kanish/workspace/mjlab2/src/mjlab/asset_zoo/robots/unitree_g1/xmls/assets" />
 
   <option timestep="0.01" integrator="implicitfast" iterations="8" ls_iterations="8" />
 
