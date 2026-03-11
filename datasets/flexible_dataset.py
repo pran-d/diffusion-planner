@@ -55,6 +55,15 @@ class FlexibleWindowDataset(Dataset):
         self.add_noise = training_cfg.get("add_obs_noise", False)
         self.add_goal_noise = training_cfg.get("add_goal_noise", False)
 
+        # ── G1 left/right mirror symmetry augmentation ──────────────
+        aug_cfg = config.get("augmentation", {})
+        mirror_cfg = aug_cfg.get("mirror_symmetry", {})
+        self.mirror_enabled = mirror_cfg.get("enabled", False)
+        self.mirror_prob = mirror_cfg.get("prob", 0.5)
+        if self.mirror_enabled:
+            self._build_mirror_tables()
+            print(f"Mirror symmetry augmentation enabled (prob={self.mirror_prob})")
+
         self._raw_buffer = data_buffer
         self._task_params = task_params
         
@@ -569,6 +578,189 @@ class FlexibleWindowDataset(Dataset):
         if key == "task_params" and self.noise_cfg.get("task_magnitude", 0) > 0:
             tensor[..., 2] *= torch.rand_like(tensor[..., 2]) * self.noise_cfg["task_magnitude"] # Large noise for goal distance to encourage generalization
         return tensor
+
+    # ────────────────────────────────────────────────────────────────
+    # G1 left/right mirror symmetry (C2 sagittal-plane reflection)
+    # ────────────────────────────────────────────────────────────────
+    def _build_mirror_tables(self):
+        """Pre-compute permutation and sign-flip tables for the feature vector
+        and the observation (current_state) vector.
+
+        G1 joint ordering (29 DOF, indices within the joints block):
+            0-5   left  hip-pitch, hip-roll, hip-yaw, knee, ankle-pitch, ankle-roll
+            6-11  right hip-pitch, hip-roll, hip-yaw, knee, ankle-pitch, ankle-roll
+            12-14 waist yaw, roll, pitch
+            15-21 left  shoulder-pitch, shoulder-roll, shoulder-yaw, elbow,
+                        wrist-roll, wrist-pitch, wrist-yaw
+            22-28 right shoulder-pitch, shoulder-roll, shoulder-yaw, elbow,
+                        wrist-roll, wrist-pitch, wrist-yaw
+
+        Under sagittal-plane reflection (left ↔ right):
+          • Left/right limb blocks are swapped.
+          • Roll and yaw joints negate (they change sign under reflection).
+          • Pitch joints stay the same.
+        """
+        from utils.math.sbto_utils import build_feature_layout
+
+        layout = build_feature_layout()
+        D = sum(layout[k] for k in self.feature_order)
+
+        # ── Feature-vector index map ────────────────────────────────
+        fidx = 0
+        f_map = {}
+        for key in self.feature_order:
+            dim = layout.get(key, 0)
+            f_map[key] = slice(fidx, fidx + dim)
+            fidx += dim
+
+        # ── Permutation & sign arrays (default: identity / +1) ─────
+        perm = np.arange(D, dtype=np.int64)
+        sign = np.ones(D, dtype=np.float32)
+
+        # 1. delta_xy: negate y
+        if "delta_xy" in f_map:
+            s = f_map["delta_xy"]
+            sign[s.start + 1] = -1.0          # delta_y
+
+        # 2. delta_yaw: negate
+        if "delta_yaw" in f_map:
+            s = f_map["delta_yaw"]
+            sign[s.start] = -1.0
+
+        # 3. obj_delta_xy: negate y
+        if "obj_delta_xy" in f_map:
+            s = f_map["obj_delta_xy"]
+            sign[s.start + 1] = -1.0           # obj_delta_y
+
+        # 4. obj_z: invariant (no change needed)
+
+        # 5. joints: swap left↔right, negate roll/yaw
+        if "joints" in f_map:
+            js = f_map["joints"].start
+            # --- permutation (swap left/right blocks) ---
+            # Legs: swap 0-5 ↔ 6-11
+            for i in range(6):
+                perm[js + i], perm[js + 6 + i] = js + 6 + i, js + i
+            # Arms: swap 15-21 ↔ 22-28
+            for i in range(7):
+                perm[js + 15 + i], perm[js + 22 + i] = js + 22 + i, js + 15 + i
+            # Torso (12-14): stays in place
+
+            # --- sign flips (roll & yaw joints negate) ---
+            # Within each 6-DOF leg block: roll=1, yaw=2, ankle_roll=5
+            for base in [0, 6]:  # after permutation both blocks need flips
+                sign[js + base + 1] = -1.0   # hip_roll
+                sign[js + base + 2] = -1.0   # hip_yaw
+                sign[js + base + 5] = -1.0   # ankle_roll
+            # Within each 7-DOF arm block: roll=1, yaw=2, wrist_roll=4, wrist_yaw=6
+            for base in [15, 22]:
+                sign[js + base + 1] = -1.0   # shoulder_roll
+                sign[js + base + 2] = -1.0   # shoulder_yaw
+                sign[js + base + 4] = -1.0   # wrist_roll
+                sign[js + base + 6] = -1.0   # wrist_yaw
+            # Waist: yaw=12, roll=13 negate; pitch=14 stays
+            sign[js + 12] = -1.0  # waist_yaw
+            sign[js + 13] = -1.0  # waist_roll
+
+        # 6. body_z: invariant
+
+        # 7. body_rot6d: [r1x, r1y, r1z, r2x, r2y, r2z]
+        #    Under S=diag(1,-1,1): → [r1x, -r1y, r1z, -r2x, r2y, -r2z]
+        if "body_rot6d" in f_map:
+            s = f_map["body_rot6d"]
+            sign[s.start + 1] = -1.0  # r1y
+            sign[s.start + 3] = -1.0  # r2x
+            sign[s.start + 5] = -1.0  # r2z
+
+        # 8. obj_rel_pos: [x, y, z] → [x, -y, z]
+        if "obj_rel_pos" in f_map:
+            s = f_map["obj_rel_pos"]
+            sign[s.start + 1] = -1.0  # y
+
+        # 9. obj_rel_rot6d: same sign pattern as body_rot6d
+        if "obj_rel_rot6d" in f_map:
+            s = f_map["obj_rel_rot6d"]
+            sign[s.start + 1] = -1.0  # r1y
+            sign[s.start + 3] = -1.0  # r2x
+            sign[s.start + 5] = -1.0  # r2z
+
+        self._mirror_perm = perm
+        self._mirror_sign = sign                   # numpy arrays
+
+        # ── Observation-vector tables (joints, body_z, body_rot6d,
+        #    obj_rel_pos, obj_rel_rot6d = 45 dims) ─────────────────
+        obs_D = self.num_observations  # 45
+        obs_perm = np.arange(obs_D, dtype=np.int64)
+        obs_sign = np.ones(obs_D, dtype=np.float32)
+
+        # Joints (0-28): same permutation & sign logic, offset = 0
+        for i in range(6):
+            obs_perm[i], obs_perm[6 + i] = 6 + i, i
+        for i in range(7):
+            obs_perm[15 + i], obs_perm[22 + i] = 22 + i, 15 + i
+
+        for base in [0, 6]:
+            obs_sign[base + 1] = -1.0
+            obs_sign[base + 2] = -1.0
+            obs_sign[base + 5] = -1.0
+        for base in [15, 22]:
+            obs_sign[base + 1] = -1.0
+            obs_sign[base + 2] = -1.0
+            obs_sign[base + 4] = -1.0
+            obs_sign[base + 6] = -1.0
+        obs_sign[12] = -1.0  # waist_yaw
+        obs_sign[13] = -1.0  # waist_roll
+
+        # body_z (29): invariant
+        # body_rot6d (30-35)
+        obs_sign[31] = -1.0; obs_sign[33] = -1.0; obs_sign[35] = -1.0
+        # obj_rel_pos (36-38): negate y
+        obs_sign[37] = -1.0
+        # obj_rel_rot6d (39-44)
+        obs_sign[40] = -1.0; obs_sign[42] = -1.0; obs_sign[44] = -1.0
+
+        self._mirror_obs_perm = obs_perm
+        self._mirror_obs_sign = obs_sign
+
+        # Task params: [goal_x, goal_y, goal_dist] → negate y
+        self._mirror_task_sign = np.array([1.0, -1.0, 1.0], dtype=np.float32)
+
+    def _apply_mirror_symmetry(
+        self,
+        window_tensor: torch.Tensor,
+        current_state: torch.Tensor,
+        task_params: torch.Tensor,
+    ):
+        """Apply C2 sagittal-plane reflection (left↔right mirror).
+
+        Operates on the *normalised* feature tensors in-place-safe fashion.
+        Because min-max / mean-std normalisation is a per-element affine map,
+        permuting and sign-flipping in normalised space is equivalent to doing
+        it in raw space *provided* we also permute the normalisation constants.
+        Since the mirror swaps symmetric joint pairs whose stats are very
+        similar (and identical in expectation over a balanced dataset), the
+        approximation is tight.
+
+        Returns:
+            (window_tensor, current_state, task_params) — mirrored copies.
+        """
+        perm_t = torch.from_numpy(self._mirror_perm).long()
+        sign_t = torch.from_numpy(self._mirror_sign)
+
+        # Feature trajectory: (T, D) → permute + sign
+        window_tensor = window_tensor[:, perm_t] * sign_t
+
+        # Current state: (H, obs_dim) → permute + sign
+        obs_perm_t = torch.from_numpy(self._mirror_obs_perm).long()
+        obs_sign_t = torch.from_numpy(self._mirror_obs_sign)
+        current_state = current_state[:, obs_perm_t] * obs_sign_t
+
+        # Task params: negate y component
+        task_sign_t = torch.from_numpy(self._mirror_task_sign)
+        tp_dim = task_params.shape[-1]
+        task_params = task_params * task_sign_t[:tp_dim]
+
+        return window_tensor, current_state, task_params
 
     def __getitem__(self, idx):
         file_idx, batch_idx, t_start = self.indices[idx]

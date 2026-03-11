@@ -250,12 +250,30 @@ class DFoTTrajectory(nn.Module):
         # Build feature group slices for partial masking
         partial_cfg = self.inbetweening_cfg.get("partial_masking", {})
 
-        # Register joints sub-slices (joints_lower, joints_upper) so they can
-        # be referenced as independent feature groups in the config.
-        # joints_split: number of leading joint dims treated as "lower body".
-        # Default: 12 (6 left-leg + 6 right-leg DOFs come first in the G1 layout).
+        # Register joints sub-slices so they can be referenced as
+        # independent feature groups in the config.
+        #
+        # joints_parts == 5 → five anatomical groups:
+        #   left_leg (0-5), right_leg (6-11), torso (12-14),
+        #   left_arm (15-21), right_arm (22-28)
+        #
+        # joints_parts == 2  (or legacy joints_split) → binary split:
+        #   joints_lower (0 .. split-1), joints_upper (split .. 28)
+        joints_parts = partial_cfg.get("joints_parts", None)
         joints_split = partial_cfg.get("joints_split", None)
-        if joints_split is not None and "joints" in self.feature_index_map:
+
+        if joints_parts == 5 and "joints" in self.feature_index_map:
+            j_sl = self.feature_index_map["joints"]
+            js = j_sl.start
+            self.feature_index_map["joints_left_leg"]  = slice(js + 0,  js + 6)
+            self.feature_index_map["joints_right_leg"] = slice(js + 6,  js + 12)
+            self.feature_index_map["joints_torso"]     = slice(js + 12, js + 15)
+            self.feature_index_map["joints_left_arm"]  = slice(js + 15, js + 22)
+            self.feature_index_map["joints_right_arm"] = slice(js + 22, js + 29)
+            # Also register the legacy 2-part slices for backward compat
+            self.feature_index_map["joints_lower"] = slice(js, js + 12)
+            self.feature_index_map["joints_upper"] = slice(js + 12, j_sl.stop)
+        elif joints_split is not None and "joints" in self.feature_index_map:
             j_sl = self.feature_index_map["joints"]
             self.feature_index_map["joints_lower"] = slice(j_sl.start,
                                                             j_sl.start + joints_split)
@@ -307,6 +325,94 @@ class DFoTTrajectory(nn.Module):
 
             # RePaint resampling config (inference-time back-and-forth loops)
             self.resample_steps = self.inbetweening_cfg.get("resample_steps", 0)
+
+        # ── State conditioning masking ──────────────────────────────
+        # At training time, randomly zero out groups of state observation
+        # features before they enter self.state_embedding(). This forces the
+        # model to learn robust generation even when parts of the observation
+        # are missing — mimicking sensor dropout, partial observability, etc.
+        state_mask_cfg = (training_config or {}).get("state_conditioning_masking", {})
+        self.state_cond_masking_enabled = state_mask_cfg.get("enabled", False)
+        if self.state_cond_masking_enabled:
+            self.state_cond_mask_prob = state_mask_cfg.get("prob", 0.3)
+            # Build observation-space group slices.
+            # Observation vector layout: joints(29), body_z(1), body_rot6d(6),
+            #   obj_rel_pos(3), obj_rel_rot6d(6) = 45 dims.
+            obs_layout = {
+                "joints": slice(0, 29),
+                "body_z": slice(29, 30),
+                "body_rot6d": slice(30, 36),
+                "obj_rel_pos": slice(36, 39),
+                "obj_rel_rot6d": slice(39, 45),
+            }
+            # If 5-part joints splitting is active, add sub-slices
+            if partial_cfg.get("joints_parts", None) == 5:
+                obs_layout["joints_left_leg"]  = slice(0, 6)
+                obs_layout["joints_right_leg"] = slice(6, 12)
+                obs_layout["joints_torso"]     = slice(12, 15)
+                obs_layout["joints_left_arm"]  = slice(15, 22)
+                obs_layout["joints_right_arm"] = slice(22, 29)
+            self.state_obs_layout = obs_layout
+
+            # Config: which groups to mask and their per-group drop probs
+            self.state_cond_mask_groups = state_mask_cfg.get("feature_groups", {})
+            self.state_cond_group_drop_probs = state_mask_cfg.get("group_drop_prob", {})
+            print(f"State conditioning masking enabled: prob={self.state_cond_mask_prob}, "
+                  f"groups={list(self.state_cond_mask_groups.keys())}")
+
+        # ── Stitched rollout training ───────────────────────────────
+        # Chain multiple sub-windows autoregressively during training so the
+        # model learns to condition on its own (imperfect) predictions.
+        stitch_cfg = (training_config or {}).get("stitched_rollouts", {})
+        self.stitch_enabled = stitch_cfg.get("enabled", False)
+        self.stitch_num_windows = stitch_cfg.get("num_windows", 2)
+        self.stitch_overlap = stitch_cfg.get("overlap", 1)
+        self.stitch_start_epoch = stitch_cfg.get("start_epoch", 50)
+        self.stitch_end_epoch = stitch_cfg.get("end_epoch", 300)
+        self.stitch_max_prob = stitch_cfg.get("max_prob", 0.5)
+        self.stitch_detach = stitch_cfg.get("detach", True)
+        # The observation features start at this index in the feature vector
+        self.obs_start_idx = self.x_shape[0] - data_config.get("num_observations", 45)
+        if self.stitch_enabled:
+            print(f"Stitched rollout training enabled: num_windows={self.stitch_num_windows}, "
+                  f"overlap={self.stitch_overlap}, schedule=[{self.stitch_start_epoch}, {self.stitch_end_epoch}], "
+                  f"max_prob={self.stitch_max_prob}")
+
+
+    def _apply_state_cond_masking(self, state_cond: torch.Tensor) -> torch.Tensor:
+        """
+        Randomly zero out feature groups in the state observation vector.
+
+        Args:
+            state_cond: (B, H, obs_dim) or (B, obs_dim) observation tensor.
+
+        Returns:
+            Masked state_cond of the same shape (in-place safe).
+        """
+        if not self.training or not self.state_cond_masking_enabled:
+            return state_cond
+
+        # Only apply masking with configured probability
+        B = state_cond.shape[0]
+        apply_mask = torch.rand(B, device=state_cond.device) < self.state_cond_mask_prob
+        if not apply_mask.any():
+            return state_cond
+
+        masked = state_cond.clone()
+        for group_name, keys in self.state_cond_mask_groups.items():
+            drop_prob = self.state_cond_group_drop_probs.get(group_name, 0.5)
+            # Per-sample decision whether to drop this group
+            drop_group = (torch.rand(B, device=state_cond.device) < drop_prob) & apply_mask
+            if not drop_group.any():
+                continue
+            for key in keys:
+                if key in self.state_obs_layout:
+                    s = self.state_obs_layout[key]
+                    if masked.ndim == 3:
+                        masked[drop_group, :, s] = 0.0
+                    else:
+                        masked[drop_group, s] = 0.0
+        return masked
 
 
     #### Training Utils ####
@@ -400,6 +506,12 @@ class DFoTTrajectory(nn.Module):
         keyframe decides whether it's "full" (all features known) or "partial"
         (only certain feature groups known, chosen randomly per group).
 
+        Supports forced extreme conditioning regimes (config-controlled):
+          - force_all_known_prob: with this probability, *all* frames become
+            full keyframes (model must reconstruct from fully-known input).
+          - force_near_empty_prob: with this probability, only one random
+            feature group at one random frame is kept (near-empty conditioning).
+
         Returns:
             waypoint_mask: (B, T, D) bool — True = known/clean, False = to be predicted
         """
@@ -408,38 +520,73 @@ class DFoTTrajectory(nn.Module):
         partial_enabled = partial_cfg.get("enabled", False)
         partial_prob = partial_cfg.get("prob", 0.5)
 
-        # Step 1: Frame-level keyframe selection
-        frame_mask = self._generate_inbetweening_mask(B, T, device)  # (B, T) bool
+        # ── Forced extreme conditioning ─────────────────────────────
+        force_all_known_prob = cfg.get("force_all_known_prob", 0.0)
+        force_near_empty_prob = cfg.get("force_near_empty_prob", 0.0)
 
-        if not partial_enabled:
-            # All waypoints are full keyframes (all features known)
-            return frame_mask.unsqueeze(-1).expand(-1, -1, D).clone()
+        extreme_roll = torch.rand(B, device=device)
+        all_known_mask = extreme_roll < force_all_known_prob
+        near_empty_mask = (
+            ~all_known_mask
+            & (extreme_roll < force_all_known_prob + force_near_empty_prob)
+        )
+        normal_mask = ~all_known_mask & ~near_empty_mask
 
-        # Step 2: For each keyframe, decide full vs partial
-        is_partial = (torch.rand(B, T, device=device) < partial_prob) & frame_mask
-
-        # Force first/last to be full keyframes if configured
-        if cfg.get("always_keep_first", True):
-            is_partial[:, 0] = False
-        if cfg.get("keep_last_partial", False) and T > 0:
-            is_partial[:, -1] = True
-
-        is_full = frame_mask & ~is_partial
-
-        # Step 3: Build feature mask
         waypoint_mask = torch.zeros(B, T, D, dtype=torch.bool, device=device)
 
-        # Full keyframes: all features known
-        waypoint_mask = waypoint_mask | is_full.unsqueeze(-1)  # broadcast (B,T,1) -> (B,T,D)
+        # --- All-known samples: every frame fully conditioned ---
+        if all_known_mask.any():
+            waypoint_mask[all_known_mask] = True
 
-        # Partial keyframes: per-group random keep
-        if is_partial.any():
-            for group_name, slices in self.feature_group_slices.items():
-                keep_prob = self.group_keep_probs.get(group_name, 0.5)
-                keep_group = (torch.rand(B, T, device=device) < keep_prob) & is_partial
-                for s in slices:
-                    width = s.stop - s.start
-                    waypoint_mask[:, :, s] |= keep_group.unsqueeze(-1).expand(-1, -1, width)
+        # --- Near-empty samples: 1 random group at 1 random frame ---
+        if near_empty_mask.any() and self.feature_group_slices:
+            group_names = list(self.feature_group_slices.keys())
+            n_empty = near_empty_mask.sum().item()
+            # Pick random group for each near-empty sample
+            g_idx = torch.randint(0, len(group_names), (n_empty,))
+            # Pick random frame for each near-empty sample
+            t_idx = torch.randint(0, T, (n_empty,))
+            empty_indices = near_empty_mask.nonzero(as_tuple=True)[0]
+            for i in range(n_empty):
+                b_i = empty_indices[i].item()
+                t_i = t_idx[i].item()
+                g_name = group_names[g_idx[i].item()]
+                for s in self.feature_group_slices[g_name]:
+                    waypoint_mask[b_i, t_i, s] = True
+
+        # --- Normal samples: standard keyframe + partial logic ---
+        if normal_mask.any():
+            normal_indices = normal_mask.nonzero(as_tuple=True)[0]
+            n_normal = normal_indices.shape[0]
+
+            # Step 1: Frame-level keyframe selection (only for normal samples)
+            frame_mask = self._generate_inbetweening_mask(n_normal, T, device)  # (n_normal, T)
+
+            if not partial_enabled:
+                waypoint_mask[normal_indices] = frame_mask.unsqueeze(-1).expand(-1, -1, D)
+            else:
+                # Step 2: full vs partial
+                is_partial = (torch.rand(n_normal, T, device=device) < partial_prob) & frame_mask
+                if cfg.get("always_keep_first", True):
+                    is_partial[:, 0] = False
+                if cfg.get("keep_last_partial", False) and T > 0:
+                    is_partial[:, -1] = True
+                is_full = frame_mask & ~is_partial
+
+                # Full keyframes
+                normal_wm = torch.zeros(n_normal, T, D, dtype=torch.bool, device=device)
+                normal_wm = normal_wm | is_full.unsqueeze(-1)
+
+                # Partial keyframes
+                if is_partial.any():
+                    for group_name, slices in self.feature_group_slices.items():
+                        keep_prob = self.group_keep_probs.get(group_name, 0.5)
+                        keep_group = (torch.rand(n_normal, T, device=device) < keep_prob) & is_partial
+                        for s in slices:
+                            width = s.stop - s.start
+                            normal_wm[:, :, s] |= keep_group.unsqueeze(-1).expand(-1, -1, width)
+
+                waypoint_mask[normal_indices] = normal_wm
 
         return waypoint_mask
 
@@ -814,6 +961,8 @@ class DFoTTrajectory(nn.Module):
         
         cond_list = []
         if self.state_condition and state_cond is not None:
+            # Apply state conditioning masking (random feature group dropout)
+            state_cond = self._apply_state_cond_masking(state_cond)
             s_cond = self.state_embedding(state_cond)  # (B, H, hidden) or (B, hidden)
             if s_cond.ndim == 2:
                 s_cond = s_cond.unsqueeze(1)            # (B, 1, hidden)
@@ -938,6 +1087,120 @@ class DFoTTrajectory(nn.Module):
         aux_losses = self.compute_auxiliary_losses(x_pred, x, masks)
 
         return {"loss": loss, "xs_pred": x_pred, "xs": x, "aux_losses": aux_losses}
+
+    def get_stitch_prob(self, epoch: int) -> float:
+        """Linear ramp of stitched-rollout probability from 0 to max_prob
+        between start_epoch and end_epoch."""
+        if not self.stitch_enabled or epoch < self.stitch_start_epoch:
+            return 0.0
+        if epoch >= self.stitch_end_epoch:
+            return self.stitch_max_prob
+        frac = (epoch - self.stitch_start_epoch) / max(
+            self.stitch_end_epoch - self.stitch_start_epoch, 1
+        )
+        return self.stitch_max_prob * frac
+
+    def forward_stitched(self, x, model_cond=None, masks=None, timesteps=None):
+        """Stitched rollout training: split the (B, T, D) trajectory into
+        ``num_windows`` overlapping sub-windows and run them autoregressively.
+
+        Window *i>0* receives its state conditioning from the predicted last
+        frame of window *i-1* (optionally detached to cap gradient length).
+        Loss is the mean across all sub-windows.
+
+        The caller in train.py decides (via ``get_stitch_prob``) whether to
+        invoke ``forward`` or ``forward_stitched`` for a given batch.
+        """
+        B, T, D = x.shape
+        n_win = self.stitch_num_windows
+        overlap = self.stitch_overlap
+
+        # Compute sub-window length and boundaries
+        # T_eff = n_win * sub_len - (n_win - 1) * overlap  →
+        # sub_len = (T + (n_win - 1) * overlap) / n_win
+        sub_len = (T + (n_win - 1) * overlap) // n_win
+        if sub_len < 2:
+            # Fall back to normal forward if window is too short to split
+            return self.forward(x, model_cond, masks, timesteps)
+
+        # Unpack conditioning (same logic as forward)
+        state_cond = None
+        task_cond = None
+        if model_cond is not None:
+            if isinstance(model_cond, (list, tuple)):
+                idx = 0
+                if self.state_condition:
+                    if len(model_cond) > idx:
+                        state_cond = model_cond[idx]
+                    idx += 1
+                if self.task_condition:
+                    if len(model_cond) > idx:
+                        task_cond = model_cond[idx]
+                    idx += 1
+            else:
+                if self.state_condition:
+                    state_cond = model_cond
+                elif self.task_condition:
+                    task_cond = model_cond
+
+        total_loss = torch.tensor(0.0, device=x.device)
+        all_aux = {}
+        all_x_pred = []
+
+        for w in range(n_win):
+            t_start = w * (sub_len - overlap)
+            t_end = min(t_start + sub_len, T)
+            x_sub = x[:, t_start:t_end]
+            m_sub = masks[:, t_start:t_end] if masks is not None else None
+
+            # Build conditioning for this sub-window
+            if w == 0:
+                # First window: use original conditioning
+                sub_state_cond = state_cond
+            else:
+                # Subsequent windows: extract observation from the predicted
+                # last frame of the *previous* sub-window.
+                prev_pred = all_x_pred[-1]          # (B, sub_T, D)
+                # Use the last frame's observation features as state conditioning
+                obs_from_pred = prev_pred[:, -1:, self.obs_start_idx:]  # (B, 1, obs_dim)
+                if self.stitch_detach:
+                    obs_from_pred = obs_from_pred.detach()
+                sub_state_cond = obs_from_pred  # (B, 1, obs_dim)
+
+            cond = []
+            if self.state_condition and sub_state_cond is not None:
+                cond.append(sub_state_cond)
+            if self.task_condition and task_cond is not None:
+                cond.append(task_cond)
+            sub_model_cond = tuple(cond) if len(cond) > 0 else None
+            if len(cond) == 1:
+                sub_model_cond = cond[0]
+
+            # Forward pass on this sub-window
+            sub_out = self.forward(x_sub, sub_model_cond, m_sub, timesteps=None)
+            total_loss = total_loss + sub_out["loss"].mean()
+            all_x_pred.append(sub_out["xs_pred"])
+
+            # Accumulate auxiliary losses
+            for k, v in sub_out.get("aux_losses", {}).items():
+                if k in all_aux:
+                    all_aux[k] = all_aux[k] + v
+                else:
+                    all_aux[k] = v
+
+        # Average loss and aux across windows
+        total_loss = total_loss / n_win
+        all_aux = {k: v / n_win for k, v in all_aux.items()}
+
+        # Concatenate predictions (for logging only; overlapping frames are doubled)
+        xs_pred_cat = torch.cat(all_x_pred, dim=1)
+
+        return {
+            "loss": total_loss,
+            "xs_pred": xs_pred_cat[:, :T],
+            "xs": x,
+            "aux_losses": all_aux,
+        }
 
     def sample(self, num_trajectories, model_cond=None, cfg_w=0.0, guidance_wt=1.0, guidance_goal=None, inpaint=False, no_state_cond=False, waypoint_values=None, waypoint_mask=None, blend_w=0.0):
         """

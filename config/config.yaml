@@ -33,6 +33,12 @@ data:
     object_pos_w: "object_pos"
     object_quat_w: "object_rot"
 
+  # ── Data augmentation ──
+  augmentation:
+    mirror_symmetry:
+      enabled: False           # G1 left/right (C2 sagittal-plane) reflection
+      prob: 0.5                # probability of mirroring each sample
+
 model:
   type: "dfot"
   inpaint: True
@@ -50,8 +56,6 @@ model:
 training:
   save_dir: "./runs/ablations/physics_loss/"
   log_dir: "./logs/ablations/physics_loss/"
-  # suffix: ""
-  # suffix: "_partial_keepall"
   suffix: ""
   num_epochs: 750
   balance_task_density: False
@@ -62,6 +66,31 @@ training:
     task: 0.2
   add_obs_noise: True
   add_goal_noise: True
+
+  # ── State conditioning masking (random feature-group dropout on obs) ──
+  state_conditioning_masking:
+    enabled: False
+    prob: 0.3                  # probability of applying masking to a sample
+    feature_groups:            # which observation groups can be dropped
+      object_state: [obj_rel_pos, obj_rel_rot6d]
+      body_orientation: [body_rot6d]
+      lower_joints: [joints_left_leg, joints_right_leg]
+      upper_joints: [joints_left_arm, joints_right_arm, joints_torso]
+    group_drop_prob:           # per-group probability of being zeroed out
+      object_state: 0.4
+      body_orientation: 0.2
+      lower_joints: 0.2
+      upper_joints: 0.2
+
+  # ── Stitched rollout training (autoregressive multi-window) ──
+  stitched_rollouts:
+    enabled: False
+    num_windows: 2             # number of sub-windows to chain
+    overlap: 1                 # overlapping frames between consecutive sub-windows
+    start_epoch: 50            # epoch at which stitching probability begins ramping
+    end_epoch: 300             # epoch at which stitching probability reaches max
+    max_prob: 0.5              # maximum probability of using stitched forward
+    detach: True               # detach predicted state between windows (cap gradient length)
 
   # Auxiliary loss weights (set > 0 to enable)
   smoothness_loss_weight: 0.0 #0.1      # penalise frame-to-frame jitter in predicted trajectory
@@ -89,23 +118,35 @@ training:
     keep_last_partial: True # always keep t=T-1 as a keyframe
     waypoint_noise_fraction: 0.5  # max noise level for partial waypoint frames (fraction of total timesteps)
     arrival_ratio: 0.85            # object reaches target in this fraction of remaining time
+
+    # ── Forced extreme conditioning regimes ──
+    force_all_known_prob: 0.0    # prob of making ALL frames full keyframes (reconstruction mode)
+    force_near_empty_prob: 0.0   # prob of keeping only 1 random group at 1 random frame
+
     partial_masking:
       enabled: True
       prob: 1.0             # probability a waypoint is partial (vs full)
-      joints_split: 12      # first 12 joints = lower body (6L + 6R leg DOFs); rest = upper body
+      joints_parts: 5       # 5-part anatomical split (left_leg, right_leg, torso, left_arm, right_arm)
+      # joints_split: 12    # legacy 2-part split (lower/upper) — ignored when joints_parts=5
       feature_groups:       # named groups of features for partial masking
         locomotion: [obj_delta_xy]
         pick_place: [obj_z]
         object_pos: [obj_rel_pos, obj_rel_rot6d]
-        lower_body: [joints_lower]   # hip / knee / ankle joints (indices 0-11)
-        upper_body: [joints_upper]   # waist + shoulder / elbow / wrist joints (indices 12-28)
+        left_leg:  [joints_left_leg]    # hip / knee / ankle joints (indices 0-5)
+        right_leg: [joints_right_leg]   # hip / knee / ankle joints (indices 6-11)
+        torso:     [joints_torso]       # waist yaw / roll / pitch  (indices 12-14)
+        left_arm:  [joints_left_arm]    # shoulder through wrist    (indices 15-21)
+        right_arm: [joints_right_arm]   # shoulder through wrist    (indices 22-28)
         pose: [body_rot6d]
         robot_pos: [body_z, delta_xy, delta_yaw]
       group_keep_prob:      # per-group probability of being kept clean in a partial waypoint
         locomotion: 0.5
         pick_place: 0.2
-        lower_body: 0.15
-        upper_body: 0.15
+        left_leg: 0.15
+        right_leg: 0.15
+        torso: 0.15
+        left_arm: 0.15
+        right_arm: 0.15
         object_pos: 0.0
         pose: 0.0
         robot_pos: 0.0

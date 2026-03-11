@@ -341,11 +341,24 @@ for epoch in range(starting_epoch, num_epochs):
         # ).long()
         timesteps = None
         with torch.autocast(device_type="cuda", dtype=torch.float32):
-            diff_output = diffuser.model(
-                prediction_target, 
-                model_cond, 
-                timesteps=timesteps, 
+            # ── Stitched rollout training ────────────────────────────
+            use_stitch = (
+                hasattr(diffuser.model, "stitch_enabled")
+                and diffuser.model.stitch_enabled
+                and torch.rand(1).item() < diffuser.model.get_stitch_prob(epoch)
             )
+            if use_stitch:
+                diff_output = diffuser.model.forward_stitched(
+                    prediction_target,
+                    model_cond,
+                    timesteps=timesteps,
+                )
+            else:
+                diff_output = diffuser.model(
+                    prediction_target, 
+                    model_cond, 
+                    timesteps=timesteps, 
+                )
             model_pred = diff_output["xs_pred"]
             pred_loss = diff_output["loss"]
             aux_losses = diff_output.get("aux_losses", {})
