@@ -489,10 +489,6 @@ class DFoTTrajectory(nn.Module):
         """
         DDIM sample step that uses the waypoint indicator embedding.
         Mirrors DiscreteDiffusion.ddim_sample_step but with the indicator injected.
-
-        Speed optimisations (zero quality change):
-        - cfg_w == 1.0 → skip unconditional pass entirely (2× fewer forwards)
-        - cfg_w != 1.0 → batch cond + uncond in a single forward pass
         """
         dm = self.diffusion_model
         clipped_curr = torch.clamp(curr_noise_level, min=0)
@@ -516,50 +512,31 @@ class DFoTTrajectory(nn.Module):
         c_coeff = dm.add_shape_channels(c_coeff)
         sigma = dm.add_shape_channels(sigma)
 
-        if cfg_w == 1.0:
-            # ---- Fast path: CFG w=1 reduces to conditional only ----
-            pred = self._model_predictions_with_indicator(
-                x, clipped_curr, external_cond, external_cond_mask=None,
-                waypoint_mask=waypoint_mask,
-            )
-            x_start = pred.pred_x_start
-            pred_noise = pred.pred_noise
-        else:
-            # ---- Batched CFG: cond + uncond in one forward pass ----
-            masked_ext = (
-                (~external_cond_mask).float() * external_cond
-                if external_cond is not None else None
-            )
-            B = x.shape[0]
-            x_double = torch.cat([x, x], dim=0)
-            k_double = torch.cat([clipped_curr, clipped_curr], dim=0)
-            cond_double = (
-                torch.cat([external_cond, masked_ext], dim=0)
-                if external_cond is not None else None
-            )
-            wm_double = (
-                torch.cat([waypoint_mask, waypoint_mask], dim=0)
-                if waypoint_mask is not None else None
-            )
+        # Conditional prediction (with indicator)
+        pred_cond = self._model_predictions_with_indicator(
+            x, clipped_curr, external_cond, external_cond_mask=None,
+            waypoint_mask=waypoint_mask,
+        )
 
-            pred_both = self._model_predictions_with_indicator(
-                x_double, k_double, cond_double, external_cond_mask=None,
-                waypoint_mask=wm_double,
-            )
+        # Unconditional prediction (with indicator but masked external cond)
+        masked_ext = external_cond_mask * external_cond if external_cond is not None else None
+        pred_uncond = self._model_predictions_with_indicator(
+            x, clipped_curr, masked_ext, external_cond_mask=None,
+            waypoint_mask=waypoint_mask,
+        )
 
-            # First B = conditional, last B = unconditional
-            x_start = pred_both.pred_x_start[B:] + cfg_w * (
-                pred_both.pred_x_start[:B] - pred_both.pred_x_start[B:]
-            )
-            pred_noise = pred_both.pred_noise[B:] + cfg_w * (
-                pred_both.pred_noise[:B] - pred_both.pred_noise[B:]
-            )
+        # CFG
+        x_start = pred_uncond.pred_x_start + cfg_w * (
+            pred_cond.pred_x_start - pred_uncond.pred_x_start
+        )
+        pred_noise = pred_uncond.pred_noise + cfg_w * (
+            pred_cond.pred_noise - pred_uncond.pred_noise
+        )
 
-            # Dynamic thresholding
-            if cfg_w > 1.0:
-                s = torch.quantile(torch.abs(x_start).flatten(1), 0.995, dim=1)
-                s = torch.maximum(s, torch.ones_like(s)).view(-1, 1, 1)
-                x_start = torch.clamp(x_start, -s, s) / s
+        if cfg_w > 1.0:
+            s = torch.quantile(torch.abs(x_start).flatten(1), 0.995, dim=1)
+            s = torch.maximum(s, torch.ones_like(s)).view(-1, 1, 1)
+            x_start = torch.clamp(x_start, -s, s) / s
 
         noise = torch.randn_like(x)
         noise = torch.clamp(noise, -dm.clip_noise, dm.clip_noise)
@@ -933,38 +910,7 @@ class DFoTTrajectory(nn.Module):
                 leave=False,
             )
 
-        # ---- Pre-compute loop invariants (hoisted from inner loop) ----
-        external_conditions_mask = torch.zeros(
-            (batch_size, 1, self.external_cond_dim), dtype=torch.bool, device=xs_pred.device
-        )
-        external_conditions_mask[..., -self.task_dim:] = 1.0
-
-        use_indicator = waypoint_mask is not None and waypoint_mask.any()
-
-        def _do_sample_step(x_in, from_k, to_k):
-            if use_indicator:
-                return self._sample_step_with_indicator(
-                    x_in, from_k, to_k, conditions,
-                    external_cond_mask=external_conditions_mask,
-                    guidance_fn=guidance_fn, guidance_goal=guidance_goal,
-                    guidance_wt=guidance_wt, cfg_w=cfg_w,
-                    waypoint_mask=waypoint_mask,
-                )
-            else:
-                return self.diffusion_model.sample_step(
-                    x_in, from_k, to_k, conditions,
-                    external_conditions_mask,
-                    guidance_fn=guidance_fn, guidance_goal=guidance_goal,
-                    guidance_wt=guidance_wt, cfg_w=cfg_w,
-                )
-
-        if inpaint:
-            f_map = get_feature_indices(build_feature_layout())
-
-        # ---- Denoising loop (no_grad for speed; enable_grad inside
-        #      guidance_fn will override when needed) ----
-        with torch.no_grad():
-          for m in range(scheduling_matrix.shape[0] - 1):
+        for m in range(scheduling_matrix.shape[0] - 1):
             from_noise_levels = scheduling_matrix[m]
             to_noise_levels = scheduling_matrix[m + 1]
 
@@ -1045,6 +991,7 @@ class DFoTTrajectory(nn.Module):
                             )
                 
             if inpaint:
+                f_map = get_feature_indices(build_feature_layout())
                 xs_pred[..., 0, f_map['joints']] = self.state_cond[..., 0, :29]
                 xs_pred[..., 0, f_map['body_z']] = self.state_cond[..., 0, 29:30]
                 xs_pred[..., 0, f_map['body_rot6d']] = self.state_cond[..., 0, 30:36]

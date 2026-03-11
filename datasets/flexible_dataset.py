@@ -73,10 +73,10 @@ class FlexibleWindowDataset(Dataset):
 
         self.max_obj_displacement = config.get("max_obj_displacement", None)
 
-        if calculate_stats:
-            self._calculate_stats()
-        elif norm_path and os.path.exists(norm_path):
+        if norm_path and os.path.exists(norm_path) and not calculate_stats:
             self._load_stats()
+        else:
+            self._calculate_stats()
         
         if self.max_obj_displacement is None:
             self.max_obj_displacement = self.stats.get("max_task_params")[2]

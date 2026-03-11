@@ -721,9 +721,6 @@ class MotionGenerator:
         # Episode-start object z — absolute baseline for the z-waypoint target.
         _rest_obj_z = float(current_anchors['ref_obj_pos'][0, 2])
 
-        # Episode-start object z — absolute baseline for the z-waypoint target.
-        _rest_obj_z = float(current_anchors['ref_obj_pos'][0, 2])
-
         stitched_segments = []
 
         # 4. Autoregressive Loop

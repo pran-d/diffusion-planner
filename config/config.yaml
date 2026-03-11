@@ -8,7 +8,7 @@ data:
   num_task_params: 3
   num_observations: 45
   start_timestep: 0
-  num_timesteps: 20
+  num_timesteps: 10
   state_history: 1
   stride: 2
   normalize_goal_vec: True
