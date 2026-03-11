@@ -108,7 +108,7 @@ def precompute_fk(data_root, model_path, config_path=None):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--data_root", type=str, required=True, help="Path to dataset root")
-    parser.add_argument("--model_path", type=str, default="./mj_model.xml", help="Path to MuJoCo XML model")
+    parser.add_argument("--model_path", type=str, default="./unitree_g1/mj_model.xml", help="Path to MuJoCo XML model")
     parser.add_argument("--config", type=str, required=False, help="Path to config.yaml")
     
     args = parser.parse_args()

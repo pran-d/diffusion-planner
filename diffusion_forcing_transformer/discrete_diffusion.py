@@ -417,22 +417,24 @@ class DiscreteDiffusion(nn.Module):
     
         clipped_curr_noise_level = torch.clamp(curr_noise_level, min=0)
 
-        model_mean_cond, _, model_log_variance = self.p_mean_variance(
-            x=x,
-            k=clipped_curr_noise_level,
-            external_cond=external_cond,
-            external_cond_mask=None,
-        )
-        
-        model_mean_uncond, _, _ = self.p_mean_variance(
-            x=x,
-            k=clipped_curr_noise_level,
-            external_cond=external_cond,
-            external_cond_mask=external_cond_mask, 
-        )
-        model_mean = model_mean_uncond + cfg_w * (
-            model_mean_cond - model_mean_uncond
-        )
+        if cfg_w == 1.0:
+            # ---- Fast path: no CFG needed, single forward pass ----
+            model_mean, _, model_log_variance = self.p_mean_variance(
+                x=x, k=clipped_curr_noise_level,
+                external_cond=external_cond, external_cond_mask=None,
+            )
+        else:
+            model_mean_cond, _, model_log_variance = self.p_mean_variance(
+                x=x, k=clipped_curr_noise_level,
+                external_cond=external_cond, external_cond_mask=None,
+            )
+            model_mean_uncond, _, _ = self.p_mean_variance(
+                x=x, k=clipped_curr_noise_level,
+                external_cond=external_cond, external_cond_mask=external_cond_mask,
+            )
+            model_mean = model_mean_uncond + cfg_w * (
+                model_mean_cond - model_mean_uncond
+            )
 
         noise = torch.where(
             self.add_shape_channels(clipped_curr_noise_level > 0),
@@ -444,6 +446,53 @@ class DiscreteDiffusion(nn.Module):
 
         # only update frames where the noise level decreases
         return torch.where(self.add_shape_channels(curr_noise_level == -1), x, x_pred)
+
+    def _cfg_predict(self, x, k, external_cond, external_cond_mask, cfg_w):
+        """
+        Shared CFG prediction logic for ddim_sample_step.
+
+        Speed optimisations (zero quality change):
+        - cfg_w == 1.0 → skip unconditional pass entirely (2× fewer forwards)
+        - cfg_w != 1.0 → batch cond + uncond in a single forward pass
+        """
+        if cfg_w == 1.0:
+            # ---- Fast path: no CFG needed, single forward pass ----
+            pred = self.model_predictions(x=x, k=k, external_cond=external_cond,
+                                          external_cond_mask=None)
+            return pred.pred_x_start, pred.pred_noise
+
+        # ---- Batched CFG: cond + uncond in one forward pass ----
+        masked_external_cond = (
+            (~external_cond_mask).float() * external_cond
+            if external_cond is not None else None
+        )
+        B = x.shape[0]
+        x_double = torch.cat([x, x], dim=0)
+        k_double = torch.cat([k, k], dim=0)
+        cond_double = (
+            torch.cat([external_cond, masked_external_cond], dim=0)
+            if external_cond is not None else None
+        )
+
+        pred_both = self.model_predictions(x=x_double, k=k_double,
+                                           external_cond=cond_double,
+                                           external_cond_mask=None)
+
+        # First B = conditional, last B = unconditional
+        x_start = pred_both.pred_x_start[B:] + cfg_w * (
+            pred_both.pred_x_start[:B] - pred_both.pred_x_start[B:]
+        )
+        pred_noise = pred_both.pred_noise[B:] + cfg_w * (
+            pred_both.pred_noise[:B] - pred_both.pred_noise[B:]
+        )
+
+        # Dynamic thresholding
+        if cfg_w > 1.0:
+            s = torch.quantile(torch.abs(x_start).flatten(1), 0.995, dim=1)
+            s = torch.maximum(s, torch.ones_like(s)).view(-1, 1, 1)
+            x_start = torch.clamp(x_start, -s, s) / s
+
+        return x_start, pred_noise
 
     def ddim_sample_step(
         self,
@@ -510,43 +559,10 @@ class DiscreteDiffusion(nn.Module):
             # Note: We subtract because we want to minimize loss
             x = x - guidance_wt * grad.detach()
 
-            # 6. Proceed with denoising using new xt
-            # Re-predict with modified x is technically more correct for the step, 
-            # Given we shifted x, let's re-predict to be safe and accurate to the new 'location'.
-            model_pred_cond = self.model_predictions(
-                x=x,
-                k=clipped_curr_noise_level,
-                external_cond=external_cond,
-                external_cond_mask=None,
+            # 6. Proceed with denoising using new xt (with CFG speed opt)
+            x_start, pred_noise = self._cfg_predict(
+                x, clipped_curr_noise_level, external_cond, external_cond_mask, cfg_w,
             )
-            
-            masked_external_cond = external_cond_mask * external_cond if external_cond is not None else None
-            model_pred_uncond = self.model_predictions(
-                x=x,
-                k=clipped_curr_noise_level,
-                external_cond=masked_external_cond,
-                external_cond_mask=None,
-            )
-
-            # Classifier-Free Guidance on the *new* prediction
-            x_start = model_pred_uncond.pred_x_start + cfg_w * (
-                model_pred_cond.pred_x_start - model_pred_uncond.pred_x_start
-            )
-            pred_noise = model_pred_uncond.pred_noise + cfg_w * (
-                model_pred_cond.pred_noise - model_pred_uncond.pred_noise
-            )
-
-            # Dynamic Thresholding (Clamp gen values to [-1, 1] then scale)
-            if cfg_w > 1.0:
-                s = torch.quantile(
-                    torch.abs(x_start).flatten(1), 
-                    0.995, 
-                    dim=1
-                )
-                s = torch.maximum(s, torch.ones_like(s))
-                # Broadcast s: (B,) -> (B, 1, 1)
-                s = s.view(-1, 1, 1)
-                x_start = torch.clamp(x_start, -s, s) / s
 
         else:
             model_pred_cond = self.model_predictions(

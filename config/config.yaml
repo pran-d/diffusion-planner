@@ -24,7 +24,6 @@ data:
     - body_rot6d
     - obj_rel_pos
     - obj_rel_rot6d
-    # ee_rel_pos
 
   key_mapping:
     body_pos_w: "root_pos"

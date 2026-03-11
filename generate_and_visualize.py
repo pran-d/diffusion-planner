@@ -249,13 +249,13 @@ def generate(
           f"({len(goals)} goal(s) × {num_samples} sample(s)), "
           f"target length {tgt_len} …")
     t0 = time.time()
-    outs = diff_generator.generate_trajectory(
+    outs, real_lengths = diff_generator.generate_trajectory(
         initial_condition=ic,
         goal_condition=goals_arr,
         num_samples=1,          # already replicated above
         target_traj_length=tgt_len,
     )
-    print(f"[Diffusion] Done in {time.time() - t0:.2f}s  →  shape {outs.shape}")
+    print(f"[Diffusion] Done in {time.time() - t0:.2f}s  →  shape {outs.shape}, real_lengths {real_lengths}")
 
     # Convert to traj dicts
     for i in range(outs.shape[0]):

@@ -16,6 +16,7 @@ Example usage:
 
 import argparse
 import math
+import math
 import os
 import re
 import tempfile
@@ -129,13 +130,24 @@ def generate_goals(original_goal, ref_obj_pos, num_goals, goal_spread,
     has a distinct direction from the robot.  Slot 0 is always the original
     goal (scaled by goal_multiplier); the remaining N-1 slots are filled with
     the two-circle layout.
+    Return an (N, 3) array of goal positions arranged on two concentric circles
+    around ref_obj_pos, each goal at a unique, evenly-spaced theta.
+
+    The N goals are distributed as evenly as possible between an inner circle
+    (radius = goal_spread / 2) and an outer circle (radius = goal_spread).
+    Angles are evenly spaced over [0, 2π) across the full set so every goal
+    has a distinct direction from the robot.  Slot 0 is always the original
+    goal (scaled by goal_multiplier); the remaining N-1 slots are filled with
+    the two-circle layout.
 
     Args:
         original_goal : (3,) world-frame target object position from dataset
         ref_obj_pos   : (3,) world-frame object position at t=0 (scaling origin)
         num_goals     : total number of goals (int)
         goal_spread   : outer circle radius in metres (float)
+        goal_spread   : outer circle radius in metres (float)
         goal_multiplier: scalar to amplify/shrink displacement from ref_obj_pos
+        rng           : np.random.Generator (unused, kept for API compatibility)
         rng           : np.random.Generator (unused, kept for API compatibility)
 
     Returns:
@@ -167,7 +179,34 @@ def generate_goals(original_goal, ref_obj_pos, num_goals, goal_spread,
             g[0] = center[0] + r * np.cos(theta)
             g[1] = center[1] + r * np.sin(theta)
             base_goals.append(g)
+    center = ref_obj_pos.copy()
 
+    # Slot 0: original goal, scaled from ref_obj_pos
+    g0 = ref_obj_pos.copy()
+    g0[:2] = ref_obj_pos[:2] + goal_multiplier * (original_goal[:2] - ref_obj_pos[:2])
+    base_goals = [g0]
+
+    n_extra = num_goals - 1
+    if n_extra > 0:
+        # Evenly-spaced angles across all extra goals
+        thetas = np.linspace(0.0, 2.0 * np.pi, n_extra, endpoint=False)
+
+        # Split into two circles: inner gets ceil(n/2), outer gets floor(n/2)
+        n_inner = math.ceil(n_extra / 2)
+        n_outer = n_extra - n_inner
+
+        r_outer = goal_spread
+        r_inner = goal_spread / 2.0
+
+        for k in range(n_extra):
+            theta = thetas[k]
+            r = r_inner if k < n_inner else r_outer
+            g = ref_obj_pos.copy()
+            g[0] = center[0] + r * np.cos(theta)
+            g[1] = center[1] + r * np.sin(theta)
+            base_goals.append(g)
+
+    return np.stack(base_goals)  # (N, 3)
     return np.stack(base_goals)  # (N, 3)
 
 
@@ -284,6 +323,7 @@ def visualize_results(full_traj, obj_traj_w, goals_arr, args):
             vis.visualize_overlay(
                 x_trajs           = full_traj,
                 repeated_xml_path = adaptive_xml,
+                timestep_delay    = 0.01,
                 timestep_delay    = 0.01,
                 loop              = True,
                 guidance_vec      = guidance_vecs,

@@ -182,9 +182,6 @@ class MotionGenerator:
         
         Args:
             data_source: Path to data folder (str) or list of trajectory dicts.
-                         The dataset internally computes task_params from each
-                         trajectory's final object position. No external goals
-                         need to be passed.
             epochs: Number of epochs to train. Overrides config if provided.
             save_path: Path to save model checkpoints. Overrides config if provided.
             checkpoint: Optional path to a checkpoint to resume from.
@@ -277,7 +274,7 @@ class MotionGenerator:
                         scaler.load_state_dict(ckpt["scaler"])
                     if "ema" in ckpt:
                         ema.load_state_dict(ckpt["ema"])
-                        print("  Loaded EMA state from checkpoint.")
+                        print("Loaded EMA state from checkpoint.")
             else:
                 print(f"Checkpoint {checkpoint} not found. Starting from scratch.")
         
@@ -357,10 +354,9 @@ class MotionGenerator:
                 nn.utils.clip_grad_norm_(self.diffuser.model.parameters(), 1.0)
                 scaler.step(optimizer)
                 scaler.update()
-
                 # EMA update (matches train.py)
                 ema.step(self.diffuser.model.parameters())
-                
+
                 epoch_losses.append(loss.item())
                 pbar.set_postfix({"loss": f"{loss.item():.4f}"})
             
@@ -382,20 +378,20 @@ class MotionGenerator:
                         os.makedirs(os.path.dirname(save_path), exist_ok=True)
                         base, ext = os.path.splitext(save_path)
                         fpath = f"{base}_{epoch+1}{ext}"
-                        ema_fpath = f"{base}_ema_{epoch+1}{ext}"
+                        ema_fpath = f"{base}_{epoch+1}_ema{ext}"
                 else:
                     # Default save
                     save_dir = get_save_path(self.model_cfg, self.data_cfg, self.training_cfg)
                     os.makedirs(save_dir, exist_ok=True)
                     fpath = os.path.join(save_dir, f"model_{epoch}.pth")
                     ema_fpath = os.path.join(save_dir, f"ema_model_{epoch}.pth")
-               
+
                 checkpoint = {
                     "model": self.diffuser.model.state_dict(),
                     "optimizer": optimizer.state_dict(),
                     "scaler": scaler.state_dict(),
-                    "scheduler": scheduler.state_dict(),
                     "ema": ema.state_dict(),
+                    "scheduler": scheduler.state_dict()
                 }
                 torch.save(checkpoint, fpath)
                 self.diffuser.save_ema_weights(ema.shadow_params, ema_fpath)
@@ -411,6 +407,7 @@ class MotionGenerator:
                 for model_p, ema_p in zip(self.diffuser.model.parameters(), ema.shadow_params):
                     model_p.copy_(ema_p.detach())
             print("  [EMA] Applied EMA weights to model for inference.")
+            
 
         # --- Cleanup training objects to release GPU/CPU memory ---
         # Note: optimizer, scheduler, scaler are kept on self for reuse across fit() calls
@@ -577,18 +574,19 @@ class MotionGenerator:
                             cfg_w: float = 1.0,
                             blend_w: float = 0.0,
                             end_error_threshold: float = 0.1,
+                            end_ground_num_frames: int = 2,
+                            end_ground_z_tol: float = 0.05,
                             enable_goal_stop: bool = False,
                             enable_physics_stop: bool = False,
-                            enable_physics_clamp: bool = False,
+                            enable_physics_clamp: bool = True,
                             use_last_frame_wp: bool = True,
                             arrival_ratio: float = 0.85,
                             lift_height: float = 0.5,
                             no_lower_dist: float = 0.5,
                             lift_start: float = 0.0,
                             lift_end: float = 0.20,
-                            walk_start_z: float = 0.80,
-                            return_analysis: bool = False,
-                            verbose: bool = False,):
+                            verbose: bool = False,
+                            walk_start_z: float = 0.80,):
         """
         Generate trajectory via autoregressive diffusion.
         
@@ -613,20 +611,22 @@ class MotionGenerator:
                           target_traj_length and model window size (minimum 1).
             num_samples: Number of parallel samples **per input condition**.
                          When input is already batched (B > 1), set to 1.
-            cfg_w: Classifier-free guidance weight (task axis).
-            blend_w: Blended denoising weight (state axis, PARC-style). 0 = fully
-                     state-conditioned, 0.35 = moderate, 0.65 = PARC default.
-                     Blends task-only and full predictions at every denoising step.
-            end_error_threshold: Stop stitching early if goal reached within this L2 error
-                                 (per trajectory). Only used when enable_goal_stop=True.
+            cfg_w: Classifier-free guidance weight.
+            end_error_threshold: XY-plane radius (metres) around the goal within which
+                                 the object must lie.  Only used when enable_goal_stop=True.
+            end_ground_num_frames: Minimum consecutive frames the object must be on
+                                   the ground before the trajectory is considered done.
+            end_ground_z_tol: Tolerance (metres) for the object z to be considered
+                              "on the ground" (|obj_z − rest_z| < tol).
             enable_goal_stop: If True, each trajectory independently stops generating and
-                              pads once its goal is reached within end_error_threshold.
+                              pads once (a) the object XY is within end_error_threshold of
+                              the goal AND (b) the object has been on the ground for at
+                              least end_ground_num_frames consecutive frames.
                               Set to False to always run the full stitch_steps.
             enable_physics_stop: If True, truncate and pad when a physical consistency
                                  violation is detected (ground penetration / position spike).
                                  Set to False to continue generating regardless.
-            enable_physics_clamp: If True, apply data-derived physics clamping after
-                                  denormalization (joint pos/vel limits, body_z, XY vel).
+            enable_physics_clamp: If True, apply physics-based constraints to clamp joint positions and velocities.
             use_last_frame_wp: If True and model supports inbetweening, add a partial
                                waypoint at the last frame with obj_delta_xy + obj_z.
             arrival_ratio: Object should arrive within this fraction of total time (0-1).
@@ -730,6 +730,13 @@ class MotionGenerator:
         # Per-trajectory goal-stop state
         _goal_reached     = np.zeros(effective_batch, dtype=bool)
         _goal_last_frame  = np.zeros((effective_batch, 43), dtype=np.float64)
+        _newly            = np.zeros(effective_batch, dtype=bool)  # tracks newly-reached samples per step
+        _ground_counter   = np.zeros(effective_batch, dtype=np.int64)  # consecutive on-ground frames
+
+        # Per-sample real trajectory length (frames before padding started).
+        # Initialised to the full output length; updated when goal/physics stop fires.
+        _real_lengths = np.full(effective_batch, -1, dtype=np.int64)  # -1 = not yet set
+        _frames_so_far = 0  # cumulative frames appended across stitch steps
 
         # Episode-start object z — absolute baseline for the z-waypoint target.
         _rest_obj_z = float(current_anchors['ref_obj_pos'][0, 2])
@@ -810,17 +817,6 @@ class MotionGenerator:
                     future_traj_np = apply_physics_clamp(
                         future_traj_np, dt=dt_eff, verbose=verbose,
                     )
-
-                # D3. Collect analysis data
-                if return_analysis:
-                    _ana_norm.append(normalized_sample.detach().cpu().numpy())
-                    _ana_denorm.append(future_traj_np.copy())
-                    if wv is not None:
-                        _ana_wv.append(wv.detach().cpu().numpy())
-                        _ana_wm.append(wm.detach().cpu().numpy().astype(bool))
-                    else:
-                        _ana_wv.append(None)
-                        _ana_wm.append(None)
                 
                 # E. Reconstruct World Frame from SBTO features
                 #    final_obj_pos in anchor must be in world frame for reconstruction
@@ -872,31 +868,69 @@ class MotionGenerator:
 
                 # ── Per-trajectory goal-stop ───────────────────────────────────────────
                 if enable_goal_stop:
+                    _seg_T = segment_world.shape[1]
+                    segment_world = segment_world.copy()
+
                     # 1. Overwrite segments for trajectories already at goal
                     if _goal_reached.any():
-                        _seg_T = segment_world.shape[1]
-                        segment_world = segment_world.copy()
                         for _di in np.where(_goal_reached)[0]:
                             segment_world[_di] = np.tile(_goal_last_frame[_di], (_seg_T, 1))
 
-                    # 2. Detect trajectories newly reaching goal
-                    _obj_end  = segment_world[:, -1, 36:39]                    # (B, 3)
-                    _goal_err = np.linalg.norm(_obj_end - goal_world, axis=-1) # (B,)
-                    _newly    = (~_goal_reached) & (_goal_err < end_error_threshold)
+                    # 2. Detect trajectories newly reaching goal (frame-by-frame)
+                    #    Condition: XY within circle AND on ground for N consecutive frames
+                    _newly = np.zeros(effective_batch, dtype=bool)
+                    _trigger_frame = np.full(effective_batch, -1, dtype=np.int64)
+                    _active = ~_goal_reached  # only check trajectories not yet reached
+                    for _t in range(_seg_T):
+                        _obj_xyz_t = segment_world[:, _t, 36:39]  # (B, 3)
+                        # Update ground counter: on-ground if |obj_z - rest_z| < tol
+                        _on_ground = np.abs(_obj_xyz_t[:, 2] - _rest_obj_z) < end_ground_z_tol
+                        _ground_counter = np.where(_on_ground, _ground_counter + 1, 0)
+                        # XY distance to goal
+                        _xy_err = np.linalg.norm(
+                            _obj_xyz_t[:, :2] - goal_world[:, :2], axis=-1
+                        )  # (B,)
+                        # Check both conditions
+                        _hit = (
+                            _active & ~_newly
+                            & (_xy_err < end_error_threshold)
+                            & (_ground_counter >= end_ground_num_frames)
+                        )
+                        if _hit.any():
+                            for _ni in np.where(_hit)[0]:
+                                _goal_last_frame[_ni] = segment_world[_ni, _t, :]
+                                _trigger_frame[_ni] = _t
+                            _newly |= _hit
+                            print(
+                                f"[goal] step {step+1}, frame {_t}: "
+                                f"sample {np.where(_hit)[0].tolist()} reached goal "
+                                f"(xy_err={_xy_err[_hit].round(4).tolist()}, "
+                                f"ground_frames={_ground_counter[_hit].astype(int).tolist()})"
+                            )
+                    # Pad remainder of current segment for newly-reached trajectories
                     if _newly.any():
                         for _ni in np.where(_newly)[0]:
-                            _goal_last_frame[_ni] = segment_world[_ni, -1, :]
+                            _tf = _trigger_frame[_ni]
+                            if _tf + 1 < _seg_T:
+                                segment_world[_ni, _tf + 1:, :] = _goal_last_frame[_ni]
                         _goal_reached |= _newly
-                        # print(f"[goal] step {step+1}: sample {np.where(_newly)[0].tolist()} "
-                        #       f"reached goal (err={_goal_err[_newly].round(4).tolist()})")
                 # ──────────────────────────────────────────────────────────────────────
 
                 stitched_segments.append(segment_world)
+                _frames_so_far += segment_world.shape[1]
+
+                # Record real length for samples that just reached goal
+                if enable_goal_stop and _newly.any():
+                    _frames_before_seg = _frames_so_far - segment_world.shape[1]
+                    for _si in np.where(_newly & (_real_lengths < 0))[0]:
+                        _real_lengths[_si] = _frames_before_seg + _trigger_frame[_si] + 1
 
                 _prev_robot_xyz = segment_world[:, -1, :3].copy()
                 _prev_obj_xyz   = segment_world[:, -1, 36:39].copy()
 
                 if _phys_stop:
+                    # Mark all samples as stopped at current frame count
+                    _real_lengths[_real_lengths < 0] = _frames_so_far
                     _steps_to_pad = stitch_steps - step - 1
                     if _steps_to_pad > 0:
                         _last_frame = segment_world[:, -1:, :]
@@ -908,6 +942,8 @@ class MotionGenerator:
 
                 # ── Early-exit when all samples have reached their goal ────────────────
                 if enable_goal_stop and _goal_reached.all():
+                    # All reached — finalise any still-unset lengths
+                    _real_lengths[_real_lengths < 0] = _frames_so_far
                     _steps_to_pad = stitch_steps - step - 1
                     if _steps_to_pad > 0:
                         _seg_T   = segment_world.shape[1]
@@ -934,6 +970,9 @@ class MotionGenerator:
         
         full_trajectory = np.concatenate(stitched_segments, axis=1)
 
+        # Finalise real lengths for samples that never triggered goal/physics stop
+        _real_lengths[_real_lengths < 0] = full_trajectory.shape[1]
+
         # Trim or pad to exactly target_traj_length frames
         if target_traj_length is not None:
             T_actual = full_trajectory.shape[1]
@@ -943,6 +982,8 @@ class MotionGenerator:
                 deficit = target_traj_length - T_actual
                 pad = np.repeat(full_trajectory[:, -1:, :], deficit, axis=1)
                 full_trajectory = np.concatenate([full_trajectory, pad], axis=1)
+            # Clamp real lengths to the output length
+            np.clip(_real_lengths, 1, full_trajectory.shape[1], out=_real_lengths)
 
         # # Interpolate if needed (based on dataset downsample config)
         # if self.dataset is not None:
@@ -951,17 +992,5 @@ class MotionGenerator:
         # Smooth trajectory
         full_trajectory = self._smooth_trajectory(full_trajectory, sigma=2.0)
 
-        if return_analysis:
-            analysis_dict = {
-                'normalized_windows': _ana_norm,     # list of (B, T, D) arrays
-                'denormalized_windows': _ana_denorm,  # list of (B, T, D) arrays
-                'waypoint_values': _ana_wv,           # list of (B, T, D) arrays or None
-                'waypoint_masks': _ana_wm,            # list of (B, T, D) bool arrays or None
-                'feature_order': list(self.dataset.feature_order),
-                'feature_dims': self.dataset.feature_dims,
-                'trajectory': full_trajectory,
-            }
-            return full_trajectory, analysis_dict
-
-        return full_trajectory
+        return full_trajectory, _real_lengths
 

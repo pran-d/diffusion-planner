@@ -59,6 +59,22 @@ def load_yaml_with_includes(path):
     
     return conf
 
+def _load_paths(config_path: str) -> dict:
+    """Load machine-local paths from paths.yaml next to the given config file.
+
+    The file is optional — if it doesn't exist an empty dict is returned.
+    Returns the nested ``paths:`` mapping (or top-level keys if there is no
+    ``paths:`` wrapper).
+    """
+    config_dir = os.path.dirname(os.path.abspath(config_path))
+    paths_file = os.path.join(config_dir, "paths.yaml")
+    if not os.path.exists(paths_file):
+        return {}
+    with open(paths_file, "r") as f:
+        raw = yaml.safe_load(f) or {}
+    return raw.get("paths", raw)
+
+
 def load_config(config_path: str, auto_conf: bool = False) -> dict:
     """Load configuration from a YAML file.
     Args:
@@ -75,19 +91,15 @@ def load_config(config_path: str, auto_conf: bool = False) -> dict:
     training_cfg = config.get('training', {})
     noise_sched_cfg = config.get('noise_scheduler', {})
 
-    # Apply paths.yaml as defaults (config values take precedence)
-    paths = load_paths()
-    if paths:
-        data_cfg.setdefault('dir_path', paths.get('data_dir', './'))
-        data_cfg.setdefault('train_path', paths.get('train_path', ''))
-        if paths.get('task_list_path') is not None:
-            data_cfg.setdefault('task_list_path', paths['task_list_path'])
-        training_cfg.setdefault('save_dir', paths.get('save_dir', './runs/'))
-        training_cfg.setdefault('log_dir', paths.get('log_dir', './logs/'))
-        if 'mj_model_xml' in paths:
-            config.setdefault('mj_model_xml', paths['mj_model_xml'])
-        if 'mj_model_repeated_xml' in paths:
-            config.setdefault('mj_model_repeated_xml', paths['mj_model_repeated_xml'])
+    # ── Inject machine-local paths from paths.yaml as defaults ──────────
+    paths = _load_paths(config_path)
+    # Data paths
+    data_cfg.setdefault("dir_path", paths.get("data_dir", "./"))
+    data_cfg.setdefault("train_path", paths.get("train_path", ""))
+    data_cfg.setdefault("task_list_path", paths.get("task_list_path", ""))
+    # Training / run paths
+    training_cfg.setdefault("save_dir", paths.get("save_dir", "./runs/"))
+    training_cfg.setdefault("log_dir", paths.get("log_dir", "./logs/"))
 
     # Propagate root-level keys to training_cfg for backward compatibility / convenience
     for key in ['save_dir', 'log_dir', 'suffix']:
@@ -142,7 +154,7 @@ def get_log_path(model_cfg: dict, data_cfg: dict, training_cfg: dict) -> str:
     return log_dir
 
 def get_data_path(data_cfg: dict) -> str:
-    data_path = data_cfg.get("dir_path", "/home/") + data_cfg.get("train_path", "")
+    data_path = data_cfg.get("dir_path", "./") + data_cfg.get("train_path", "")
     path_suffix = ''
     if data_cfg.get("rot_type", "quat") != "quat":
         path_suffix = f"_{data_cfg['rot_type']}"
