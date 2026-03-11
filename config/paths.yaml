@@ -6,6 +6,7 @@ paths:
   data_dir: "./test_datasets/"
 
   # Sub-path within data_dir that selects the active dataset split
+  # train_path: "SBTO_OmniRetarget_diffusion"
   train_path: "trial/cleanup"
 
   # YAML file listing which tasks/subdirectories to load (relative to data_dir)
@@ -19,5 +20,5 @@ paths:
   log_dir: "./results/logs/"
 
   # MuJoCo XML model files (used for visualisation and FK evaluation)
-  mj_model_xml: "./mj_model.xml"
-  mj_model_repeated_xml: "./mj_model_repeated.xml"
+  mj_model_xml: "./unitree_g1/mj_model.xml"
+  mj_model_repeated_xml: "./unitree_g1/mj_model_repeated.xml"

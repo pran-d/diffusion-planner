@@ -16,6 +16,7 @@ Example usage:
 
 import argparse
 import math
+import math
 import os
 import re
 import tempfile
@@ -24,7 +25,7 @@ import numpy as np
 import torch
 import yaml
 
-from config.configure import load_config, get_data_path, get_norm_path
+from config.configure import load_config, get_data_path, get_norm_path, get_mj_xml_paths
 from models.model import RobotDiffuser
 from datasets.flexible_dataset import FlexibleWindowDataset
 from utils.data.load_dataset import preload_dataset
@@ -64,6 +65,8 @@ def parse_args():
                         help="Scale every goal's displacement from ref_obj_pos by this factor")
     parser.add_argument("--seed",            type=int,   default=42,
                         help="Random seed for goal generation (default: 42)")
+    parser.add_argument("--ema",             action="store_true",   
+                        help="Use EMA weights for inference (default: False)")
 
     # Inference
     parser.add_argument("--stitch_steps",   type=int,   default=None,
@@ -79,24 +82,28 @@ def parse_args():
     parser.add_argument("--device",         type=str,   default="cuda")
     parser.add_argument("--enable_goal_stop", action="store_true",
                         help="Stop at the end goal (default: False)")
+    parser.add_argument("--enable_physics_stop", action="store_true",  
+                        help="Stop when physics violations are detected (default: False)")
     parser.add_argument("--goal_stop_threshold", type=float, default=0.1,
                         help="Distance threshold for stopping at each goal (default: 0.1)")
 
     # Waypoint / z-profile args (forwarded to run_evaluation_batch)
     parser.add_argument("--last_frame_waypoint", action="store_true",
                         help="Add last-frame partial waypoint (obj_delta_xy + obj_delta_z)")
-    parser.add_argument("--arrival_ratio", type=float, default=0.85,
-                        help="Object arrives in this fraction of remaining time (0-1)")
+    parser.add_argument("--arrival_ratio", type=float, default=0.70,
+                        help="Object arrives in this fraction of total time (0-1; data: 90%% XY by 65%%)")
     parser.add_argument("--lift_height",   type=float, default=DEFAULT_LIFT_HEIGHT,
                         help=f"Peak lift height in metres (default: {DEFAULT_LIFT_HEIGHT}m)")
-    parser.add_argument("--lift_start",    type=float, default=0.0,
-                        help="Fraction of trajectory where lift begins")
-    parser.add_argument("--lift_end",      type=float, default=0.20,
-                        help="Fraction of trajectory where lift reaches peak")
-    parser.add_argument("--walk_start_z",  type=float, default=0.80,
-                        help="Gate XY motion until z >= this fraction of lift_height")
-    parser.add_argument("--no_lower_dist", type=float, default=0.5,
+    parser.add_argument("--lift_start",    type=float, default=0.10,
+                        help="Fraction of trajectory where lift begins (data: ~10%%)")
+    parser.add_argument("--lift_end",      type=float, default=0.40,
+                        help="Fraction of trajectory where lift reaches peak (data: ~40%%)")
+    parser.add_argument("--walk_start_z",  type=float, default=0.25,
+                        help="Gate XY motion until z >= this fraction of lift_height (data: ~25%%)")
+    parser.add_argument("--no_lower_dist", type=float, default=0.75,
                         help="Lower z when XY distance to goal drops below this (metres)")
+    parser.add_argument("--enable_phys_clamp", action="store_true", 
+                        help="Apply physics-based clamping to generated trajectories (default: False)")
 
     # Output
     parser.add_argument("--save_path", type=str, default="results/goal_sweep.npy",
@@ -123,13 +130,24 @@ def generate_goals(original_goal, ref_obj_pos, num_goals, goal_spread,
     has a distinct direction from the robot.  Slot 0 is always the original
     goal (scaled by goal_multiplier); the remaining N-1 slots are filled with
     the two-circle layout.
+    Return an (N, 3) array of goal positions arranged on two concentric circles
+    around ref_obj_pos, each goal at a unique, evenly-spaced theta.
+
+    The N goals are distributed as evenly as possible between an inner circle
+    (radius = goal_spread / 2) and an outer circle (radius = goal_spread).
+    Angles are evenly spaced over [0, 2π) across the full set so every goal
+    has a distinct direction from the robot.  Slot 0 is always the original
+    goal (scaled by goal_multiplier); the remaining N-1 slots are filled with
+    the two-circle layout.
 
     Args:
         original_goal : (3,) world-frame target object position from dataset
         ref_obj_pos   : (3,) world-frame object position at t=0 (scaling origin)
         num_goals     : total number of goals (int)
         goal_spread   : outer circle radius in metres (float)
+        goal_spread   : outer circle radius in metres (float)
         goal_multiplier: scalar to amplify/shrink displacement from ref_obj_pos
+        rng           : np.random.Generator (unused, kept for API compatibility)
         rng           : np.random.Generator (unused, kept for API compatibility)
 
     Returns:
@@ -161,7 +179,34 @@ def generate_goals(original_goal, ref_obj_pos, num_goals, goal_spread,
             g[0] = center[0] + r * np.cos(theta)
             g[1] = center[1] + r * np.sin(theta)
             base_goals.append(g)
+    center = ref_obj_pos.copy()
 
+    # Slot 0: original goal, scaled from ref_obj_pos
+    g0 = ref_obj_pos.copy()
+    g0[:2] = ref_obj_pos[:2] + goal_multiplier * (original_goal[:2] - ref_obj_pos[:2])
+    base_goals = [g0]
+
+    n_extra = num_goals - 1
+    if n_extra > 0:
+        # Evenly-spaced angles across all extra goals
+        thetas = np.linspace(0.0, 2.0 * np.pi, n_extra, endpoint=False)
+
+        # Split into two circles: inner gets ceil(n/2), outer gets floor(n/2)
+        n_inner = math.ceil(n_extra / 2)
+        n_outer = n_extra - n_inner
+
+        r_outer = goal_spread
+        r_inner = goal_spread / 2.0
+
+        for k in range(n_extra):
+            theta = thetas[k]
+            r = r_inner if k < n_inner else r_outer
+            g = ref_obj_pos.copy()
+            g[0] = center[0] + r * np.cos(theta)
+            g[1] = center[1] + r * np.sin(theta)
+            base_goals.append(g)
+
+    return np.stack(base_goals)  # (N, 3)
     return np.stack(base_goals)  # (N, 3)
 
 
@@ -251,112 +296,39 @@ def _build_guidance_vecs(obj_traj_w, goals_arr):
     return guidance_vecs
 
 
-def extract_ref_trajectories(dataset, ref_pos, target_T):
+def visualize_results(full_traj, obj_traj_w, goals_arr, args):
     """
-    Extract one world-frame ground-truth trajectory per unique (file_idx, batch_idx)
-    from the dataset's ram_cache, translate each so its t=0 pelvis XY aligns with
-    ref_pos, and pad/trim to target_T frames.
-
-    Returns:
-        np.ndarray of shape (K, target_T, 43)  or  None if cache is empty.
-    """
-    seen = {}   # file_idx → (target_T, 43) array  (batch_idx=0 only)
-    for file_idx, _, __ in dataset.indices:
-        if file_idx in seen:
-            continue
-        raw    = dataset.ram_cache[file_idx]
-        base   = np.asarray(raw['base'][0],   dtype=np.float64)  # (T, 7)
-        joints = np.asarray(raw['joints'][0], dtype=np.float64)  # (T, 29)
-        obj    = np.asarray(raw['obj'][0],    dtype=np.float64)  # (T, 7)
-
-        # Translate XY so t=0 pelvis aligns with the current initial condition
-        xy_offset    = np.asarray(ref_pos[:2]) - base[0, :2]
-        base_a       = base.copy();  base_a[:, :2] += xy_offset
-        obj_a        = obj.copy();   obj_a[:, :2]  += xy_offset
-
-        # Guard: base / joints / obj may have different T when downsampling
-        # is applied unevenly across keys — trim to the common minimum.
-        T_min = min(base_a.shape[0], joints.shape[0], obj_a.shape[0])
-        base_a, joints, obj_a = base_a[:T_min], joints[:T_min], obj_a[:T_min]
-
-        traj = np.concatenate([base_a, joints, obj_a], axis=-1).astype(np.float32)  # (T, 43)
-
-        # Pad or trim to target_T
-        T = traj.shape[0]
-        if T < target_T:
-            traj = np.concatenate([traj, np.tile(traj[-1:], (target_T - T, 1))], axis=0)
-        else:
-            traj = traj[:target_T]
-        seen[file_idx] = traj
-
-    if not seen:
-        return None
-    return np.stack(list(seen.values()))   # (K, target_T, 43)
-
-
-def visualize_results(full_traj, obj_traj_w, goals_arr, args, dataset=None, ref_pos=None):
-    """
-    Visualise all N goal trajectories simultaneously, plus ground-truth dataset
-    trajectories in a contrasting colour.
+    Visualise all N generated goal trajectories simultaneously.
 
     When mj_model_repeated.xml is present, an adaptive copy is generated on the
-    fly with exactly N + K robots (generated + reference), so MuJoCo only
-    allocates the joints / mocap bodies actually needed.
+    fly with exactly N robots, so MuJoCo only allocates the joints / mocap
+    bodies actually needed.
 
     Falls back to MjVisualizer with overlay_paths + markers when the repeated
     XML template is unavailable.
     """
     N, T, _ = full_traj.shape
-    xml_path          = "mj_model.xml"
-    repeated_xml_path = "mj_model_repeated.xml"
+    xml_path, repeated_xml_path = get_mj_xml_paths()
 
-    # ── Extract ground-truth reference trajectories ───────────────────────────
-    ref_trajs = None
-    if dataset is not None and ref_pos is not None:
-        ref_trajs = extract_ref_trajectories(dataset, ref_pos, T)
-        if ref_trajs is not None:
-            K = len(ref_trajs)
-            print(f"Loaded {K} reference (ground-truth) trajectories from dataset.")
-
-    # ── Merge generated + reference into one batch ────────────────────────────
-    if ref_trajs is not None:
-        all_trajs     = np.concatenate([full_traj, ref_trajs], axis=0)   # (N+K, T, 43)
-        ref_obj_goals = ref_trajs[:, -1, 36:39]                          # final obj pos
-        all_goals     = np.concatenate([goals_arr, ref_obj_goals], axis=0)
-        ref_start     = N
-        K             = len(ref_trajs)
-    else:
-        all_trajs = full_traj
-        all_goals = goals_arr
-        ref_start = -1
-        K         = 0
-
-    # Guidance vectors: computed for generated only, padded with zeros for refs
     guidance_vecs = _build_guidance_vecs(obj_traj_w, goals_arr)  # (N, T, 3)
-    if K > 0:
-        guidance_vecs = np.concatenate(
-            [guidance_vecs, np.zeros((K, T, 3), dtype=np.float32)], axis=0
-        )
-
-    total_robots = N + K
 
     # ── Option A: adaptive multi-robot overlay ────────────────────────────────
     if os.path.exists(repeated_xml_path):
         adaptive_xml = None
         try:
-            adaptive_xml = build_adaptive_xml(repeated_xml_path, total_robots)
-            print(f"\nVisualising {N} generated + {K} reference trajectories "
+            adaptive_xml = build_adaptive_xml(repeated_xml_path, N)
+            print(f"\nVisualising {N} generated trajectories "
                   f"with DiffusionOverlayVisualizer…")
             vis = DiffusionOverlayVisualizer(xml_path)
             vis.visualize_overlay(
-                x_trajs           = all_trajs,
+                x_trajs           = full_traj,
                 repeated_xml_path = adaptive_xml,
+                timestep_delay    = 0.01,
                 timestep_delay    = 0.01,
                 loop              = True,
                 guidance_vec      = guidance_vecs,
-                world_goal_pos    = all_goals,
+                world_goal_pos    = goals_arr,
                 spacing           = 0.0,
-                ref_start_idx     = ref_start,
             )
         finally:
             # Remove the temp XML however the visualisation exits
@@ -503,14 +475,28 @@ def main():
 
     # ── 7. Stitch steps (auto) ────────────────────────────────────────────────
     if args.stitch_steps is None:
-        base_steps = dataset.traj_lengths[file_idx] // data_cfg["num_timesteps"]
-        # Scale by the largest goal multiplier / spread distance ratio
-        orig_dist  = max(np.linalg.norm(original_goal[:2] - ref_obj_pos[:2]), 1e-6)
-        max_dist   = max(np.linalg.norm(g[:2] - ref_obj_pos[:2]) for g in goals_arr)
-        scale      = max(1.0, max_dist / orig_dist)
-        args.stitch_steps = max(1, int(base_steps * abs(args.goal_multiplier) * scale))
+        _eff = data_cfg["num_timesteps"] - 1   # frames per step (t=0 anchor is skipped)
+        base_steps = max(1, math.ceil(dataset.traj_lengths[file_idx] / _eff))
+
+        # Estimate metres-per-step from the *base* trajectory length and orig distance.
+        # If orig_dist is tiny (goal barely moved from ref_obj_pos in the dataset sample),
+        # we cannot calibrate speed from it — fall back to goal_spread as the reference
+        # distance, which represents a "typical" goal in this sweep.
+        orig_dist = np.linalg.norm(original_goal[:2] - ref_obj_pos[:2])
+        ref_dist  = orig_dist if orig_dist > 0.1 else args.goal_spread
+        metres_per_step = max(ref_dist / base_steps, 0.05)  # floor: 5 cm/step
+
+        # Use the farthest goal to bound the required steps.
+        max_dist = max(np.linalg.norm(g[:2] - ref_obj_pos[:2]) for g in goals_arr)
+        args.stitch_steps = max(base_steps, math.ceil(max_dist / metres_per_step))
+
+        # Apply goal_multiplier if != 1 (matches inference.py convention)
+        if abs(args.goal_multiplier) != 1.0:
+            args.stitch_steps = max(1, int(args.stitch_steps * abs(args.goal_multiplier)))
+
         print(f"\nAuto stitch_steps = {args.stitch_steps}  "
-              f"(base={base_steps}, scale={scale:.2f})")
+              f"(base={base_steps}, ref_dist={ref_dist:.2f}m, "
+              f"m/step={metres_per_step:.3f}, max_dist={max_dist:.2f}m)")
 
     # ── 8. Batch inference ────────────────────────────────────────────────────
     print(f"\nRunning batch inference for {N} goals…")
@@ -532,6 +518,7 @@ def main():
     print("\nResults:")
     for i in range(N):
         final_pos  = obj_traj_w[i, -1, :2]
+
         goal_xy    = goals_arr[i, :2]
         goal_err   = np.linalg.norm(goal_xy - final_pos)
         disp_xy    = np.linalg.norm(displacements[i, :2])
@@ -551,8 +538,7 @@ def main():
 
     # ── 11. Visualise ─────────────────────────────────────────────────────────
     if args.visualize:
-        visualize_results(full_traj, obj_traj_w, goals_arr, args,
-                          dataset=dataset, ref_pos=ref_pos)
+        visualize_results(full_traj, obj_traj_w, goals_arr, args)
 
 
 if __name__ == "__main__":
