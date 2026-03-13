@@ -137,11 +137,7 @@ def check_physical_consistency(
     _FLOOR_Z = -0.1
     _MAX_DXY =  0.2  # m / frame at 100 Hz
 
-    layout = build_feature_layout(
-        has_vel=data_cfg.get("has_vel", False),
-        has_obj_delta_xy=data_cfg.get("has_obj_delta_xy", True),
-        has_obj_z=data_cfg.get("has_obj_z", True),
-    )
+    layout = build_feature_layout()
     feat_idx   = get_feature_indices(layout)
     body_z_col = feat_idx["body_z"].start
     dxy_sl     = feat_idx["delta_xy"]                          # slice(0, 2)

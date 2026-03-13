@@ -31,7 +31,6 @@ class RobotDiffuser():
         
         self.num_channels = data_config['num_features']
             
-        self.goal_condition = self.model_cfg.get("goal_condition", False)
         self.state_condition = self.model_cfg.get("state_condition", False)
 
         if model_type == "simple_diffusion":
@@ -57,7 +56,7 @@ class RobotDiffuser():
             else:
                 path = self.save_dir + f"model_{policy_num}.pth"
         print(f"Loading diffusion model weights from {path}{'  [EMA]' if ema else ''}... \n")
-        weights = torch.load(path, map_location=self.device)
+        weights = torch.load(path, map_location=self.device, weights_only=False)
         # EMA weight files are saved as plain state_dicts (no "model" key)
         state = weights["model"] if "model" in weights else weights
         missing, unexpected = self.model.load_state_dict(state, strict=False)
@@ -73,7 +72,7 @@ class RobotDiffuser():
     def load_weights_from_file(self, path):
         """Load weights from a specific file path."""
         print(f"Loading model weights from {path}... \n")
-        weights = torch.load(path, map_location=self.device)
+        weights = torch.load(path, map_location=self.device, weights_only=False)
         state = weights["model"] if "model" in weights else weights
         missing, unexpected = self.model.load_state_dict(state, strict=False)
         if missing:

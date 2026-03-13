@@ -12,6 +12,7 @@ from models.model import RobotDiffuser
 from datasets.flexible_dataset import FlexibleWindowDataset, yaw_to_rot_matrix, yaw_from_quat
 from utils.data.load_dataset import preload_dataset
 from utils.math.sbto_utils import reconstruct_sbto_trajectory, compute_task_params
+from utils.physics_limits import apply_physics_clamp
 from utils.visualize.visualize import MjVisualizer
 from inference import build_inference_waypoints, DEFAULT_LIFT_HEIGHT, run_visualization
 
@@ -177,7 +178,7 @@ def run_evaluation_batch(
 
     # Per-trajectory goal-stop state
     enable_goal_stop     = getattr(args, 'enable_goal_stop', True)
-    enable_physics_stop  = getattr(args, 'enable_physics_stop', True)
+    enable_physics_stop  = getattr(args, 'enable_physics_stop', False)
     goal_stop_threshold  = getattr(args, 'goal_stop_threshold', 0.1)
     goal_reached         = np.zeros(num_samples, dtype=bool)
     _goal_last_frame     = np.zeros((num_samples, 43), dtype=np.float64)
@@ -296,6 +297,13 @@ def run_evaluation_batch(
             # Denormalize
             denorm = dataset.denormalize_global(sample)
             future_traj = denorm.cpu().numpy()
+
+            if args.enable_phys_clamp:
+                dt_eff = diffuser.data_cfg.get("raw_dt", 0.01) * diffuser.data_cfg.get("stride", 1)
+                future_traj = apply_physics_clamp(
+                    future_traj,
+                    dt=dt_eff,
+                )
             
             # Reconstruct
             b_anchors = np.concatenate([
@@ -319,14 +327,15 @@ def run_evaluation_batch(
                     inpaint=diffuser.model_cfg.get("inpaint", False)
                 )
 
+            history_size = diffuser.data_cfg.get("history_size", 1)
             if args.action_horizon is not None:
-                robot_world = robot_world[:, 1:, :]  # skip t=0 then apply horizon
-                obj_world   = obj_world[:, 1:, :]
+                robot_world = robot_world[:, history_size:, :]  # skip t=0 then apply horizon
+                obj_world   = obj_world[:, history_size:, :]
                 robot_world = robot_world[:, :args.action_horizon, :]
                 obj_world = obj_world[:, :args.action_horizon, :]
             else:
-                robot_world = robot_world[:, 1:, :]  # skip t=0 (anchored to current state)
-                obj_world   = obj_world[:, 1:, :]
+                robot_world = robot_world[:, history_size:, :]  # skip t=0 (anchored to current state)
+                obj_world   = obj_world[:, history_size:, :]
 
             # Store (B, T, D)
             segment = np.concatenate([robot_world[..., :36], obj_world[..., :7]], axis=-1)

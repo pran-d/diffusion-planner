@@ -9,6 +9,7 @@ from datasets import BufferDataset
 from utils.data.load_dataset import preload_dataset
 from datasets.flexible_dataset import yaw_to_rot_matrix, yaw_from_quat
 from utils.math.sbto_utils import reconstruct_sbto_trajectory, compute_task_params, build_feature_layout
+from utils.physics_limits import apply_physics_clamp
 
 # Default lift height derived from dataset statistics:
 # median peak cumulative obj_delta_z across 1634 pick-and-place trajectories.
@@ -476,8 +477,7 @@ def run_visualization(vis, stitched_trajs, goal_vectors=None, final_obj_pos=None
 def main():
     parser = argparse.ArgumentParser(description="Clean Inference & Stitching Pipeline")
     parser.add_argument("--epoch", type=str, required=True, help="Checkpoint epoch or path")
-    parser.add_argument("--ema", action="store_true",
-                        help="Use EMA weights (loads ema_model_N.pth instead of model_N.pth)")
+    parser.add_argument("--ema", action="store_true", help="Whether to use EMA weights")
     parser.add_argument("--num_samples", type=int, default=1)
     parser.add_argument("--stitch_steps", type=int, default=None, help="Number of autoregressive segments to generate")
     parser.add_argument("--save_path", type=str, default="results/inference.npy")
@@ -498,6 +498,9 @@ def main():
                         help="Z tolerance (m) for object to be considered on the ground")
     parser.add_argument("--goal_multiplier", type=float, default=1.0, help="Scaling factor for goal (for testing different r for same theta)")
     parser.add_argument("--visualize_windows", action="store_true", help="Render and save each generated window as a video")
+    parser.add_argument("--enable_phys_stop", action="store_true", help="Stop trajectory when object reaches goal region (for pick-and-place)")
+    parser.add_argument("--enable_phys_clamp", action="store_true", help="Apply data-derived physics clamping (joint pos/vel, body_z, XY vel)")
+    parser.add_argument("--verbose_physics", action="store_true", help="Print physics clamping statistics per window")
 
     # Guidance arguments
     parser.add_argument("--guidance_wt", type=float, default=0.0, help="Test-time gradient guidance strength")
@@ -555,7 +558,13 @@ def main():
         diffuser.load_weights_from_file(args.epoch)
     else:
         diffuser.loadWeights(int(args.epoch), ema=args.ema)
+        diffuser.loadWeights(int(args.epoch), ema=args.ema)
 
+    # Optional attention explainability capture (DiT backbone only)
+    backbone = None
+    if hasattr(diffuser.model, "diffusion_model") and hasattr(diffuser.model.diffusion_model, "model"):
+        backbone = diffuser.model.diffusion_model.model
+  
     # 4. Prepare Initial Condition
     if args.traj_idx is not None:
         target = (args.traj_idx, args.batch_idx, args.start_time)
@@ -693,6 +702,13 @@ def main():
         denorm_btc = dataset.denormalize_global(normalized_sample)
         future_traj_np = denorm_btc.cpu().numpy()
 
+        # B2. Physics-informed clamping (joint pos/vel, body_z, XY vel)
+        if args.enable_phys_clamp:
+            dt_eff = data_cfg.get("raw_dt", 0.01) * data_cfg.get("stride", 2)
+            future_traj_np = apply_physics_clamp(
+                future_traj_np, dt=dt_eff, verbose=args.verbose_physics,
+            )
+
         # Store unreconstructed segment for debugging   
         unreconstructed_segments.append(future_traj_np)
 
@@ -715,8 +731,8 @@ def main():
         res = reconstruct_sbto_trajectory(anchor_arr, future_traj_np, inpaint=diffuser.model_cfg.get("inpaint", False))
         r_world, o_world = res[0], res[1]
 
-        r_world = r_world[:, 1:, :]
-        o_world = o_world[:, 1:, :]
+        r_world = r_world[:, history_size:, :]
+        o_world = o_world[:, history_size:, :]
 
         if args.action_horizon is not None:
             r_world = r_world[:, :args.action_horizon, :]
@@ -739,7 +755,7 @@ def main():
         _rspike  = np.linalg.norm(_rxy - _rxy_p, axis=-1) > _MAX_ROBOT_STEP
         _ospike  = np.linalg.norm(_oxy - _oxy_p, axis=-1) > _MAX_OBJ_STEP
         _bad_t   = np.where((_floor | _rspike | _ospike).any(axis=0))[0]
-        _phys_stop = _bad_t.size > 0
+        _phys_stop = args.enable_phys_stop and _bad_t.size > 0
         if _phys_stop:
             _t_bad   = int(_bad_t[0])
             _t_clamp = max(_t_bad, 1)

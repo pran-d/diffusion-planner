@@ -286,14 +286,17 @@ class MotionGenerator:
         
         print(f"Starting training for {epochs} epochs...")
         
+        max_batches = self.training_cfg.get("batches_per_epoch", None)
+
         for epoch in range(epochs):
             epoch_losses = []
-            pbar = tqdm(train_dataloader, desc=f"Epoch {epoch+1}/{epochs}")
+            total_steps = min(max_batches, len(train_dataloader)) if max_batches else len(train_dataloader)
+            pbar = tqdm(enumerate(train_dataloader), total=total_steps, desc=f"Epoch {epoch+1}/{epochs}")
             
-            for step, batch in enumerate(pbar):
+            for step, batch in pbar:
 
-                # if self.training_cfg.get("batches_per_epoch") and step >= self.training_cfg["batches_per_epoch"]:
-                #     break
+                if max_batches and step >= max_batches:
+                    break
                 
                 if batch[0].shape[0] < self.data_cfg["batch_size"]:
                     current_bs = batch[0].shape[0]
@@ -584,13 +587,22 @@ class MotionGenerator:
                             verbose: bool = False,
                             walk_start_z: float = 0.80,):
         """
-        Generate trajectory via autoregressive diffusion (mirrors inference.py).
+        Generate trajectory via autoregressive diffusion.
+        
+        This is the single unified entry point for trajectory generation, used by
+        both inference_mg.py and the evolutionary pipeline.
         
         Args:
             initial_condition: Dict with 'robot' (B, H, 36) or (H, 36) and 
                                'obj' (B, H, 7) or (H, 7) history in world frame.
-            goal_condition: np.ndarray (B, D_task) or (D_task,) — desired task params 
-                           (e.g. final object position) in world frame.
+                               Robot: [x, y, z, qw, qx, qy, qz, joint_1..joint_29].
+                               Object: [x, y, z, qw, qx, qy, qz].
+            goal_condition: np.ndarray (B, D) or (D,) — desired final object
+                           displacement from initial object position, expressed in
+                           the yaw-rotated initial robot pelvis frame.
+                           For pick_place_relative_box_pose: D=2, [relative_x, relative_y].
+                           Internally converted to world frame via:
+                             goal_world = R(yaw_init) @ goal_local + init_obj_pos
             target_traj_length: Desired output trajectory length (pre-interpolation).
                                 Used to auto-compute stitch_steps from the model window size.
                                 Ignored if stitch_steps is explicitly provided.
@@ -637,12 +649,8 @@ class MotionGenerator:
         # --- Auto-compute stitch_steps from target trajectory length ---
         if stitch_steps is None:
             if target_traj_length is not None:
-                _eff = window_size - 1   # frames contributed by steps 1+ (t=0 skipped)
-                # Step 0 contributes window_size frames; steps 1+ contribute _eff each.
-                # Total = window_size + (stitch_steps-1)*_eff  =  1 + stitch_steps*_eff.
-                # Ensure total >= target_traj_length:
-                #   stitch_steps >= (target_traj_length - 1) / _eff
-                stitch_steps = max(1, math.ceil((target_traj_length - 1) / _eff))
+                _eff = window_size - 1   # each step contributes (T-1) frames (t=0 always skipped)
+                stitch_steps = max(1, math.ceil(target_traj_length / _eff))
             else:
                 stitch_steps = 1
 
@@ -807,9 +815,9 @@ class MotionGenerator:
                 )
                 r_world, o_world = res[0], res[1]
 
-                if step > 0:
-                    r_world = r_world[:, 1:, :]  # skip t=0 (anchored to current state)
-                    o_world = o_world[:, 1:, :]
+                # Always skip t=0 (anchor frame) — matches inference.py
+                r_world = r_world[:, history_size:, :]
+                o_world = o_world[:, history_size:, :]
                 
                 # Store segment: Robot(36) + Object(7)
                 segment_world = np.concatenate([r_world[..., :36], o_world[..., :7]], axis=-1)
@@ -925,8 +933,8 @@ class MotionGenerator:
                         ])
                         for _ in range(_steps_to_pad):
                             stitched_segments.append(_all_pad.copy())
-                        print(f"[goal] All {effective_batch} samples reached goal after "
-                              f"step {step+1}. Padding {_steps_to_pad} remaining steps.")
+                        # print(f"[goal] All {effective_batch} samples reached goal after "
+                        #       f"step {step+1}. Padding {_steps_to_pad} remaining steps.")
                     break
                 # ──────────────────────────────────────────────────────────────────────
 

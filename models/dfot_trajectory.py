@@ -64,6 +64,48 @@ class MLP(nn.Module):
         return self.net(x)
 
 
+class HistoryAggregator(nn.Module):
+    """Compress (B, H, D) history embeddings into (B, 1, D).
+
+    Supports two modes:
+      - ``"attn"`` (default): learned attention pooling — a single-head
+        attention query that attends to all H frames.  Most expressive
+        and order-aware.
+      - ``"mean"``: simple mean pooling over the time axis.  Parameter-free,
+        useful as a lightweight baseline.
+
+    When ``H == 1`` both modes reduce to an identity reshape.
+    """
+
+    def __init__(self, hidden_dim: int, mode: str = "attn"):
+        super().__init__()
+        self.mode = mode
+        if mode == "attn":
+            # Learned query vector that attends to the H history tokens
+            self.query = nn.Parameter(torch.randn(1, 1, hidden_dim) * 0.02)
+            self.attn = nn.MultiheadAttention(
+                embed_dim=hidden_dim, num_heads=1, batch_first=True,
+            )
+        elif mode != "mean":
+            raise ValueError(f"Unknown history aggregation mode: {mode!r}")
+
+    def forward(self, h: torch.Tensor) -> torch.Tensor:
+        """
+        Args:
+            h: (B, H, D) embedded history frames.
+        Returns:
+            (B, 1, D) aggregated conditioning token.
+        """
+        if h.shape[1] == 1:
+            return h  # no-op when H == 1
+        if self.mode == "mean":
+            return h.mean(dim=1, keepdim=True)
+        # attn: query (B, 1, D) attends to h (B, H, D)
+        query = self.query.expand(h.shape[0], -1, -1)
+        out, _ = self.attn(query, h, h)  # (B, 1, D)
+        return out
+
+
 class DFoTTrajectory(nn.Module):
     def __init__(self, model_config, data_config, noise_scheduler_config=None, training_config=None):
         super().__init__()
@@ -80,11 +122,20 @@ class DFoTTrajectory(nn.Module):
         self.task_dim = model_config.get("hidden_size", 64) if self.task_condition else 0
 
         self.external_cond_dim = self.state_dim + self.task_dim
+
+        self.history_size = data_config.get("state_history", 1)
             
         if self.state_condition:
             self.state_embedding = MLP(
                 in_dim=data_config.get("num_observations", 86),
                 out_dim=model_config.get("hidden_size", 64)
+            )
+            # Aggregate multi-frame history (B, H, hidden) → (B, 1, hidden)
+            # When H == 1 the aggregator is a no-op reshape.
+            agg_mode = model_config.get("history_aggregation", "attn")
+            self.history_aggregator = HistoryAggregator(
+                hidden_dim=model_config.get("hidden_size", 64),
+                mode=agg_mode,
             )
 
         if self.task_condition:
@@ -222,6 +273,23 @@ class DFoTTrajectory(nn.Module):
         self.group_keep_probs = partial_cfg.get("group_keep_prob", {})
         self.waypoint_noise_fraction = self.inbetweening_cfg.get("waypoint_noise_fraction", 0.25)
 
+        # Optional: group-wise input embeddings for the DiT1D backbone.
+        # Instead of a single nn.Linear(D, hidden) the backbone uses per-group
+        # projections whose outputs are summed → hidden, giving the model an
+        # inductive bias about the heterogeneous feature structure.
+        if model_config.get("group_wise_embedding", False) and backbone_type == "dit1d":
+            # Use the canonical feature_order groups (not the partial masking
+            # groups which merge multiple keys).  This gives one projection per
+            # semantic feature (delta_xy, delta_yaw, joints, …).
+            gw_slices = {
+                k: v for k, v in self.feature_index_map.items()
+                if k not in ("joints_lower", "joints_upper")  # avoid sub-slices
+            }
+            self.diffusion_model.model.set_group_wise_embedder(gw_slices)
+            # Recount params after replacement
+            total_params = sum(p.numel() for p in self.diffusion_model.model.parameters())
+            print(f"  Updated param count: {total_params/1e6:.2f}M parameters.")
+
         # Waypoint indicator embedding: projects per-feature binary mask (D) into
         # the backbone's hidden space so the model knows which features are constrained.
         # Added to token embeddings after input_embedder + pos_emb, before transformer blocks.
@@ -332,6 +400,12 @@ class DFoTTrajectory(nn.Module):
         keyframe decides whether it's "full" (all features known) or "partial"
         (only certain feature groups known, chosen randomly per group).
 
+        Supports forced extreme conditioning regimes (config-controlled):
+          - force_all_known_prob: with this probability, *all* frames become
+            full keyframes (model must reconstruct from fully-known input).
+          - force_near_empty_prob: with this probability, only one random
+            feature group at one random frame is kept (near-empty conditioning).
+
         Returns:
             waypoint_mask: (B, T, D) bool — True = known/clean, False = to be predicted
         """
@@ -340,38 +414,73 @@ class DFoTTrajectory(nn.Module):
         partial_enabled = partial_cfg.get("enabled", False)
         partial_prob = partial_cfg.get("prob", 0.5)
 
-        # Step 1: Frame-level keyframe selection
-        frame_mask = self._generate_inbetweening_mask(B, T, device)  # (B, T) bool
+        # ── Forced extreme conditioning ─────────────────────────────
+        force_all_known_prob = cfg.get("force_all_known_prob", 0.0)
+        force_near_empty_prob = cfg.get("force_near_empty_prob", 0.0)
 
-        if not partial_enabled:
-            # All waypoints are full keyframes (all features known)
-            return frame_mask.unsqueeze(-1).expand(-1, -1, D).clone()
+        extreme_roll = torch.rand(B, device=device)
+        all_known_mask = extreme_roll < force_all_known_prob
+        near_empty_mask = (
+            ~all_known_mask
+            & (extreme_roll < force_all_known_prob + force_near_empty_prob)
+        )
+        normal_mask = ~all_known_mask & ~near_empty_mask
 
-        # Step 2: For each keyframe, decide full vs partial
-        is_partial = (torch.rand(B, T, device=device) < partial_prob) & frame_mask
-
-        # Force first/last to be full keyframes if configured
-        if cfg.get("always_keep_first", True):
-            is_partial[:, 0] = False
-        if cfg.get("keep_last_partial", False) and T > 0:
-            is_partial[:, -1] = True
-
-        is_full = frame_mask & ~is_partial
-
-        # Step 3: Build feature mask
         waypoint_mask = torch.zeros(B, T, D, dtype=torch.bool, device=device)
 
-        # Full keyframes: all features known
-        waypoint_mask = waypoint_mask | is_full.unsqueeze(-1)  # broadcast (B,T,1) -> (B,T,D)
+        # --- All-known samples: every frame fully conditioned ---
+        if all_known_mask.any():
+            waypoint_mask[all_known_mask] = True
 
-        # Partial keyframes: per-group random keep
-        if is_partial.any():
-            for group_name, slices in self.feature_group_slices.items():
-                keep_prob = self.group_keep_probs.get(group_name, 0.5)
-                keep_group = (torch.rand(B, T, device=device) < keep_prob) & is_partial
-                for s in slices:
-                    width = s.stop - s.start
-                    waypoint_mask[:, :, s] |= keep_group.unsqueeze(-1).expand(-1, -1, width)
+        # --- Near-empty samples: 1 random group at 1 random frame ---
+        if near_empty_mask.any() and self.feature_group_slices:
+            group_names = list(self.feature_group_slices.keys())
+            n_empty = near_empty_mask.sum().item()
+            # Pick random group for each near-empty sample
+            g_idx = torch.randint(0, len(group_names), (n_empty,))
+            # Pick random frame for each near-empty sample
+            t_idx = torch.randint(0, T, (n_empty,))
+            empty_indices = near_empty_mask.nonzero(as_tuple=True)[0]
+            for i in range(n_empty):
+                b_i = empty_indices[i].item()
+                t_i = t_idx[i].item()
+                g_name = group_names[g_idx[i].item()]
+                for s in self.feature_group_slices[g_name]:
+                    waypoint_mask[b_i, t_i, s] = True
+
+        # --- Normal samples: standard keyframe + partial logic ---
+        if normal_mask.any():
+            normal_indices = normal_mask.nonzero(as_tuple=True)[0]
+            n_normal = normal_indices.shape[0]
+
+            # Step 1: Frame-level keyframe selection (only for normal samples)
+            frame_mask = self._generate_inbetweening_mask(n_normal, T, device)  # (n_normal, T)
+
+            if not partial_enabled:
+                waypoint_mask[normal_indices] = frame_mask.unsqueeze(-1).expand(-1, -1, D)
+            else:
+                # Step 2: full vs partial
+                is_partial = (torch.rand(n_normal, T, device=device) < partial_prob) & frame_mask
+                if cfg.get("always_keep_first", True):
+                    is_partial[:, 0] = False
+                if cfg.get("keep_last_partial", False) and T > 0:
+                    is_partial[:, -1] = True
+                is_full = frame_mask & ~is_partial
+
+                # Full keyframes
+                normal_wm = torch.zeros(n_normal, T, D, dtype=torch.bool, device=device)
+                normal_wm = normal_wm | is_full.unsqueeze(-1)
+
+                # Partial keyframes
+                if is_partial.any():
+                    for group_name, slices in self.feature_group_slices.items():
+                        keep_prob = self.group_keep_probs.get(group_name, 0.5)
+                        keep_group = (torch.rand(n_normal, T, device=device) < keep_prob) & is_partial
+                        for s in slices:
+                            width = s.stop - s.start
+                            normal_wm[:, :, s] |= keep_group.unsqueeze(-1).expand(-1, -1, width)
+
+                waypoint_mask[normal_indices] = normal_wm
 
         return waypoint_mask
 
@@ -560,6 +669,135 @@ class DFoTTrajectory(nn.Module):
 
         return loss
 
+    # ------------------------------------------------------------------
+    # Auxiliary losses (computed on predicted clean trajectory x_pred)
+    # ------------------------------------------------------------------
+
+    def compute_auxiliary_losses(
+        self, x_pred: torch.Tensor, x_gt: torch.Tensor, masks: torch.Tensor
+    ) -> dict:
+        """Compute optional auxiliary losses on the predicted clean trajectory.
+
+        All losses are returned as *scalar* tensors (already reduced) so they
+        can be summed into the main objective with per-loss weight coefficients.
+
+        Args:
+            x_pred: (B, T, D) predicted clean x0 in feature space.
+            x_gt:   (B, T, D) ground-truth trajectory.
+            masks:  (B, T) boolean validity mask.
+
+        Returns:
+            dict  {loss_name: scalar tensor}  (empty if nothing is enabled).
+        """
+        aux = {}
+        tcfg = self.training_config or {}
+        fim = self.feature_index_map  # e.g. {"joints": slice(6,35), ...}
+
+        # Helper: frame-pair mask for consecutive-frame losses (B, T-1)
+        if masks is not None and masks.shape[1] > 1:
+            pair_mask = (masks[:, :-1] & masks[:, 1:]).float()   # (B, T-1)
+        else:
+            pair_mask = None
+
+        # ---- 1. Temporal smoothness loss ----
+        # Penalise large frame-to-frame changes in x_pred (encourages smooth
+        # trajectories).  Applied to all features by default, but can be
+        # restricted to specific groups via config.
+        w_smooth = tcfg.get("smoothness_loss_weight", 0.0)
+        if w_smooth > 0.0 and x_pred.shape[1] > 1:
+            diff_pred = x_pred[:, 1:] - x_pred[:, :-1]  # (B, T-1, D)
+            diff_gt   = x_gt[:, 1:]   - x_gt[:, :-1]
+
+            smooth_groups = tcfg.get("smoothness_feature_groups", None)
+            if smooth_groups and fim:
+                # Only apply to listed groups
+                slices = [fim[g] for g in smooth_groups if g in fim]
+                if slices:
+                    sel = torch.cat(
+                        [diff_pred[..., s] for s in slices], dim=-1
+                    )
+                    sel_gt = torch.cat(
+                        [diff_gt[..., s] for s in slices], dim=-1
+                    )
+                else:
+                    sel, sel_gt = diff_pred, diff_gt
+            else:
+                sel, sel_gt = diff_pred, diff_gt
+
+            # MSE between predicted and true consecutive differences
+            smooth_loss = F.mse_loss(sel, sel_gt, reduction="none")
+            if pair_mask is not None:
+                smooth_loss = smooth_loss * pair_mask.unsqueeze(-1)
+                smooth_loss = smooth_loss.sum() / (pair_mask.sum() * sel.shape[-1] + 1e-8)
+            else:
+                smooth_loss = smooth_loss.mean()
+            aux["smoothness"] = w_smooth * smooth_loss
+
+        # ---- 2. Object grasping consistency loss ----
+        # During carry phases (object close to body), obj_rel_pos should stay
+        # stable.  We penalise large frame-to-frame changes in obj_rel_pos
+        # weighted by a soft "grasp gate" = sigmoid(-dist + threshold).
+        w_grasp = tcfg.get("grasp_consistency_loss_weight", 0.0)
+        if w_grasp > 0.0 and "obj_rel_pos" in fim and x_pred.shape[1] > 1:
+            rel_sl = fim["obj_rel_pos"]                          # slice(42, 45)
+            pred_rel = x_pred[..., rel_sl]                       # (B, T, 3)
+            gt_rel   = x_gt[..., rel_sl]
+
+            # Grasp gate: use GT relative distance so the gate is stable
+            dist_gt = gt_rel.norm(dim=-1, keepdim=True)          # (B, T, 1)
+            grasp_thresh = tcfg.get("grasp_distance_threshold", 0.35)
+            # Soft gate: 1 when object is close, 0 when far
+            gate = torch.sigmoid(5.0 * (grasp_thresh - dist_gt)) # (B, T, 1)
+
+            delta_pred = pred_rel[:, 1:] - pred_rel[:, :-1]     # (B, T-1, 3)
+            delta_gt   = gt_rel[:, 1:]   - gt_rel[:, :-1]
+            gate_pairs = torch.minimum(gate[:, 1:], gate[:, :-1]) # conservative
+
+            grasp_loss = F.mse_loss(delta_pred, delta_gt, reduction="none") * gate_pairs
+            if pair_mask is not None:
+                grasp_loss = grasp_loss * pair_mask.unsqueeze(-1)
+                denom = (pair_mask.unsqueeze(-1) * gate_pairs).sum() + 1e-8
+                grasp_loss = grasp_loss.sum() / denom
+            else:
+                grasp_loss = (grasp_loss.sum()) / (gate_pairs.sum() + 1e-8)
+            aux["grasp_consistency"] = w_grasp * grasp_loss
+
+        # ---- 3. Feet-sliding proxy loss ----
+        # Without differentiable FK we use a joint-velocity proxy: penalise
+        # large ankle-joint velocity in the prediction when the GT also has
+        # low ankle velocity (i.e., stance phases).
+        # Ankle indices inside the 29-joint block:
+        #   left ankle  pitch/roll → 4, 5
+        #   right ankle pitch/roll → 10, 11
+        w_feet = tcfg.get("feet_sliding_loss_weight", 0.0)
+        if w_feet > 0.0 and "joints" in fim and x_pred.shape[1] > 1:
+            j_sl = fim["joints"]  # slice(6, 35)
+            ankle_local = [4, 5, 10, 11]  # indices within 29-joint block
+            ankle_global = [j_sl.start + i for i in ankle_local]
+
+            pred_ankles = x_pred[..., ankle_global]              # (B, T, 4)
+            gt_ankles   = x_gt[..., ankle_global]
+
+            vel_pred = pred_ankles[:, 1:] - pred_ankles[:, :-1]  # (B, T-1, 4)
+            vel_gt   = gt_ankles[:, 1:]   - gt_ankles[:, :-1]
+
+            # Stance gate: GT ankle velocity is small → foot likely on ground
+            vel_gt_mag = vel_gt.abs()
+            stance_thresh = tcfg.get("stance_velocity_threshold", 0.02)
+            stance_gate = (vel_gt_mag < stance_thresh).float()   # (B, T-1, 4)
+
+            # Penalise predicted ankle velocity during GT stance
+            feet_loss = (vel_pred ** 2) * stance_gate
+            if pair_mask is not None:
+                feet_loss = feet_loss * pair_mask.unsqueeze(-1)
+                denom = (pair_mask.unsqueeze(-1) * stance_gate).sum() + 1e-8
+                feet_loss = feet_loss.sum() / denom
+            else:
+                feet_loss = feet_loss.sum() / (stance_gate.sum() + 1e-8)
+            aux["feet_sliding"] = w_feet * feet_loss
+
+        return aux
+
     def forward(self, x, model_cond=None, masks=None, timesteps=None):
         """
         Forward pass for training.
@@ -596,7 +834,9 @@ class DFoTTrajectory(nn.Module):
         if self.state_condition and state_cond is not None:
             s_cond = self.state_embedding(state_cond) 
             if s_cond.ndim == 2:
-                s_cond = s_cond.unsqueeze(1)
+                s_cond = s_cond.unsqueeze(1)            # (B, 1, hidden)
+            # Aggregate multi-frame history → single conditioning token
+            s_cond = self.history_aggregator(s_cond)    # (B, 1, hidden)
             s_cond = apply_condition_dropout(
                 s_cond, 
                 self.training_config.get("condition_dropout_prob", {}).get("state", 0.0),
@@ -692,17 +932,30 @@ class DFoTTrajectory(nn.Module):
         loss_weight = self.diffusion_model.add_shape_channels(loss_weight)
         loss = loss * loss_weight
 
-        # Zero out loss on known/pinned features so the model isn't
-        # penalised for predicting clean data it was given (esp. k=0 frames
-        # where the v-prediction target is pure noise → random loss).
-        fully_known = waypoint_mask.all(dim=-1)  # (B, T)
-        if fully_known.any():
-            loss = loss * (~fully_known).float().unsqueeze(-1)  
+        # Zero out loss on pinned features so the model isn't penalised for
+        # predicting values it was given as input (esp. k=0 full keyframes
+        # where the v-prediction target is pure noise → arbitrary loss, and
+        # partial waypoints where only the *known* features are injected).
+        #
+        #   • Full keyframes  (all features known)  → zero entire token's loss
+        #   • Partial keyframes (some features known) → zero only those features
+        #     The unknown features in a partial keyframe still contribute to loss.
+        if waypoint_mask is not None and waypoint_mask.any():
+            # Per-feature mask (B,T,D): True where feature was pinned/given.
+            # ~waypoint_mask → True where unknown (keep loss), False where known (zero loss).
+            # This correctly handles:
+            #   - Fully known frames:    all D features True  → all loss zeroed
+            #   - Partially known frames: only known features → only those zeroed
+            #   - Unknown frames:         all D features False → full loss kept
+            loss = loss * (~fully_known.unsqueeze(-1)).float()
 
         # Apply frame-level validity masks
         loss = self._reweight_loss(loss, masks)
 
-        return {"loss": loss, "xs_pred": x_pred, "xs": x}
+        # Compute optional auxiliary losses on the predicted clean trajectory
+        aux_losses = self.compute_auxiliary_losses(x_pred, x, masks)
+
+        return {"loss": loss, "xs_pred": x_pred, "xs": x, "aux_losses": aux_losses}
 
     def sample(self, num_trajectories, model_cond=None, cfg_w=0.0, guidance_wt=1.0, guidance_goal=None, inpaint=False, no_state_cond=False, waypoint_values=None, waypoint_mask=None):
         """
@@ -738,7 +991,11 @@ class DFoTTrajectory(nn.Module):
         cond_list = []
         if self.state_condition and state_cond_input is not None:
             self.state_cond = state_cond_input
-            s_cond = self.state_embedding(state_cond_input) # (B, C)
+            s_cond = self.state_embedding(state_cond_input) # (B, H, hidden) or (B, hidden)
+            if s_cond.ndim == 2:
+                s_cond = s_cond.unsqueeze(1)                # (B, 1, hidden)
+            # Aggregate multi-frame history → single conditioning token
+            s_cond = self.history_aggregator(s_cond)         # (B, 1, hidden)
             if no_state_cond:
                 s_cond = apply_condition_dropout(
                     s_cond, 
@@ -909,7 +1166,7 @@ class DFoTTrajectory(nn.Module):
                 desc="Sampling with DFoT",
                 leave=False,
             )
-
+        f_map = get_feature_indices(build_feature_layout())
         for m in range(scheduling_matrix.shape[0] - 1):
             from_noise_levels = scheduling_matrix[m]
             to_noise_levels = scheduling_matrix[m + 1]
@@ -991,12 +1248,14 @@ class DFoTTrajectory(nn.Module):
                             )
                 
             if inpaint:
-                f_map = get_feature_indices(build_feature_layout())
-                xs_pred[..., 0, f_map['joints']] = self.state_cond[..., 0, :29]
-                xs_pred[..., 0, f_map['body_z']] = self.state_cond[..., 0, 29:30]
-                xs_pred[..., 0, f_map['body_rot6d']] = self.state_cond[..., 0, 30:36]
-                xs_pred[..., 0, f_map['obj_rel_pos']] = self.state_cond[..., 0, 36:39]
-                xs_pred[..., 0, f_map['obj_rel_rot6d']] = self.state_cond[..., 0, 39:45]
+                # Pin t=0 of the output window to the current (most recent) history frame.
+                # state_cond is (B, H, obs_dim); index -1 is the latest observation.
+                _cur = self.state_cond[..., -1, :]  # (B, obs_dim)
+                xs_pred[..., 0, f_map['joints']] = _cur[..., :29]
+                xs_pred[..., 0, f_map['body_z']] = _cur[..., 29:30]
+                xs_pred[..., 0, f_map['body_rot6d']] = _cur[..., 30:36]
+                xs_pred[..., 0, f_map['obj_rel_pos']] = _cur[..., 36:39]
+                xs_pred[..., 0, f_map['obj_rel_rot6d']] = _cur[..., 39:45]
             
             pbar.update(1)
 

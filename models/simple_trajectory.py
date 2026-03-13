@@ -43,15 +43,12 @@ class SimpleTrajectoryDiffuser(nn.Module):
         # --- 2. Conditions ---
         self.state_condition = model_config.get("state_condition", False)
         self.history_condition = model_config.get("history_condition", False)
-        self.goal_condition = model_config.get("goal_condition", False)
         self.expand_task_condition = model_config.get("expand_task_condition", False)
         
         self.external_cond_dim = 0
         if self.state_condition: 
             self.external_cond_dim += self.hidden_size
         if self.history_condition: 
-            self.external_cond_dim += self.hidden_size
-        if self.goal_condition: 
             self.external_cond_dim += self.hidden_size
         if self.expand_task_condition:
             self.external_cond_dim += self.hidden_size
@@ -119,15 +116,12 @@ class SimpleTrajectoryDiffuser(nn.Module):
         if self.history_condition:
             hist_dim = data_cfg.get("num_features", 48) # Approx
             self.history_embedding = MLP(hist_dim, self.hidden_size)
-        if self.goal_condition:
-            goal_dim = data_cfg.get("num_features", 48)
-            self.goal_embedding = MLP(goal_dim, self.hidden_size)
         if self.expand_task_condition:
             self.task_embedding = MLP(1, self.hidden_size)
 
     def _process_conditions(self, model_cond, device, batch_size):
         """Processes internal condition logic to produce external_cond tensor."""
-        state_cond, history_cond, goal_cond = None, None, None
+        state_cond, history_cond = None, None
         
         # Unpack tuple/list if necessary
         if model_cond is not None:
@@ -139,13 +133,9 @@ class SimpleTrajectoryDiffuser(nn.Module):
                 if self.history_condition:
                     if len(model_cond) > idx: history_cond = model_cond[idx]
                     idx += 1
-                if self.goal_condition:
-                    if len(model_cond) > idx: goal_cond = model_cond[idx]
-                    idx += 1
             else:
-                 # Assumption: Single condition usually maps to state or goal depending on config
+                 # Assumption: Single condition usually maps to state
                  if self.state_condition: state_cond = model_cond
-                 elif self.goal_condition: goal_cond = model_cond
 
         cond_list = []
         if self.state_condition and state_cond is not None:
@@ -155,11 +145,6 @@ class SimpleTrajectoryDiffuser(nn.Module):
             
         if self.history_condition and history_cond is not None:
             c = self.history_embedding(history_cond)
-            if c.ndim == 2: c = c.unsqueeze(1)
-            cond_list.append(c)
-            
-        if self.goal_condition and goal_cond is not None:
-            c = self.goal_embedding(goal_cond)
             if c.ndim == 2: c = c.unsqueeze(1)
             cond_list.append(c)
             

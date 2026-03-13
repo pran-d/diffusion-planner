@@ -55,6 +55,15 @@ class FlexibleWindowDataset(Dataset):
         self.add_noise = training_cfg.get("add_obs_noise", False)
         self.add_goal_noise = training_cfg.get("add_goal_noise", False)
 
+        # ── G1 left/right mirror symmetry augmentation ──────────────
+        aug_cfg = config.get("augmentation", {})
+        mirror_cfg = aug_cfg.get("mirror_symmetry", {})
+        self.mirror_enabled = mirror_cfg.get("enabled", False)
+        self.mirror_prob = mirror_cfg.get("prob", 0.5)
+        if self.mirror_enabled:
+            self._build_mirror_tables()
+            print(f"Mirror symmetry augmentation enabled (prob={self.mirror_prob})")
+
         self._raw_buffer = data_buffer
         self._task_params = task_params
         
@@ -570,6 +579,327 @@ class FlexibleWindowDataset(Dataset):
             tensor[..., 2] *= torch.rand_like(tensor[..., 2]) * self.noise_cfg["task_magnitude"] # Large noise for goal distance to encourage generalization
         return tensor
 
+    # ────────────────────────────────────────────────────────────────
+    # G1 left/right mirror symmetry (C2 sagittal-plane reflection)
+    # ────────────────────────────────────────────────────────────────
+    def _build_mirror_tables(self):
+        """Pre-compute permutation and sign-flip tables for the feature vector
+        and the observation (current_state) vector.
+
+        G1 joint ordering (29 DOF, indices within the joints block):
+            0-5   left  hip-pitch, hip-roll, hip-yaw, knee, ankle-pitch, ankle-roll
+            6-11  right hip-pitch, hip-roll, hip-yaw, knee, ankle-pitch, ankle-roll
+            12-14 waist yaw, roll, pitch
+            15-21 left  shoulder-pitch, shoulder-roll, shoulder-yaw, elbow,
+                        wrist-roll, wrist-pitch, wrist-yaw
+            22-28 right shoulder-pitch, shoulder-roll, shoulder-yaw, elbow,
+                        wrist-roll, wrist-pitch, wrist-yaw
+
+        Under sagittal-plane reflection (left ↔ right):
+          • Left/right limb blocks are swapped.
+          • Roll and yaw joints negate (they change sign under reflection).
+          • Pitch joints stay the same.
+        """
+        from utils.math.sbto_utils import build_feature_layout
+
+        layout = build_feature_layout()
+        D = sum(layout[k] for k in self.feature_order)
+
+        # ── Feature-vector index map ────────────────────────────────
+        fidx = 0
+        f_map = {}
+        for key in self.feature_order:
+            dim = layout.get(key, 0)
+            f_map[key] = slice(fidx, fidx + dim)
+            fidx += dim
+
+        # ── Permutation & sign arrays (default: identity / +1) ─────
+        perm = np.arange(D, dtype=np.int64)
+        sign = np.ones(D, dtype=np.float32)
+
+        # 1. delta_xy: negate y
+        if "delta_xy" in f_map:
+            s = f_map["delta_xy"]
+            sign[s.start + 1] = -1.0          # delta_y
+
+        # 2. delta_yaw: negate
+        if "delta_yaw" in f_map:
+            s = f_map["delta_yaw"]
+            sign[s.start] = -1.0
+
+        # 3. obj_delta_xy: negate y
+        if "obj_delta_xy" in f_map:
+            s = f_map["obj_delta_xy"]
+            sign[s.start + 1] = -1.0           # obj_delta_y
+
+        # 4. obj_z: invariant (no change needed)
+
+        # 5. joints: swap left↔right, negate roll/yaw
+        if "joints" in f_map:
+            js = f_map["joints"].start
+            # --- permutation (swap left/right blocks) ---
+            # Legs: swap 0-5 ↔ 6-11
+            for i in range(6):
+                perm[js + i], perm[js + 6 + i] = js + 6 + i, js + i
+            # Arms: swap 15-21 ↔ 22-28
+            for i in range(7):
+                perm[js + 15 + i], perm[js + 22 + i] = js + 22 + i, js + 15 + i
+            # Torso (12-14): stays in place
+
+            # --- sign flips (roll & yaw joints negate) ---
+            # Within each 6-DOF leg block: roll=1, yaw=2, ankle_roll=5
+            for base in [0, 6]:  # after permutation both blocks need flips
+                sign[js + base + 1] = -1.0   # hip_roll
+                sign[js + base + 2] = -1.0   # hip_yaw
+                sign[js + base + 5] = -1.0   # ankle_roll
+            # Within each 7-DOF arm block: roll=1, yaw=2, wrist_roll=4, wrist_yaw=6
+            for base in [15, 22]:
+                sign[js + base + 1] = -1.0   # shoulder_roll
+                sign[js + base + 2] = -1.0   # shoulder_yaw
+                sign[js + base + 4] = -1.0   # wrist_roll
+                sign[js + base + 6] = -1.0   # wrist_yaw
+            # Waist: yaw=12, roll=13 negate; pitch=14 stays
+            sign[js + 12] = -1.0  # waist_yaw
+            sign[js + 13] = -1.0  # waist_roll
+
+        # 6. body_z: invariant
+
+        # 7. body_rot6d: [r1x, r1y, r1z, r2x, r2y, r2z]
+        #    Under S=diag(1,-1,1): → [r1x, -r1y, r1z, -r2x, r2y, -r2z]
+        if "body_rot6d" in f_map:
+            s = f_map["body_rot6d"]
+            sign[s.start + 1] = -1.0  # r1y
+            sign[s.start + 3] = -1.0  # r2x
+            sign[s.start + 5] = -1.0  # r2z
+
+        # 8. obj_rel_pos: [x, y, z] → [x, -y, z]
+        if "obj_rel_pos" in f_map:
+            s = f_map["obj_rel_pos"]
+            sign[s.start + 1] = -1.0  # y
+
+        # 9. obj_rel_rot6d: same sign pattern as body_rot6d
+        if "obj_rel_rot6d" in f_map:
+            s = f_map["obj_rel_rot6d"]
+            sign[s.start + 1] = -1.0  # r1y
+            sign[s.start + 3] = -1.0  # r2x
+            sign[s.start + 5] = -1.0  # r2z
+
+        self._mirror_perm = perm
+        self._mirror_sign = sign                   # numpy arrays
+
+        # ── Observation-vector tables (joints, body_z, body_rot6d,
+        #    obj_rel_pos, obj_rel_rot6d = 45 dims) ─────────────────
+        obs_D = self.num_observations  # 45
+        obs_perm = np.arange(obs_D, dtype=np.int64)
+        obs_sign = np.ones(obs_D, dtype=np.float32)
+
+        # Joints (0-28): same permutation & sign logic, offset = 0
+        for i in range(6):
+            obs_perm[i], obs_perm[6 + i] = 6 + i, i
+        for i in range(7):
+            obs_perm[15 + i], obs_perm[22 + i] = 22 + i, 15 + i
+
+        for base in [0, 6]:
+            obs_sign[base + 1] = -1.0
+            obs_sign[base + 2] = -1.0
+            obs_sign[base + 5] = -1.0
+        for base in [15, 22]:
+            obs_sign[base + 1] = -1.0
+            obs_sign[base + 2] = -1.0
+            obs_sign[base + 4] = -1.0
+            obs_sign[base + 6] = -1.0
+        obs_sign[12] = -1.0  # waist_yaw
+        obs_sign[13] = -1.0  # waist_roll
+
+        # body_z (29): invariant
+        # body_rot6d (30-35)
+        obs_sign[31] = -1.0; obs_sign[33] = -1.0; obs_sign[35] = -1.0
+        # obj_rel_pos (36-38): negate y
+        obs_sign[37] = -1.0
+        # obj_rel_rot6d (39-44)
+        obs_sign[40] = -1.0; obs_sign[42] = -1.0; obs_sign[44] = -1.0
+
+        self._mirror_obs_perm = obs_perm
+        self._mirror_obs_sign = obs_sign
+
+        # Task params: [goal_x, goal_y, goal_dist] → negate y
+        self._mirror_task_sign = np.array([1.0, -1.0, 1.0], dtype=np.float32)
+
+    def _build_mirror_norm_bias(self):
+        """
+        Pre-compute per-feature additive bias needed to correctly apply sign-flips
+        in *normalised* space.
+
+        For a sign-flip on feature i (sign[i] == -1) the raw operation is x' = -x.
+        Under min-max normalisation: x_n = (x - lo) / (hi - lo)
+          → x'_n = (-x - lo) / (hi - lo)
+                  = -(x - lo)/(hi - lo) - 2*lo/(hi - lo)
+                  = -x_n  +  bias_i
+        where  bias_i = -2 * lo_i / (hi_i - lo_i).
+        Under mean-std normalisation: x_n = (x - mu) / sigma
+          → x'_n = -(x - mu)/sigma - 2*mu/sigma
+                  = -x_n  +  bias_i
+        where  bias_i = -2 * mu_i / sigma_i.
+
+        For features that are NOT flipped (sign[i] == +1), bias = 0.
+        This correction makes the mirror exactly equivalent to working in raw space.
+        """
+        from utils.math.sbto_utils import build_feature_layout
+        layout  = build_feature_layout()
+        D_feat  = sum(layout[k] for k in self.feature_order)
+        D_obs   = self.num_observations
+
+        # ── feature-vector bias ─────────────────────────────────────
+        feat_bias = np.zeros(D_feat, dtype=np.float32)
+        fidx = 0
+        for key in self.feature_order:
+            dim = layout.get(key, 0)
+            sl  = slice(fidx, fidx + dim)
+            if self.normalization_type == "min_max":
+                lo = self.stats.get(f"min_{key}")
+                hi = self.stats.get(f"max_{key}")
+                if lo is not None and hi is not None:
+                    lo_np = lo.numpy()
+                    hi_np = hi.numpy()
+                    denom = hi_np - lo_np
+                    denom = np.where(np.abs(denom) < 1e-6, 1.0, denom)
+                    feat_bias[sl] = -2.0 * lo_np / denom
+            else:   # mean_std
+                mu  = self.stats.get(f"mean_{key}")
+                sig = self.stats.get(f"std_{key}")
+                if mu is not None and sig is not None:
+                    mu_np  = mu.numpy()
+                    sig_np = sig.numpy()
+                    sig_np = np.where(np.abs(sig_np) < 1e-6, 1.0, sig_np)
+                    feat_bias[sl] = -2.0 * mu_np / sig_np
+            fidx += dim
+        # Only apply bias where sign == -1
+        feat_bias = np.where(self._mirror_sign == -1.0, feat_bias, 0.0)
+        self._mirror_feat_bias = feat_bias.astype(np.float32)
+
+        # ── observation-vector bias ──────────────────────────────────
+        # Observation = the last num_observations dims of the feature vector,
+        # i.e. feature indices [D_feat - D_obs : D_feat].
+        obs_feat_bias = feat_bias[D_feat - D_obs:]
+        # However the obs sign table is independent; reconstruct bias from obs sign
+        obs_bias = np.zeros(D_obs, dtype=np.float32)
+        obs_sign_nz = self._mirror_obs_sign  # (-1 where flipped)
+        obs_keys_in_order = [
+            k for k in self.feature_order
+            if k in ("joints", "body_z", "body_rot6d", "obj_rel_pos", "obj_rel_rot6d")
+        ]
+        oidx = 0
+        for key in obs_keys_in_order:
+            dim = layout.get(key, 0)
+            sl  = slice(oidx, oidx + dim)
+            if self.normalization_type == "min_max":
+                lo = self.stats.get(f"min_{key}")
+                hi = self.stats.get(f"max_{key}")
+                if lo is not None and hi is not None:
+                    lo_np = lo.numpy()
+                    hi_np = hi.numpy()
+                    denom = hi_np - lo_np
+                    denom = np.where(np.abs(denom) < 1e-6, 1.0, denom)
+                    obs_bias[sl] = np.where(
+                        obs_sign_nz[sl] == -1.0,
+                        -2.0 * lo_np / denom,
+                        0.0
+                    )
+            else:
+                mu  = self.stats.get(f"mean_{key}")
+                sig = self.stats.get(f"std_{key}")
+                if mu is not None and sig is not None:
+                    mu_np  = mu.numpy()
+                    sig_np = sig.numpy()
+                    sig_np = np.where(np.abs(sig_np) < 1e-6, 1.0, sig_np)
+                    obs_bias[sl] = np.where(
+                        obs_sign_nz[sl] == -1.0,
+                        -2.0 * mu_np / sig_np,
+                        0.0
+                    )
+            oidx += dim
+        self._mirror_obs_bias = obs_bias.astype(np.float32)
+
+        # ── task-params bias ────────────────────────────────────────
+        tp_bias = np.zeros(3, dtype=np.float32)
+        if self.normalization_type == "min_max":
+            lo = self.stats.get("min_task_params")
+            hi = self.stats.get("max_task_params")
+            if lo is not None and hi is not None:
+                lo_np = lo.numpy()
+                hi_np = hi.numpy()
+                denom = hi_np - lo_np
+                denom = np.where(np.abs(denom) < 1e-6, 1.0, denom)
+                tp_bias = np.where(
+                    self._mirror_task_sign == -1.0,
+                    -2.0 * lo_np / denom,
+                    0.0
+                ).astype(np.float32)
+        else:
+            mu  = self.stats.get("mean_task_params")
+            sig = self.stats.get("std_task_params")
+            if mu is not None and sig is not None:
+                mu_np  = mu.numpy()
+                sig_np = sig.numpy()
+                sig_np = np.where(np.abs(sig_np) < 1e-6, 1.0, sig_np)
+                tp_bias = np.where(
+                    self._mirror_task_sign == -1.0,
+                    -2.0 * mu_np / sig_np,
+                    0.0
+                ).astype(np.float32)
+        self._mirror_task_bias = tp_bias
+
+    def _apply_mirror_symmetry(
+        self,
+        window_tensor: torch.Tensor,
+        current_state: torch.Tensor,
+        task_params: torch.Tensor,
+    ):
+        """Apply C2 sagittal-plane reflection (left↔right mirror).
+
+        Operates correctly in *normalised* space regardless of whether
+        min-max or mean-std normalisation is used.
+
+        For a sign-flip on feature i, the normalised-space operation is:
+            x_n' = -x_n + bias_i
+        where bias_i = -2 * lo_i / (hi_i - lo_i)  (min-max)
+                     = -2 * mu_i / sigma_i          (mean-std)
+        bias_i == 0 when the distribution is symmetric around zero, which is
+        the ideal case; the explicit correction handles the asymmetric case
+        (e.g. body_z, which is always positive).
+
+        Permutation (left↔right joint swap) is exact in any normalised space.
+
+        Returns:
+            (window_tensor, current_state, task_params) — mirrored copies.
+        """
+        # Lazily build norm bias tables the first time (stats must be ready)
+        if not hasattr(self, '_mirror_feat_bias'):
+            self._build_mirror_norm_bias()
+
+        dev = window_tensor.device
+        perm_t      = torch.from_numpy(self._mirror_perm).long().to(dev)
+        sign_t      = torch.from_numpy(self._mirror_sign).to(dev)
+        feat_bias_t = torch.from_numpy(self._mirror_feat_bias).to(dev)
+
+        # Feature trajectory: (T, D) → permute first, then sign-flip + bias
+        window_tensor = window_tensor[:, perm_t] * sign_t + feat_bias_t
+
+        # Current state: (H, obs_dim) → permute + sign-flip + bias
+        obs_perm_t = torch.from_numpy(self._mirror_obs_perm).long().to(dev)
+        obs_sign_t = torch.from_numpy(self._mirror_obs_sign).to(dev)
+        obs_bias_t = torch.from_numpy(self._mirror_obs_bias).to(dev)
+        current_state = current_state[:, obs_perm_t] * obs_sign_t + obs_bias_t
+
+        # Task params: negate y component + bias correction
+        task_sign_t = torch.from_numpy(self._mirror_task_sign).to(dev)
+        task_bias_t = torch.from_numpy(self._mirror_task_bias).to(dev)
+        tp_dim = task_params.shape[-1]
+        task_params = task_params * task_sign_t[:tp_dim] + task_bias_t[:tp_dim]
+
+        return window_tensor, current_state, task_params
+
+
     def __getitem__(self, idx):
         file_idx, batch_idx, t_start = self.indices[idx]
         
@@ -603,6 +933,12 @@ class FlexibleWindowDataset(Dataset):
         task_params = self._normalize("task_params", task_params)
         if self.add_goal_noise:
             task_params = self._add_obs_noise(task_params, "task_params")
+
+        # Mirror symmetry augmentation (C2 sagittal-plane reflection)
+        if self.mirror_enabled and torch.rand(1).item() < self.mirror_prob:
+            future_states, current_state, task_params = self._apply_mirror_symmetry(
+                future_states, current_state, task_params
+            )
 
         return future_states, current_state, task_params, anchor
 
