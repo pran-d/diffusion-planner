@@ -7,3 +7,5 @@ diffusers
 scipy
 einops
 tqdm
+imageio
+imageio-ffmpeg

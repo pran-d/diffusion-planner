@@ -90,6 +90,10 @@ def parse_args():
                         help="Directory to save results into")
     parser.add_argument("--visualize", action="store_true",
                         help="Open MuJoCo viewer after generation")
+    parser.add_argument("--video", action="store_true",
+                        help="Save visualization as video file instead of opening interactive viewer")
+    parser.add_argument("--video_path", type=str, default=None,
+                        help="Path to save video file (default: results/goal_sweep_video.mp4)")
 
     return parser.parse_args()
 
@@ -204,7 +208,7 @@ def visualize_results(full_traj, obj_traj_w, goals_arr, args):
     xml_path, repeated_xml_path = get_mj_xml_paths()
     guidance_vecs = _build_guidance_vecs(obj_traj_w, goals_arr)
 
-    if os.path.exists(repeated_xml_path):
+    if os.path.exists(repeated_xml_path) and not getattr(args, 'video', False):
         adaptive_xml = None
         try:
             adaptive_xml = build_adaptive_xml(repeated_xml_path, N)
@@ -231,11 +235,17 @@ def visualize_results(full_traj, obj_traj_w, goals_arr, args):
     markers = [np.tile(goals_arr[i:i+1], (T, 1)) for i in range(N)]
     t_arr = np.arange(T) * 0.01
     vis = MjVisualizer(xml_path, close_on_enter=False)
-    vis.visualize_trajectory(
-        t=t_arr, x_traj=full_traj[0], repeat=True,
-        guidance_vec=guidance_vecs[0], goal_pos=goals_arr[0],
-        overlay_paths=overlay_paths, markers=markers,
-    )
+    
+    if getattr(args, 'video', False):
+        video_path = getattr(args, 'video_path', None) or "results/goal_sweep_video.mp4"
+        os.makedirs(os.path.dirname(video_path) or ".", exist_ok=True)
+        vis.render_trajectory_to_video(t=t_arr, x_traj=full_traj[0], save_path=video_path)
+    else:
+        vis.visualize_trajectory(
+            t=t_arr, x_traj=full_traj[0], repeat=True,
+            guidance_vec=guidance_vecs[0], goal_pos=goals_arr[0],
+            overlay_paths=overlay_paths, markers=markers,
+        )
     vis.close()
 
 
@@ -436,7 +446,7 @@ def main():
     print(f"Saved to {args.save_dir}/")
 
     # -- 6. Visualise ------------------------------------------------------
-    if args.visualize:
+    if args.visualize or args.video:
         visualize_results(full_traj, result["obj_traj_w"], goals_world, args)
 
 

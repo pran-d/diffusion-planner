@@ -135,6 +135,10 @@ def main():
     # Analysis / visualization
     parser.add_argument("--no_visualize", action="store_true",
                         help="Skip MuJoCo visualisation")
+    parser.add_argument("--video", action="store_true",
+                        help="Save visualization as video file instead of opening interactive viewer")
+    parser.add_argument("--video_path", type=str, default=None,
+                        help="Path to save video file (default: results/inference_mg_video.mp4)")
 
     args = parser.parse_args()
 
@@ -299,11 +303,16 @@ def main():
             if os.path.exists(xml_path):
                 vis = MjVisualizer(xml_path, close_on_enter=False)
                 t = np.arange(T_total) * 0.01
-                vis.visualize_trajectory(
-                    t=t, x_traj=traj_0, repeat=True,
-                    guidance_vec=guidance_vec,
-                    goal_pos=goal_world,
-                )
+                if args.video:
+                    video_path = args.video_path or "results/inference_mg_video.mp4"
+                    os.makedirs(os.path.dirname(video_path) or ".", exist_ok=True)
+                    vis.render_trajectory_to_video(t=t, x_traj=traj_0, save_path=video_path)
+                else:
+                    vis.visualize_trajectory(
+                        t=t, x_traj=traj_0, repeat=True,
+                        guidance_vec=guidance_vec,
+                        goal_pos=goal_world,
+                    )
                 vis.close()
             else:
                 print(f"MuJoCo model not found at {xml_path}; skipping visualisation.")

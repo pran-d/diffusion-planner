@@ -58,6 +58,74 @@ class MjVisualizer():
         mujoco.mj_forward(self.mj_model, self.mj_data)
         self.viewer.sync()
 
+    def render_trajectory_to_video(
+        self,
+        t: np.ndarray,
+        x_traj: np.ndarray,
+        save_path: str,
+        fps: int = 100,
+        width: int = 1280,
+        height: int = 720,
+    ) -> None:
+        """
+        Render a trajectory using mujoco.Renderer and save it as a video file.
+
+        Args:
+            t: (T,) time array
+            x_traj: (T, state_dim) trajectory array [qpos, qvel]
+            save_path: Path to save the video (e.g., 'results/output.mp4')
+            fps: Frames per second for video
+            width: Render width in pixels
+            height: Render height in pixels
+        """
+        try:
+            import imageio
+        except ImportError:
+            print("ERROR: imageio not installed. Install with: pip install imageio imageio-ffmpeg")
+            return
+
+        # Create output directory if needed
+        os.makedirs(os.path.dirname(save_path) if os.path.dirname(save_path) else ".", exist_ok=True)
+
+        # Determine actual fps from data
+        if len(t) > 1:
+            dt = t[1] - t[0]
+            actual_fps = min(fps, int(1.0 / dt))
+        else:
+            actual_fps = fps
+
+        # Initialize renderer
+        renderer = mujoco.Renderer(self.mj_model, height=height, width=width)
+        
+        nq = self.mj_model.nq
+        nv = self.mj_model.nv
+        frames = []
+        
+        print(f"Rendering trajectory to video: {save_path}")
+        print(f"  Resolution: {width}x{height}, FPS: {actual_fps}, Frames: {len(x_traj)}")
+
+        for i, timestep in enumerate(t):
+            # Reset and set state
+            mujoco.mj_resetData(self.mj_model, self.mj_data)
+            self.mj_data.qpos[:] = x_traj[i, :nq]
+            if x_traj.shape[1] > nq and nv > 0:
+                self.mj_data.qvel[:] = x_traj[i, nq:nq + nv]
+            
+            mujoco.mj_forward(self.mj_model, self.mj_data)
+
+            # Render frame
+            renderer.update_scene(self.mj_data, camera="track")
+            frame = renderer.render()
+            frames.append(frame)
+
+            if (i + 1) % max(1, len(x_traj) // 10) == 0:
+                print(f"  Rendered {i + 1}/{len(x_traj)} frames...")
+
+        # Save video using imageio
+        imageio.mimwrite(save_path, frames, fps=actual_fps)
+        renderer.close()
+        print(f"Video saved to {save_path}")
+
     def visualize_trajectory(
         self,
         t: np.ndarray,

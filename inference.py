@@ -3,7 +3,7 @@ import numpy as np
 import yaml
 import os
 import argparse
-from config.configure import load_config, get_data_path, get_norm_path
+from config.configure import load_config, get_data_path, get_norm_path, get_mj_xml_paths
 from models.model import RobotDiffuser
 from datasets import BufferDataset
 from utils.data.load_dataset import preload_dataset
@@ -462,7 +462,7 @@ def update_condition(dataset, robot_world_history, obj_world_history, final_obj_
     return next_state_tens, batched_anchor
 
 
-def run_visualization(vis, stitched_trajs, goal_vectors=None, final_obj_pos=None, repeat=True):    
+def run_visualization(vis, stitched_trajs, goal_vectors=None, final_obj_pos=None, repeat=True, save_video_path=None):    
     # Use first sample (num_samples, T, D) -> (T, D)
     if stitched_trajs.ndim == 3:
         traj = stitched_trajs[0] 
@@ -472,7 +472,10 @@ def run_visualization(vis, stitched_trajs, goal_vectors=None, final_obj_pos=None
     T_steps = traj.shape[0]
     t = np.arange(T_steps) * 0.01
 
-    vis.visualize_trajectory(t=t, x_traj=traj, repeat=repeat, guidance_vec=goal_vectors, goal_pos=final_obj_pos)
+    if save_video_path:
+        vis.render_trajectory_to_video(t=t, x_traj=traj, save_path=save_video_path)
+    else:
+        vis.visualize_trajectory(t=t, x_traj=traj, repeat=repeat, guidance_vec=goal_vectors, goal_pos=final_obj_pos)
 
 def main():
     parser = argparse.ArgumentParser(description="Clean Inference & Stitching Pipeline")
@@ -516,6 +519,10 @@ def main():
                         help="Gate XY motion: don't walk until z >= this fraction of lift_height (default: 0.80)")
     parser.add_argument("--no_lower_dist", type=float, default=0.4,
                         help="Lower z when remaining XY distance drops below this value in metres (default: 0.3m)")
+    parser.add_argument("--video", action="store_true", 
+                        help="Save visualization as video file instead of opening interactive viewer")
+    parser.add_argument("--video_path", type=str, default=None,
+                        help="Path to save video file (default: results/inference_video.mp4)")
     
     args = parser.parse_args()
 
@@ -542,10 +549,16 @@ def main():
     )
 
     from utils.visualize.visualize import MjVisualizer
-    xml_path = "mj_model.xml"
+    cfg_xml_path, _ = get_mj_xml_paths()
+    xml_path = cfg_xml_path
     if not os.path.exists(xml_path):
-        xml_path = os.path.join(data_path, "mj_model.xml")
-    vis = MjVisualizer(xml_path, close_on_enter=False)
+        fallback_xml = "mj_model.xml"
+        data_xml = os.path.join(data_path, "mj_model.xml")
+        if os.path.exists(fallback_xml):
+            xml_path = fallback_xml
+        elif os.path.exists(data_xml):
+            xml_path = data_xml
+    vis = MjVisualizer(xml_path, close_on_enter=False) if os.path.exists(xml_path) else None
 
     # 3. Model
     diffuser = RobotDiffuser(
@@ -898,12 +911,17 @@ def main():
             pass
 
     # 7. Visualize
-    if os.path.exists(xml_path):
-        run_visualization(vis, full_trajectory, goal_vectors, anchor["final_obj_pos"])
+    if vis is not None and os.path.exists(xml_path):
+        video_path = None
+        if args.video:
+            video_path = args.video_path or "results/inference_video.mp4"
+            os.makedirs(os.path.dirname(video_path) or ".", exist_ok=True)
+        run_visualization(vis, full_trajectory, goal_vectors, anchor["final_obj_pos"], save_video_path=video_path)
     else:
-        print("Could not find mj_model.xml for visualization.")
+        print(f"Could not find MuJoCo XML for visualization. Tried configured path: {cfg_xml_path}")
 
-    vis.close()
+    if vis is not None:
+        vis.close()
 
 if __name__ == "__main__":
     main()
