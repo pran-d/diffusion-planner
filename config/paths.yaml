@@ -14,10 +14,10 @@ paths:
   task_list_path: "./test_datasets/chosen_tasks_test.yml"
 
   # Directory where checkpoints and norm stats are saved
-  save_dir: "./results/runs/"
+  save_dir: "./results/runs/ablations/mar_14/"
 
   # Directory where tensorboard / WandB logs are written
-  log_dir: "./results/logs/"
+  log_dir: "./results/logs/ablations/mar_14/"
 
   # MuJoCo XML model files (used for visualisation and FK evaluation)
   mj_model_xml: "./unitree_g1/mj_model.xml"

@@ -649,7 +649,8 @@ class MotionGenerator:
         # --- Auto-compute stitch_steps from target trajectory length ---
         if stitch_steps is None:
             if target_traj_length is not None:
-                _eff = window_size - 1   # each step contributes (T-1) frames (t=0 always skipped)
+                # Effective frames added per window = window_size - history_size
+                _eff = max(1, window_size - history_size)
                 stitch_steps = max(1, math.ceil(target_traj_length / _eff))
             else:
                 stitch_steps = 1

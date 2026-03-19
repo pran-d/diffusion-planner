@@ -154,6 +154,13 @@ class DiT1D(BaseBackbone):
             use_causal_mask,
         )
 
+        if use_causal_mask:
+            self.use_causal_mask = True
+        else:
+            self.use_causal_mask = False
+
+        self.mask_token = nn.Parameter(torch.randn(1, 1, cfg.hidden_size))
+
         hidden_size = cfg.hidden_size
         in_channels = x_shape[0]
         out_channels = x_shape[0]
@@ -269,10 +276,15 @@ class DiT1D(BaseBackbone):
         noise_levels: torch.Tensor,
         external_cond: Optional[torch.Tensor] = None,
         external_cond_mask: Optional[torch.Tensor] = None,
+        mask: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         # 1. Input Embedding
         # x is (B, T, C)
         x = self.input_embedder(x) # (B, T, hidden)
+
+        if mask is not None:
+            # mask: (B, T) boolean tensor where True means masked
+            x = torch.where(mask.unsqueeze(-1), self.mask_token, x)
 
         # 2. Condition Embedding
         c = self.noise_level_pos_embedding(noise_levels)

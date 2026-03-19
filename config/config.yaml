@@ -64,7 +64,7 @@ training:
   save_dir: "./runs/ablations/symmetry_aug/"
   log_dir: "./logs/ablations/symmetry_aug/"
   suffix: "_mirroraug"
-  num_epochs: 250
+  num_epochs: 1000
   balance_task_density: False
   learning_rate: 0.0005
   save_every: 20
@@ -156,8 +156,8 @@ training:
       group_keep_prob:      # per-group probability of being kept clean in a partial waypoint
         locomotion: 0.5
         pick_place: 0.2
-        lower_body: 0.1
-        upper_body: 0.1
+        lower_body: 0.15
+        upper_body: 0.15
         object_pos: 0.0
         pose: 0.0
         robot_pos: 0.0

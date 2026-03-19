@@ -307,7 +307,7 @@ def run_goal_sweep(mg, dataset, args):
     # -- Auto stitch_steps -------------------------------------------------
     stitch_steps = args.stitch_steps
     if stitch_steps is None:
-        _eff = data_cfg["num_timesteps"] - 1
+        _eff = max(1, data_cfg["num_timesteps"] - data_cfg.get("state_history", 1))
         traj_len = dataset.traj_lengths[file_idx]
         base_steps = max(1, math.ceil(traj_len / _eff))
         max_dist = max(np.linalg.norm(goals_local[i, :2]) for i in range(N))

@@ -27,9 +27,14 @@ from __future__ import annotations
 
 import argparse
 import os
+import re
 import sys
+import tempfile
+import xml.etree.ElementTree as ET
 
 import numpy as np
+
+from config.configure import get_mj_xml_paths
 
 # ────────────────────────── constants ──────────────────────────
 
@@ -57,17 +62,22 @@ RIGHT_ARM = slice(22, 29)
 
 # Within each 6-DOF leg:  pitch=0, roll=1, yaw=2, knee=3, ankle_pitch=4, ankle_roll=5
 # Within each 7-DOF arm:  sh_pitch=0, sh_roll=1, sh_yaw=2, elbow=3, wr_roll=4, wr_pitch=5, wr_yaw=6
-# Roll and yaw joints negate under sagittal-plane reflection.
+
+# Correct reflections based on user spec:
+# Legs: hip_roll, hip_yaw, ankle_roll (1, 2, 5) -> same as before
+# Arms: sh_roll, sh_yaw, wr_roll, wr_yaw (1, 2, 4, 6) -> wr_roll is 4, wr_yaw is 6
+# Waist: yaw, roll (0, 1) -> pitch is 2
+
 LEG_NEGATE_OFFSETS = [1, 2, 5]         # hip_roll, hip_yaw, ankle_roll
 ARM_NEGATE_OFFSETS = [1, 2, 4, 6]      # sh_roll, sh_yaw, wr_roll, wr_yaw
-WAIST_NEGATE_OFFSETS = [0, 1]           # waist_yaw, waist_roll  (pitch stays)
+WAIST_NEGATE_OFFSETS = [0, 1]           # waist_yaw, waist_roll
 
 
 def reflect_quaternion_y(quat: np.ndarray) -> np.ndarray:
     """Reflect a quaternion (w, x, y, z) about the xz-plane (negate y).
 
     A reflection S = diag(1, -1, 1) acting on rotation R gives R' = S R S.
-    In quaternion form: (w, x, y, z) → (w, -x, y, -z).
+    In quaternion form: (w, x, y, z) → (w, -1, y, -z).
     """
     q = quat.copy()
     q[..., 1] *= -1   # qx
@@ -75,17 +85,18 @@ def reflect_quaternion_y(quat: np.ndarray) -> np.ndarray:
     return q
 
 
-def mirror_qpos(qpos: np.ndarray) -> np.ndarray:
+def mirror_qpos(qpos: np.ndarray, q_off=None) -> np.ndarray:
     """Apply C2 sagittal-plane reflection to a qpos vector (or trajectory).
 
     Works on shapes (43,) or (T, 43).
-
-    The sagittal plane is the xz-plane (y = 0). Under reflection:
-      - Positions: y negates
-      - Orientations: R → S R S  where S = diag(1, -1, 1)
-      - Left/right limb joints swap
-      - Roll and yaw joints negate (sign flip under reflection)
+    
+    q_off: optional (4,) quaternion representing geom offset for the object.
+           If None, it tries to load it from the default XML.
     """
+    if q_off is None:
+        single_xml, _ = get_mj_xml_paths()
+        q_off = get_obj_geom_quat(single_xml)
+
     q = qpos.copy()
     single = q.ndim == 1
     if single:
@@ -100,34 +111,80 @@ def mirror_qpos(qpos: np.ndarray) -> np.ndarray:
     # ── Robot joints (indices 7..35 in qpos → 0..28 in joint block) ──
     joints = q[:, 7:36].copy()              # (T, 29)
 
-    # 1. Swap left ↔ right blocks
-    new_joints = np.empty_like(joints)
-    new_joints[:, LEFT_LEG]  = joints[:, RIGHT_LEG]
-    new_joints[:, RIGHT_LEG] = joints[:, LEFT_LEG]
-    new_joints[:, WAIST]     = joints[:, WAIST]
-    new_joints[:, LEFT_ARM]  = joints[:, RIGHT_ARM]
-    new_joints[:, RIGHT_ARM] = joints[:, LEFT_ARM]
+    # 1. Swap left ↔ right blocks based on user permutation
+    # permutation_Q_js: [[
+    #   6, 7, 8, 9, 10, 11,        # right_leg -> left_leg position
+    #   0, 1, 2, 3, 4, 5,          # left_leg -> right_leg position
+    #   12, 13, 14,                 # waist (yaw, roll, pitch)
+    #   22, 23, 24, 25, 26, 27, 28, # right_arm -> left_arm position
+    #   15, 16, 17, 18, 19, 20, 21  # left_arm -> right_arm position
+    # ]]
+    
+    # Flattened permutation indices (target_i takes from source_perm[i]):
+    perm_indices = [
+         6,  7,  8,  9, 10, 11,  # 0-5 (L leg)
+         0,  1,  2,  3,  4,  5,  # 6-11 (R leg)
+        12, 13, 14,              # 12-14 (Waist)
+        22, 23, 24, 25, 26, 27, 28, # 15-21 (L arm)
+        15, 16, 17, 18, 19, 20, 21  # 22-28 (R arm)
+    ]
+    new_joints = joints[:, perm_indices]
 
-    # 2. Negate roll/yaw joints (in both the new left and new right blocks)
-    for leg_sl in [LEFT_LEG, RIGHT_LEG]:
-        base_idx = leg_sl.start
-        for off in LEG_NEGATE_OFFSETS:
-            new_joints[:, base_idx + off] *= -1
-
-    for arm_sl in [LEFT_ARM, RIGHT_ARM]:
-        base_idx = arm_sl.start
-        for off in ARM_NEGATE_OFFSETS:
-            new_joints[:, base_idx + off] *= -1
-
-    for off in WAIST_NEGATE_OFFSETS:
-        base_idx = WAIST.start
-        new_joints[:, base_idx + off] *= -1
+    # 2. Negate specified joints based on user feedback
+    # reflection_Q_js: [[
+    #   1, -1, -1, 1, 1, -1,       # left_leg: hip_pitch, hip_roll, hip_yaw, knee, ankle_pitch, ankle_roll
+    #   1, -1, -1, 1, 1, -1,       # right_leg: hip_pitch, hip_roll, hip_yaw, knee, ankle_pitch, ankle_roll
+    #   -1, -1, 1,                 # waist: yaw, roll, pitch
+    #   1, -1, -1, 1, -1, 1, -1,   # left_arm: sh_pitch, sh_roll, sh_yaw, elbow, wr_roll, wr_pitch, wr_yaw
+    #   1, -1, -1, 1, -1, 1, -1    # right_arm: sh_pitch, sh_roll, sh_yaw, elbow, wr_roll, wr_pitch, wr_yaw
+    # ]]
+    reflect_sign = np.array([
+        1, -1, -1, 1, 1, -1,      # L leg
+        1, -1, -1, 1, 1, -1,      # R leg
+       -1, -1,  1,                # Waist
+        1, -1, -1, 1, -1, 1, -1,  # L arm
+        1, -1, -1, 1, -1, 1, -1   # R arm
+    ], dtype=np.float32)
+    
+    new_joints = new_joints * reflect_sign
 
     q[:, 7:36] = new_joints
 
     # ── Object free-joint ────────────────────────────────────────
     q[:, 37] *= -1                          # object y
-    q[:, 39:43] = reflect_quaternion_y(q[:, 39:43])  # object quaternion
+    
+    # Correct quaternion mirroring accounting for geom offset:
+    #   q_new_body = Refl(q_body * q_off) * q_off_inv
+    # This ensures the *Visual* quaternion is mirrored correctly.
+    # Note: If the user provided an XML path, we try to parse q_off from it.
+    
+    # We need XML path for parsing q_off. Ideally we pass it in, but here we can
+    # try to use the default one if possible.
+    single_xml, _ = get_mj_xml_paths()
+    q_off = get_obj_geom_quat(single_xml) # (4,)
+    
+    # Expand q_off to (T, 4) or (1, 4) depending on q shape
+    if q.ndim == 2:
+        q_off_T = np.tile(q_off, (T, 1))
+    else:
+        q_off_T = q_off[None, :]
+
+    q_body_orig = q[:, 39:43]
+    
+    # 1. Compute CURRENT visual quaternion in world frame
+    #    q_vis = q_body * q_off
+    q_vis_orig = quat_mul(q_body_orig, q_off_T)
+    
+    # 2. Reflect visual quaternion
+    #    q_vis_mirr = Refl(q_vis)
+    q_vis_mirr = reflect_quaternion_y(q_vis_orig)
+    
+    # 3. Compute NEW body quaternion
+    #    q_body_mirr = q_vis_mirr * q_off_inv
+    q_off_inv_T = quat_inv(q_off_T)
+    q_body_mirr = quat_mul(q_vis_mirr, q_off_inv_T)
+    
+    q[:, 39:43] = q_body_mirr
 
     if single:
         q = q[0]
@@ -237,6 +294,104 @@ def print_mirror_diagnostics(qpos_orig: np.ndarray, qpos_mirror: np.ndarray):
     print("╚══════════════════════════════════════════════╝\n")
 
 
+# --------------------------------------------------------------------------- #
+# Adaptive XML generation (mirrors batch_goal_sweep.py)
+# --------------------------------------------------------------------------- #
+
+def build_adaptive_xml(base_repeated_xml, num_robots):
+    """
+    Generate a temporary MuJoCo XML with exactly *num_robots* robots by
+    stamping copies of robot-0 from *base_repeated_xml*.
+    Written into the same directory so relative meshdir resolves correctly.
+    """
+    with open(base_repeated_xml) as f:
+        lines = f.readlines()
+
+    robot_starts = [
+        idx for idx, line in enumerate(lines)
+        if re.search(r'body name="pelvis_\d+"', line)
+    ]
+    if not robot_starts:
+        raise ValueError(f"No pelvis_N bodies found in {base_repeated_xml}")
+
+    header = ''.join(lines[: robot_starts[0]])
+    wb_close_idx = next(
+        (i for i, l in enumerate(lines) if '</worldbody>' in l), len(lines)
+    )
+    block_end = robot_starts[1] if len(robot_starts) >= 2 else wb_close_idx
+    template = ''.join(lines[robot_starts[0]: block_end])
+    footer = ''.join(lines[wb_close_idx:])
+
+    robot_blocks = [re.sub(r'_0(?=")', f'_{i}', template) for i in range(num_robots)]
+    xml_content = header + ''.join(robot_blocks) + footer
+
+    source_dir = os.path.dirname(os.path.abspath(base_repeated_xml))
+    tmp = tempfile.NamedTemporaryFile(
+        mode='w', suffix='.xml',
+        prefix=f'mj_adaptive_{num_robots}r_',
+        dir=source_dir,
+        delete=False,
+    )
+    tmp.write(xml_content)
+    tmp.flush()
+    tmp.close()
+    return tmp.name
+
+
+# --------------------------------------------------------------------------- #
+# Quaternion helpers
+# --------------------------------------------------------------------------- #
+
+def get_obj_geom_quat(xml_path=None):
+    """
+    Look for a geom named 'obj' in the XML and return its quaternion offset
+    (w, x, y, z). If not found or if xml_path is None, defaults to the
+    hardcoded value found in unitree_g1/mj_model.xml.
+    """
+    # Hardcoded fallback from the current XML
+    q_default = np.array([0.00991298, 0.849052, -0.523456, 0.0707591], dtype=np.float64)
+
+    if xml_path is None or not os.path.exists(xml_path):
+        return q_default
+
+    try:
+        tree = ET.parse(xml_path)
+        # Search all geoms recursively
+        # (ElementTree 1.3+ supports XPath)
+        for geom in tree.findall(".//geom"):
+            if geom.get("name") == "obj":
+                q_str = geom.get("quat")
+                if q_str:
+                    q_arr = np.fromstring(q_str, sep=' ')
+                    if len(q_arr) == 4:
+                        return q_arr
+    except Exception as e:
+        print(f"Warning: Failed to parse geom 'obj' quat from {xml_path}: {e}")
+
+    return q_default
+
+
+def quat_mul(q1: np.ndarray, q2: np.ndarray) -> np.ndarray:
+    """Hamilton product of two quaternions (w, x, y, z). Broadcasts."""
+    w1, x1, y1, z1 = q1[..., 0], q1[..., 1], q1[..., 2], q1[..., 3]
+    w2, x2, y2, z2 = q2[..., 0], q2[..., 1], q2[..., 2], q2[..., 3]
+
+    w = w1 * w2 - x1 * x2 - y1 * y2 - z1 * z2
+    x = w1 * x2 + x1 * w2 + y1 * z2 - z1 * y2
+    y = w1 * y2 - x1 * z2 + y1 * w2 + z1 * x2
+    z = w1 * z2 + x1 * y2 - y1 * x2 + z1 * w2
+
+    return np.stack([w, x, y, z], axis=-1)
+
+
+def quat_inv(q: np.ndarray) -> np.ndarray:
+    """Inverse of unit quaternion (conjugate): (w, -x, -y, -z)."""
+    # q is (..., 4)
+    inv = q.copy()
+    inv[..., 1:] *= -1
+    return inv
+
+
 # ───────────────────────── main ──────────────────────────────
 
 def main():
@@ -248,10 +403,6 @@ def main():
                         help="Path to a .npz trajectory file")
     parser.add_argument("--idx", type=int, default=None,
                         help="Window index in the dataset (uses FlexibleWindowDataset)")
-    parser.add_argument("--single-xml", type=str, default="mj_model.xml",
-                        help="Path to the single-robot MuJoCo model XML")
-    parser.add_argument("--repeated-xml", type=str, default="./mj_model_repeated.xml",
-                        help="Path to the repeated (multi-robot) MuJoCo model XML")
     parser.add_argument("--offset", type=float, default=1.5,
                         help="Spacing between the two robots in the viewer")
     parser.add_argument("--dt", type=float, default=0.02,
@@ -334,8 +485,7 @@ def main():
     #    apart at a glance.
     from utils.visualize.visualize import DiffusionOverlayVisualizer
 
-    single_xml = args.single_xml
-    repeated_xml = args.repeated_xml
+    single_xml, repeated_xml = get_mj_xml_paths()
 
     if not os.path.exists(single_xml):
         print(f"ERROR: Single model '{single_xml}' not found. Cannot visualise.")
@@ -347,21 +497,30 @@ def main():
     # Shape: (B=2, T, nq_single=43)
     x_trajs = np.stack([qpos, qpos_mirror], axis=0)
 
-    print(f"\nLaunching viewer …")
-    print(f"  Robot 0 (default colour)  = ORIGINAL")
-    print(f"  Robot 1 (sky-blue)        = MIRRORED")
-    print(f"  Spacing = {args.offset}")
-    print(f"Controls:  Space=pause  ←/→=step  R=restart\n")
+    # Use adaptive XML to ensure we have exactly 2 robots (nq=86)
+    print("Generating temporary XML for 2 robots...")
+    adaptive_xml = None
+    try:
+        adaptive_xml = build_adaptive_xml(repeated_xml, 2)
 
-    viz = DiffusionOverlayVisualizer(single_xml)
-    viz.visualize_overlay(
-        x_trajs,
-        repeated_xml_path=repeated_xml,
-        timestep_delay=args.dt,
-        loop=True,
-        spacing=args.offset,
-        ref_start_idx=1,        # mirror copy → sky-blue
-    )
+        print(f"\nLaunching viewer …")
+        print(f"  Robot 0 (default colour)  = ORIGINAL")
+        print(f"  Robot 1 (sky-blue)        = MIRRORED")
+        print(f"  Spacing = {args.offset}")
+        print(f"Controls:  Space=pause  ←/→=step  R=restart\n")
+
+        viz = DiffusionOverlayVisualizer(single_xml)
+        viz.visualize_overlay(
+            x_trajs,
+            repeated_xml_path=adaptive_xml,
+            timestep_delay=args.dt,
+            loop=True,
+            spacing=args.offset,
+            ref_start_idx=1,        # mirror copy → sky-blue
+        )
+    finally:
+        if adaptive_xml and os.path.exists(adaptive_xml):
+            os.unlink(adaptive_xml)
 
 
 if __name__ == "__main__":

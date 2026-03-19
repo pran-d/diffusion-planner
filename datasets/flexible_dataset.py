@@ -368,7 +368,9 @@ class FlexibleWindowDataset(Dataset):
                 T_down = T
 
                 pad_start = self.history_size
-                pad_end = self.window_size - (T_down + pad_start) % self.window_size + self.history_size
+                # Ensure sufficient padding so that the trailing window can have its history 
+                # fully overlapping the end of the real trajectory (future is padding).
+                pad_end = self.window_size + self.history_size
             
                 T_padded = T_down + pad_start + pad_end
                 self.traj_lengths.append(T_padded)
@@ -376,9 +378,11 @@ class FlexibleWindowDataset(Dataset):
                 w_size = self.window_size
                 
                 for b in range(B):
-                    # Restrict to real data: window must start before real data ends
+                    # Restrict to real data: window history part must be valid real data.
+                    # This allows the very last real states to be used as history conditioning
+                    # for a window whose future is entirely padding (stationary target).
                     real_T = real_lengths[b]
-                    max_start = min(T_padded - w_size, real_T + pad_start - w_size)
+                    max_start = min(T_padded - w_size, real_T + pad_start - self.history_size)
                     max_start = max(max_start, 0)
                     
                     if max_start >= 0:
@@ -637,30 +641,41 @@ class FlexibleWindowDataset(Dataset):
         # 5. joints: swap left↔right, negate roll/yaw
         if "joints" in f_map:
             js = f_map["joints"].start
-            # --- permutation (swap left/right blocks) ---
-            # Legs: swap 0-5 ↔ 6-11
-            for i in range(6):
-                perm[js + i], perm[js + 6 + i] = js + 6 + i, js + i
-            # Arms: swap 15-21 ↔ 22-28
-            for i in range(7):
-                perm[js + 15 + i], perm[js + 22 + i] = js + 22 + i, js + 15 + i
-            # Torso (12-14): stays in place
 
-            # --- sign flips (roll & yaw joints negate) ---
-            # Within each 6-DOF leg block: roll=1, yaw=2, ankle_roll=5
-            for base in [0, 6]:  # after permutation both blocks need flips
-                sign[js + base + 1] = -1.0   # hip_roll
-                sign[js + base + 2] = -1.0   # hip_yaw
-                sign[js + base + 5] = -1.0   # ankle_roll
-            # Within each 7-DOF arm block: roll=1, yaw=2, wrist_roll=4, wrist_yaw=6
-            for base in [15, 22]:
-                sign[js + base + 1] = -1.0   # shoulder_roll
-                sign[js + base + 2] = -1.0   # shoulder_yaw
-                sign[js + base + 4] = -1.0   # wrist_roll
-                sign[js + base + 6] = -1.0   # wrist_yaw
-            # Waist: yaw=12, roll=13 negate; pitch=14 stays
-            sign[js + 12] = -1.0  # waist_yaw
-            sign[js + 13] = -1.0  # waist_roll
+            # Explicit permutation based on user specification:
+            #   [0-5]   (L Leg) <- [6-11]  (R Leg)
+            #   [6-11]  (R Leg) <- [0-5]   (L Leg)
+            #   [12-14] (Waist) <- [12-14] (Waist)
+            #   [15-21] (L Arm) <- [22-28] (R Arm)
+            #   [22-28] (R Arm) <- [15-21] (L Arm)
+            perm_indices = [
+                 6,  7,  8,  9, 10, 11,      # 0-5
+                 0,  1,  2,  3,  4,  5,      # 6-11
+                12, 13, 14,                  # 12-14
+                22, 23, 24, 25, 26, 27, 28,  # 15-21
+                15, 16, 17, 18, 19, 20, 21   # 22-28
+            ]
+            for i, p_idx in enumerate(perm_indices):
+                perm[js + i] = js + p_idx
+
+            # Explicit sign flips based on user specification:
+            # reflection_Q_js: [[
+            #   1, -1, -1, 1, 1, -1,       # L leg
+            #   1, -1, -1, 1, 1, -1,       # R leg
+            #   -1, -1, 1,                 # Waist
+            #   1, -1, -1, 1, -1, 1, -1,   # L arm
+            #   1, -1, -1, 1, -1, 1, -1    # R arm
+            # ]]
+            flip_vec = [
+                1, -1, -1, 1, 1, -1,      # 0-5
+                1, -1, -1, 1, 1, -1,      # 6-11
+               -1, -1,  1,                # 12-14
+                1, -1, -1, 1, -1, 1, -1,  # 15-21
+                1, -1, -1, 1, -1, 1, -1   # 22-28
+            ]
+            for i, s_val in enumerate(flip_vec):
+                if s_val == -1:
+                    sign[js + i] = -1.0
 
         # 6. body_z: invariant
 
@@ -693,23 +708,12 @@ class FlexibleWindowDataset(Dataset):
         obs_perm = np.arange(obs_D, dtype=np.int64)
         obs_sign = np.ones(obs_D, dtype=np.float32)
 
-        # Joints (0-28): same permutation & sign logic, offset = 0
-        for i in range(6):
-            obs_perm[i], obs_perm[6 + i] = 6 + i, i
-        for i in range(7):
-            obs_perm[15 + i], obs_perm[22 + i] = 22 + i, 15 + i
-
-        for base in [0, 6]:
-            obs_sign[base + 1] = -1.0
-            obs_sign[base + 2] = -1.0
-            obs_sign[base + 5] = -1.0
-        for base in [15, 22]:
-            obs_sign[base + 1] = -1.0
-            obs_sign[base + 2] = -1.0
-            obs_sign[base + 4] = -1.0
-            obs_sign[base + 6] = -1.0
-        obs_sign[12] = -1.0  # waist_yaw
-        obs_sign[13] = -1.0  # waist_roll
+        # Joints (0-28): reuse explicit values from user spec
+        for i, p_idx in enumerate(perm_indices):
+            obs_perm[i] = p_idx
+        for i, s_val in enumerate(flip_vec):
+            if s_val == -1:
+                obs_sign[i] = -1.0
 
         # body_z (29): invariant
         # body_rot6d (30-35)
@@ -908,6 +912,23 @@ class FlexibleWindowDataset(Dataset):
         # Compute features
         features, anchor = self._compute_transform(raw_traj, t_start)
 
+        # Mirror symmetry augmentation (Raw Feature Space)
+        if self.mirror_enabled and torch.rand(1).item() < self.mirror_prob:
+            self._mirror_raw_features(features)
+            
+            # Mirror Anchor (must copy to avoid modifying cache)
+            anchor = {k: v.copy() for k, v in anchor.items()}
+            
+            if 'ref_pos' in anchor:
+                anchor['ref_pos'][1] *= -1.0
+            if 'ref_obj_pos' in anchor:
+                anchor['ref_obj_pos'][1] *= -1.0
+            if 'final_obj_pos' in anchor:
+                anchor['final_obj_pos'][1] *= -1.0
+            if 'ref_quat' in anchor:
+                anchor['ref_quat'][1] *= -1.0
+                anchor['ref_quat'][3] *= -1.0
+
         # Assemble Windowed Feature Vector
         window_parts = []
         for key in self.feature_order:
@@ -934,11 +955,6 @@ class FlexibleWindowDataset(Dataset):
         if self.add_goal_noise:
             task_params = self._add_obs_noise(task_params, "task_params")
 
-        # Mirror symmetry augmentation (C2 sagittal-plane reflection)
-        if self.mirror_enabled and torch.rand(1).item() < self.mirror_prob:
-            future_states, current_state, task_params = self._apply_mirror_symmetry(
-                future_states, current_state, task_params
-            )
 
         return future_states, current_state, task_params, anchor
 
@@ -1181,3 +1197,91 @@ class FlexibleWindowDataset(Dataset):
 
     def __len__(self):
         return len(self.indices)
+    
+    def _mirror_raw_features(self, features):
+        """
+        Apply mirror symmetry to raw feature arrays (in-place modification).
+        Mirroring happens BEFORE normalization to avoid statistical bias from 
+        normalized distributions of swapped antisymmetric joints.
+        """
+        # 1. Joints: Swap L/R and Negate Roll/Yaw
+        if "joints" in features:
+            perm_indices = [
+                 6,  7,  8,  9, 10, 11,      # 0-5
+                 0,  1,  2,  3,  4,  5,      # 6-11
+                12, 13, 14,                  # 12-14
+                22, 23, 24, 25, 26, 27, 28,  # 15-21
+                15, 16, 17, 18, 19, 20, 21   # 22-28
+            ]
+            flip_vec = [
+                1, -1, -1, 1, 1, -1,      # 0-5
+                1, -1, -1, 1, 1, -1,      # 6-11
+               -1, -1,  1,                # 12-14
+                1, -1, -1, 1, -1, 1, -1,  # 15-21
+                1, -1, -1, 1, -1, 1, -1   # 22-28
+            ]
+            
+            # Apply permutation (Advanced indexing returns a copy)
+            joints = features["joints"]
+            joints = joints[..., perm_indices]
+            
+            # Apply sign
+            sign = np.array(flip_vec, dtype=joints.dtype)
+            joints = joints * sign
+            
+            features["joints"] = joints
+
+        # 2. Simple flips (Negate Y or specific indices)
+        # Lists of (key, indices_to_negate)
+        negate_tasks = [
+            ("delta_xy", [1]),
+            ("delta_yaw", [0]),
+            ("obj_delta_xy", [1]),
+            ("obj_rel_pos", [1]),
+            ("task_params", [1]), 
+            ("body_rot6d", [1, 3, 5]),
+            # ("obj_rel_rot6d", [1, 3, 5]),  # Handled separately below with geom offset
+        ]
+        
+        for key, indices in negate_tasks:
+            if key in features:
+                # In-place negation
+                # Ensure we have a copy first if it might be a view? 
+                # features are usually copies from compute_sbto_components.
+                features[key][..., indices] *= -1.0
+
+        # 3. Object Orientation Mirroring (with Geom Offset Correction)
+        # The object BODY frame is mirrored, but we must account for the fixed GEOM offset
+        # so that the VISUAL object is mirrored correctly.
+        # R_new = M @ (R_rel @ R_off) @ M @ R_off.T
+        if "obj_rel_rot6d" in features:
+            # Hardcoded offset from unitree_g1/mj_model.xml
+            # q_off = [0.00991298, 0.849052, -0.523456, 0.0707591] (w, x, y, z)
+            q_off = np.array([0.00991298, 0.849052, -0.523456, 0.0707591], dtype=np.float64)
+            
+            # Get R_off (3x3)
+            # quat_to_rot expects (..., 4)
+            R_off = quat_to_rot(q_off[None, :])[0] # (3, 3)
+            R_off_T = R_off.T
+            
+            # Mirror Matrix M = diag(1, -1, 1)
+            M = np.diag([1, -1, 1]).astype(np.float64)
+            
+            # Convert obj_rel_rot6d to R_rel
+            obj_rot6d = features["obj_rel_rot6d"] # (..., 6)
+            input_shape = obj_rot6d.shape
+            obj_rot6d_flat = obj_rot6d.reshape(-1, 6)
+            R_rel = rot6d_to_rot(obj_rot6d_flat) # (N, 3, 3)
+            
+            # Compute R_new
+            # R_vis = R_rel @ R_off
+            R_vis = np.matmul(R_rel, R_off) 
+            # R_vis_mirr = M @ R_vis @ M
+            R_vis_mirr = np.matmul(M, np.matmul(R_vis, M))
+            
+            # R_new = R_vis_mirr @ R_off.T
+            R_new = np.matmul(R_vis_mirr, R_off_T)
+            
+            # Convert back to 6d
+            obj_rot6d_new = rot_to_6d(R_new)
+            features["obj_rel_rot6d"] = obj_rot6d_new.reshape(input_shape).astype(obj_rot6d.dtype)

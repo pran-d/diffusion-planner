@@ -199,7 +199,7 @@ def main():
     # When the user supplied --task_params we calibrate from the goal distance
     # so the trajectory is long enough to actually reach it.
     if args.stitch_steps is None and args.target_traj_length is None:
-        _eff = data_cfg["num_timesteps"] - 1
+        _eff = max(1, data_cfg["num_timesteps"] - data_cfg.get("state_history", 1))
         traj_len = dataset.traj_lengths[args.traj_idx]
         base_steps = max(1, math.ceil(traj_len / _eff))
 

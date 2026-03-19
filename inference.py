@@ -549,8 +549,7 @@ def main():
     )
 
     from utils.visualize.visualize import MjVisualizer
-    cfg_xml_path, _ = get_mj_xml_paths()
-    xml_path = cfg_xml_path
+    xml_path, _ = get_mj_xml_paths()
     if not os.path.exists(xml_path):
         fallback_xml = "mj_model.xml"
         data_xml = os.path.join(data_path, "mj_model.xml")
@@ -616,7 +615,8 @@ def main():
     task_tens = task_params.repeat(args.num_samples, 1)
 
     if args.stitch_steps is None:
-        _eff = data_cfg["num_timesteps"] - 1  # t=0 always skipped; each window yields (T-1) frames
+        # t=0..H-1 are conditioning/overlap; H..T-1 are new frames
+        _eff = max(1, data_cfg["num_timesteps"] - data_cfg.get("state_history", 1))
         args.stitch_steps = (dataset.traj_lengths[args.traj_idx] + _eff - 1) // _eff
         print(f"Auto-setting stitch_steps to {args.stitch_steps} based on dataset length.")
 
@@ -846,7 +846,7 @@ def main():
 
             if args.visualize_dataset: 
                 # Update Task Params and anchor for next window from ground truth
-                next_start = current_start_time + (step + 1) * dataset.window_size
+                next_start = current_start_time + (step + 1) * (dataset.window_size - dataset.history_size)
                 target_key = (current_file_idx, current_batch_idx, next_start)
                 if target_key in index_map:
                     next_idx = index_map[target_key]

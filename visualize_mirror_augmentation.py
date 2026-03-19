@@ -299,12 +299,12 @@ def main():
     if js is not None:
         orig_j_np = future_orig_np[:, js]
         mirr_j_np = future_mirr_np[:, js]
-     _check("feature-space: left_hip_pitch ≈ mirror right_hip_pitch",
-         orig_j_np[:, 0], mirr_j_np[:, 6], expect_sign=+1)
-     _check("feature-space: left_hip_roll ≈ -mirror right_hip_roll",
-         orig_j_np[:, 1], mirr_j_np[:, 7], expect_sign=-1)
-     _check("feature-space: waist_yaw negated",
-         orig_j_np[:, 12], mirr_j_np[:, 12], expect_sign=-1)
+    _check("feature-space: left_hip_pitch ≈ mirror right_hip_pitch", 
+        orig_j_np[:, 0], mirr_j_np[:, 6], expect_sign=+1)
+    _check("feature-space: left_hip_roll ≈ -mirror right_hip_roll",
+        orig_j_np[:, 1], mirr_j_np[:, 7], expect_sign=-1)
+    _check("feature-space: waist_yaw negated",
+        orig_j_np[:, 12], mirr_j_np[:, 12], expect_sign=-1)
 
     if xy_sl:
         _check("delta_x unchanged?",
