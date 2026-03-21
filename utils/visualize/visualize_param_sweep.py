@@ -14,7 +14,7 @@ from utils.data.load_dataset import preload_dataset
 from utils.math.sbto_utils import reconstruct_sbto_trajectory, compute_task_params
 from utils.physics_limits import apply_physics_clamp
 from utils.visualize.visualize import MjVisualizer
-from inference import build_inference_waypoints, DEFAULT_LIFT_HEIGHT, run_visualization
+from utils.inference_utils import build_inference_waypoints, DEFAULT_LIFT_HEIGHT, run_visualization
 
 def update_condition(dataset, robot_world_history, obj_world_history, final_obj_pos=None):
     """

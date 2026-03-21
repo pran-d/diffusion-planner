@@ -21,7 +21,7 @@ from datasets.flexible_dataset import FlexibleWindowDataset
 from utils.math.sbto_utils import reconstruct_sbto_trajectory, compute_task_params
 from utils.math.math_tools import yaw_from_quat, yaw_to_rot_matrix
 from utils.physics_limits import apply_physics_clamp
-from inference import build_inference_waypoints
+from utils.inference_utils import build_inference_waypoints
 from diffusers import EMAModel
 
 

@@ -80,22 +80,22 @@ mg.fit(
 
 There are two ways to run inference for the motion-planner module.
 
-### 1. `inference.py` — standalone script
+### 1. `inference_mg.py` — standalone script (single supported inference entry point)
 
 Full control over the autoregressive loop, waypoints, and visualisation:
 
 ```bash
 # Basic generation with MuJoCo visualisation
-python inference.py --epoch 500 --traj_idx 0 --batch_idx 0 --stitch_steps 10
+python inference_mg.py --epoch 500 --traj_idx 0 --batch_idx 0 --stitch_steps 10
 
 # Use EMA weights
-python inference.py --epoch 500 --ema --stitch_steps 10
+python inference_mg.py --epoch 500 --ema --stitch_steps 10
 
 # Custom goal in local frame
-python inference.py --epoch 500 --task_params 0.5 -0.3 --stitch_steps 8
+python inference_mg.py --epoch 500 --task_params 0.5 -0.3 --stitch_steps 8
 
 # With waypoint conditioning and early goal stop
-python inference.py --epoch 500 --ema --stitch_steps 15 \
+python inference_mg.py --epoch 500 --ema --stitch_steps 15 \
     --last_frame_waypoint --enable_goal_stop --cfg_w 1.5
 ```
 
@@ -112,6 +112,8 @@ Key flags:
 | `--end_error_threshold R` | XY radius (m) for goal-reached check |
 | `--end_ground_num_frames N` | Consecutive on-ground frames before stopping |
 | `--goal_multiplier M` | Scale goal displacement from base traj |
+| `--save_path results/run_01.npz` | Save full trajectory bundle as `.npz` |
+| `--metrics_log_path results/inference_metrics.jsonl` | Append goal direction/magnitude/error and generation time |
 
 
 ### 2. MotionGenerator Python API
@@ -193,11 +195,21 @@ All settings live in `config/config.yaml`. Key sections:
 Generated trajectories can be played back in MuJoCo:
 
 ```bash
-# inference.py includes built-in visualisation
-python inference.py --epoch 500 --ema --stitch_steps 10
+# inference_mg.py includes built-in visualisation
+python inference_mg.py --epoch 500 --ema --stitch_steps 10
 
 # Batch goal sweep with multi-trajectory overlay
 python batch_goal_sweep.py --epoch 500 --traj_idx 0 --num_goals 6
+```
+
+Offline NPZ tools:
+
+```bash
+# Plot XY/Z/yaw + hand-object distances
+python plot_trajectory_npz.py --npz_path results/inference_mg.npz
+
+# Visualize copied NPZ trajectory later on laptop
+python visualize_trajectory_npz.py --npz_path results/inference_mg.npz
 ```
 
 **MuJoCo viewer controls**: `SPACE` pause/play · `→` step forward · `←` step back · `ESC` exit

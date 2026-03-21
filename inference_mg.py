@@ -1,7 +1,7 @@
 """
 Inference script that uses MotionGenerator as the single entry point.
 
-This mirrors inference.py but delegates all autoregressive loop logic,
+This is the primary standalone inference entry point and delegates all autoregressive loop logic,
 waypoint construction, and SBTO reconstruction to MotionGenerator.generate_trajectory().
 
 Usage:
@@ -13,18 +13,25 @@ Usage:
 import argparse
 import os
 import math
+import json
+import time
+from datetime import datetime, timezone
 
 import numpy as np
 import torch
-import yaml
 
-from config.configure import load_config, get_data_path, get_norm_path, get_mj_xml_paths
+from config.configure import get_data_path, get_norm_path, get_mj_xml_paths
 from datasets.flexible_dataset import FlexibleWindowDataset
 from utils.data.load_dataset import preload_dataset
-from utils.math.sbto_utils import build_feature_layout
 from utils.math.math_tools import yaw_from_quat, yaw_to_rot_matrix
 from motion_generator import MotionGenerator
-from inference import DEFAULT_LIFT_HEIGHT
+from utils.inference_utils import DEFAULT_LIFT_HEIGHT
+
+
+def _append_jsonl(path, record):
+    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+    with open(path, "a", encoding="utf-8") as f:
+        f.write(json.dumps(record) + "\n")
 
 
 def extract_initial_condition(dataset, sample_idx, num_task_params):
@@ -93,7 +100,9 @@ def main():
                         help="Number of autoregressive segments (auto-computed if omitted)")
     parser.add_argument("--target_traj_length", type=int, default=None,
                         help="Desired output trajectory length; used to auto-compute stitch_steps")
-    parser.add_argument("--save_path", type=str, default="results/inference_mg.npy")
+    parser.add_argument("--save_path", type=str, default="results/inference_mg.npz")
+    parser.add_argument("--metrics_log_path", type=str, default="results/inference_metrics.jsonl",
+                        help="Append per-run goal/error/timing metrics as JSONL")
     parser.add_argument("--traj_idx", type=int, default=0,
                         help="Trajectory (file) index")
     parser.add_argument("--batch_idx", type=int, default=0,
@@ -222,7 +231,7 @@ def main():
     # Scale goal if requested (AFTER auto-computing stitch_steps so we can scale them too)
     if args.goal_multiplier != 1.0:
         goal_local = goal_local * args.goal_multiplier
-        # Scale stitch_steps to match the longer/shorter distance (matches inference.py)
+        # Scale stitch_steps to match the longer/shorter distance.
         if args.stitch_steps is not None:
             args.stitch_steps = max(1, int(args.stitch_steps * abs(args.goal_multiplier)))
         print(f"Scaled goal by {args.goal_multiplier} → {goal_local} "
@@ -234,7 +243,8 @@ def main():
     print(f"Anchor final_obj_pos (world): {anchor['final_obj_pos']}")
 
     # ─── 5. Generate ──────────────────────────────────────────────────────────
-    result, _ = mg.generate_trajectory(
+    t0 = time.perf_counter()
+    result, real_lengths = mg.generate_trajectory(
         initial_condition=initial_condition,
         goal_condition=goal_local,
         target_traj_length=args.target_traj_length,
@@ -255,12 +265,14 @@ def main():
         lift_end=args.lift_end,
         walk_start_z=args.walk_start_z,
     )
+    gen_time_s = time.perf_counter() - t0
     full_trajectory = result
 
     # ─── 6. Save ──────────────────────────────────────────────────────────────
-    os.makedirs(os.path.dirname(args.save_path) or ".", exist_ok=True)
-    np.save(args.save_path, full_trajectory)
-    print(f"Trajectory saved to {args.save_path}  (shape: {full_trajectory.shape})")
+    save_path = args.save_path
+    if not save_path.endswith(".npz"):
+        save_path = f"{save_path}.npz"
+    os.makedirs(os.path.dirname(save_path) or ".", exist_ok=True)
 
     # ─── 7. Compute goal world position from (possibly scaled) goal_local ───
     init_base_quat = initial_condition['robot'][0, 3:7]
@@ -273,17 +285,60 @@ def main():
     print(f"Goal world position: {goal_world}")
 
     # ─── 8. Report ────────────────────────────────────────────────────────────
+    err = float("nan")
+    desired = None
+    achieved = None
     if full_trajectory.shape[-1] >= 43:
         start_obj = full_trajectory[0, 0, 36:36 + num_task_params]
-        end_obj = full_trajectory[0, -1, 36:36 + num_task_params]
+        end_idx = int(real_lengths[0] - 1) if len(real_lengths) > 0 else -1
+        end_obj = full_trajectory[0, end_idx, 36:36 + num_task_params]
         achieved = end_obj - start_obj
         desired = (goal_world - init_obj_pos)[:num_task_params]
-        err = np.linalg.norm(desired - achieved)
+        err = float(np.linalg.norm(desired - achieved))
         print("-" * 40)
         print(f"Desired displacement  (world): {desired}")
         print(f"Achieved displacement (world): {achieved}")
         print(f"L2 error: {err:.4f}")
         print("-" * 40)
+
+    np.savez_compressed(
+        save_path,
+        trajectory=full_trajectory,
+        real_lengths=np.asarray(real_lengths),
+        goal_local=np.asarray(goal_local),
+        goal_world=np.asarray(goal_world),
+        init_robot=np.asarray(initial_condition['robot']),
+        init_obj=np.asarray(initial_condition['obj']),
+        traj_idx=np.array([args.traj_idx], dtype=np.int64),
+        batch_idx=np.array([args.batch_idx], dtype=np.int64),
+        start_time=np.array([args.start_time], dtype=np.int64),
+    )
+    print(f"Trajectory bundle saved to {save_path}  (shape: {full_trajectory.shape})")
+
+    # ─── 8.1 Metrics logging ─────────────────────────────────────────────────
+    goal_xy = np.asarray(goal_local[:2], dtype=np.float64)
+    goal_mag = float(np.linalg.norm(goal_xy))
+    if goal_mag > 1e-9:
+        goal_dir = (goal_xy / goal_mag).tolist()
+    else:
+        goal_dir = [0.0, 0.0]
+    metrics_record = {
+        "timestamp_utc": datetime.now(timezone.utc).isoformat(),
+        "script": "inference_mg.py",
+        "checkpoint": args.epoch,
+        "ema": bool(args.ema),
+        "traj_idx": int(args.traj_idx),
+        "batch_idx": int(args.batch_idx),
+        "start_time": int(args.start_time),
+        "goal_local": np.asarray(goal_local, dtype=float).tolist(),
+        "goal_direction_xy": goal_dir,
+        "goal_magnitude_xy": goal_mag,
+        "error_l2": err,
+        "generation_time_s": float(gen_time_s),
+        "save_path": save_path,
+    }
+    _append_jsonl(args.metrics_log_path, metrics_record)
+    print(f"Metrics appended to {args.metrics_log_path}")
 
     # ─── 9. Build per-frame guidance vector for the arrow visualisation ───────
     #   guidance_vec: (T_total, 2+) — world-frame direction from current object

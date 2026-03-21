@@ -288,7 +288,7 @@ This ensures the generated trajectory starts from the actual robot state.
 
 ## Part 4: Autoregressive Inference with Window Stitching
 
-**Location:** `inference.py` (~873 lines)
+**Location:** `inference_mg.py` + `motion_generator.py` + `utils/inference_utils.py`
 
 For generating long trajectories beyond the 20-timestep window, an **autoregressive stitching** approach is used.
 

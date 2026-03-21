@@ -54,7 +54,7 @@ from datasets.flexible_dataset import FlexibleWindowDataset
 from utils.data.load_dataset import preload_dataset
 from utils.math.math_tools import yaw_from_quat, yaw_to_rot_matrix
 from motion_generator import MotionGenerator
-from inference import DEFAULT_LIFT_HEIGHT
+from utils.inference_utils import DEFAULT_LIFT_HEIGHT
 from batch_goal_sweep import run_goal_sweep
 
 
@@ -699,6 +699,18 @@ def main():
                             "achieved_displacements"]:
                     np.save(os.path.join(abl_dir, f"{key}.npy"), result[key])
                 np.save(os.path.join(abl_dir, "ref_obj_pos.npy"), result["ref_obj_pos"])
+                np.savez_compressed(
+                    os.path.join(abl_dir, "goal_sweep_results.npz"),
+                    trajectories=result["full_traj"],
+                    goals_world=result["goals_world"],
+                    goals_local=result["goals_local"],
+                    errors=result["errors"],
+                    real_lengths=result["real_lengths"],
+                    desired_displacements=result["desired_displacements"],
+                    achieved_displacements=result["achieved_displacements"],
+                    ref_obj_pos=result["ref_obj_pos"],
+                    per_goal_time_s=result.get("per_goal_time_s", np.zeros_like(result["errors"])),
+                )
 
                 # ── Per-ablation plots ───────────────────────────────────────
                 plot_polar_error(result, abl_name,

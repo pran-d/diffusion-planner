@@ -18,6 +18,9 @@ import math
 import os
 import re
 import tempfile
+import json
+import time
+from datetime import datetime, timezone
 
 import numpy as np
 import torch
@@ -28,7 +31,7 @@ from utils.data.load_dataset import preload_dataset
 from utils.math.math_tools import yaw_from_quat, yaw_to_rot_matrix
 from utils.visualize.visualize import MjVisualizer, DiffusionOverlayVisualizer
 from motion_generator import MotionGenerator
-from inference import DEFAULT_LIFT_HEIGHT
+from utils.inference_utils import DEFAULT_LIFT_HEIGHT
 from inference_mg import extract_initial_condition
 
 
@@ -88,6 +91,8 @@ def parse_args():
     # Output
     parser.add_argument("--save_dir", type=str, default="results/goal_sweep",
                         help="Directory to save results into")
+    parser.add_argument("--metrics_log_path", type=str, default="results/inference_metrics.jsonl",
+                        help="Append per-goal metrics and generation timing as JSONL")
     parser.add_argument("--visualize", action="store_true",
                         help="Open MuJoCo viewer after generation")
     parser.add_argument("--video", action="store_true",
@@ -319,6 +324,7 @@ def run_goal_sweep(mg, dataset, args):
     # -- Run inference (batched) -------------------------------------------
     batch_size = getattr(args, 'batch_size', None) or N  # default: all at once
     all_trajs, all_real_lengths = [], []
+    per_goal_time_s = []
 
     for b_start in range(0, N, batch_size):
         b_end = min(b_start + batch_size, N)
@@ -331,6 +337,7 @@ def run_goal_sweep(mg, dataset, args):
             'obj':   np.tile(initial_condition['obj'],   (bs, 1, 1)),  # (bs, H, 7)
         }
 
+        t0 = time.perf_counter()
         traj, rl = mg.generate_trajectory(
             initial_condition=ic_batch,
             goal_condition=goals_local[b_start:b_end],  # (bs, D)
@@ -349,10 +356,13 @@ def run_goal_sweep(mg, dataset, args):
             walk_start_z=getattr(args, 'walk_start_z', 0.80),
             no_lower_dist=getattr(args, 'no_lower_dist', 0.4),
         )
+        elapsed = time.perf_counter() - t0
+        per_traj_elapsed = elapsed / max(bs, 1)
         # traj: (bs, T, 43),  rl: (bs,)
         for j in range(bs):
             all_trajs.append(traj[j])
             all_real_lengths.append(int(rl[j]))
+            per_goal_time_s.append(float(per_traj_elapsed))
 
     full_traj = np.stack(all_trajs)  # (N, T, 43)
     real_lengths = np.array(all_real_lengths)
@@ -377,6 +387,7 @@ def run_goal_sweep(mg, dataset, args):
         "goals_local": goals_local,
         "errors": np.array(errors),
         "real_lengths": real_lengths,
+        "per_goal_time_s": np.array(per_goal_time_s, dtype=np.float64),
         "ref_obj_pos": ref_obj_pos,
         "desired_displacements": np.array(desired_displacements),
         "achieved_displacements": np.array(achieved_displacements),
@@ -443,6 +454,64 @@ def main():
                 "real_lengths", "desired_displacements", "achieved_displacements"]:
         np.save(os.path.join(args.save_dir, f"{key}.npy"), result[key])
     np.save(os.path.join(args.save_dir, "ref_obj_pos.npy"), ref_obj_pos)
+
+    # Aggregate NPZ for portable downstream plotting/visualisation.
+    aggregate_npz = os.path.join(args.save_dir, "goal_sweep_results.npz")
+    np.savez_compressed(
+        aggregate_npz,
+        trajectories=result["full_traj"],
+        goals_world=result["goals_world"],
+        goals_local=result["goals_local"],
+        errors=result["errors"],
+        real_lengths=result["real_lengths"],
+        desired_displacements=result["desired_displacements"],
+        achieved_displacements=result["achieved_displacements"],
+        per_goal_time_s=result.get("per_goal_time_s", np.zeros_like(result["errors"])),
+        ref_obj_pos=ref_obj_pos,
+    )
+
+    # Individual trajectory NPZ files.
+    for i in range(N):
+        traj_npz = os.path.join(args.save_dir, f"trajectory_{i:03d}.npz")
+        np.savez_compressed(
+            traj_npz,
+            trajectory=result["full_traj"][i],
+            real_length=np.array([result["real_lengths"][i]], dtype=np.int64),
+            goal_world=result["goals_world"][i],
+            goal_local=result["goals_local"][i],
+            desired_displacement=result["desired_displacements"][i],
+            achieved_displacement=result["achieved_displacements"][i],
+            error=np.array([result["errors"][i]], dtype=np.float64),
+            generation_time_s=np.array([result.get("per_goal_time_s", np.zeros(N))[i]], dtype=np.float64),
+        )
+
+    # Per-goal metrics log (JSONL append).
+    os.makedirs(os.path.dirname(args.metrics_log_path) or ".", exist_ok=True)
+    now_iso = datetime.now(timezone.utc).isoformat()
+    for i in range(N):
+        dxy = result["desired_displacements"][i]
+        mag = float(np.linalg.norm(dxy))
+        direction = (dxy / mag).tolist() if mag > 1e-9 else [0.0, 0.0]
+        rec = {
+            "timestamp_utc": now_iso,
+            "script": "batch_goal_sweep.py",
+            "checkpoint": args.epoch,
+            "ema": bool(args.ema),
+            "goal_index": int(i),
+            "traj_idx": int(args.traj_idx),
+            "batch_idx": int(args.batch_idx),
+            "start_time": int(args.start_time),
+            "goal_world": result["goals_world"][i].tolist(),
+            "goal_local": result["goals_local"][i].tolist(),
+            "goal_direction_xy": direction,
+            "goal_magnitude_xy": mag,
+            "error": float(result["errors"][i]),
+            "generation_time_s": float(result.get("per_goal_time_s", np.zeros(N))[i]),
+            "trajectory_path": os.path.join(args.save_dir, f"trajectory_{i:03d}.npz"),
+        }
+        with open(args.metrics_log_path, "a", encoding="utf-8") as f:
+            f.write(json.dumps(rec) + "\n")
+
     print(f"Saved to {args.save_dir}/")
 
     # -- 6. Visualise ------------------------------------------------------

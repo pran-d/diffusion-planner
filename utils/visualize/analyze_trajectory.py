@@ -440,7 +440,7 @@ def main():
     )
     parser.add_argument(
         "analysis_path", type=str,
-        help="Path to *_analysis.npz saved by inference.py",
+        help="Path to *_analysis.npz saved by inference_mg.py",
     )
     parser.add_argument(
         "--mode", type=str, default="all",
