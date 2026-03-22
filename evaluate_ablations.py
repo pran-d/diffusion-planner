@@ -198,8 +198,8 @@ def plot_per_ablation_displacement(result: dict, name: str, out_path: str):
     2-D quiver showing desired (blue) and achieved (red) displacement vectors
     for a single ablation.
     """
-    desired = result["desired_displacements"]
-    achieved = result["achieved_displacements"]
+    desired = result["desired_displacements"][..., :2]
+    achieved = result["achieved_displacements"][..., :2]
 
     fig, ax = plt.subplots(figsize=(6, 6))
     N = len(desired)
@@ -563,6 +563,7 @@ def parse_args(argv=None):
     # Goal sweep params
     p.add_argument("--num_goals",        type=int,   default=12)
     p.add_argument("--goal_spread",      type=float, default=0.5)
+    p.add_argument("--goal_z_offset",    type=float, default=0.0)
     p.add_argument("--goal_multiplier",  type=float, default=1.0)
     p.add_argument("--include_original", action="store_true")
     p.add_argument("--seed",             type=int,   default=42)

@@ -9,9 +9,7 @@ from torch.nn import functional as F
 from torch.utils.data import DataLoader, WeightedRandomSampler
 from torch.utils.tensorboard import SummaryWriter
 from torch.amp import GradScaler
-from tqdm import tqdm
 from matplotlib import pyplot as plt
-from tqdm import tqdm
 import os
 import yaml
 import mujoco
@@ -67,7 +65,7 @@ def compute_dataset_weights(dataset, sigma=0.2):
     tp_list = []
     key_list = []
         
-    for f, b in tqdm(unique_traj_keys, desc="Extracting Task Params"):
+    for f, b in unique_traj_keys:
         raw = dataset._get_single_traj(f, b)
         tp_raw = dataset._compute_task_params(raw['base'], raw['obj'], start_idx=0)
         
@@ -368,11 +366,7 @@ best_phys_epoch      = -1
 for epoch in range(starting_epoch, num_epochs):
     epoch_losses = []
 
-    total_batches = training_cfg.get("batches_per_epoch", len(train_dataloader))
-    
-    pbar = tqdm(enumerate(train_dataloader), total=total_batches, desc=f"Epoch {epoch}/{num_epochs-1}")
-
-    for step, batch in pbar:
+    for step, batch in enumerate(train_dataloader):
         
         if training_cfg.get("batches_per_epoch", False) and step >= training_cfg["batches_per_epoch"]:
             break
@@ -481,7 +475,6 @@ for epoch in range(starting_epoch, num_epochs):
 
         # use ema to update the model average
         ema.step(diffuser.model.parameters())
-        ema.step(diffuser.model.parameters())
         
         losses.append(loss.item())
         epoch_losses.append(loss.item())
@@ -493,9 +486,14 @@ for epoch in range(starting_epoch, num_epochs):
         for aux_name, aux_val in aux_losses.items():
             writer.add_scalar(f"Loss/{aux_name}", aux_val.item(), global_step)
 
-        pbar.set_postfix({
-            "Mean loss": f"{np.mean(epoch_losses).item():.5f}"
-        })
+        if step % 100 == 0:
+            aux_val = aux_total.item() if isinstance(aux_total, torch.Tensor) else float(aux_total)
+            print(
+                f"Epoch {epoch}/{num_epochs-1} Step {step}: "
+                f"loss={loss.item():.4f}, "
+                f"pred_loss={pred_loss.mean().item():.4f}, "
+                f"aux={aux_val:.4f}"
+            )
 
     # Epoch summary
     mean_loss = np.mean(epoch_losses)

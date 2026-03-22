@@ -64,6 +64,8 @@ def parse_args(argv=None):
                         help="Number of goals on the concentric circles (default: 12)")
     parser.add_argument("--goal_spread",     type=float, default=0.5,
                         help="Outer-ring radius in metres (default: 0.5)")
+    parser.add_argument("--goal_z_offset",   type=float, default=0.0,
+                        help="Constant z offset (m) added to generated goals")
     parser.add_argument("--goal_multiplier", type=float, default=1.0,
                         help="Scale every goal displacement by this factor")
     parser.add_argument("--include_original", action="store_true",
@@ -290,8 +292,9 @@ def run_goal_sweep(mg, dataset, args):
         raise ValueError(f"Index tuple {target} not in dataset.indices")
 
     num_task_params = data_cfg.get("num_task_params", 3)
+    local_goal_dim = min(3, num_task_params)
     initial_condition, goal_local_orig, anchor, file_idx, _, _ = \
-        extract_initial_condition(dataset, sample_idx, num_task_params)
+        extract_initial_condition(dataset, sample_idx, local_goal_dim)
 
     ref_obj_pos = initial_condition['obj'][0, :3].copy()
     init_base_quat = initial_condition['robot'][0, 3:7]
@@ -300,7 +303,12 @@ def run_goal_sweep(mg, dataset, args):
     R_world_to_local = yaw_to_rot_matrix(-yaw)
 
     # -- Generate goals ----------------------------------------------------
-    goals_world = generate_goals_3ring(ref_obj_pos, args.num_goals, args.goal_spread)
+    goals_world = generate_goals_3ring(
+        ref_obj_pos,
+        args.num_goals,
+        args.goal_spread,
+        z_height=ref_obj_pos[2] + float(getattr(args, 'goal_z_offset', 0.0)),
+    )
     if getattr(args, 'include_original', False):
         g0_3d = np.zeros(3, dtype=np.float64)
         g0_3d[:len(goal_local_orig)] = goal_local_orig
@@ -310,17 +318,17 @@ def run_goal_sweep(mg, dataset, args):
     N = len(goals_world)
 
     # Convert to local displacements
-    goals_local = np.zeros((N, num_task_params), dtype=np.float64)
+    goals_local = np.zeros((N, local_goal_dim), dtype=np.float64)
     for i in range(N):
         delta_w = goals_world[i, :3] - ref_obj_pos[:3]
         delta_l = (R_world_to_local @ delta_w[:, None])[:, 0]
-        goals_local[i] = delta_l[:num_task_params]
+        goals_local[i] = delta_l[:local_goal_dim]
 
     if args.goal_multiplier != 1.0:
         goals_local *= args.goal_multiplier
         for i in range(N):
             g3d = np.zeros(3, dtype=np.float64)
-            g3d[:num_task_params] = goals_local[i]
+            g3d[:local_goal_dim] = goals_local[i]
             goals_world[i] = (R_local_to_world @ g3d[:, None])[:, 0] + ref_obj_pos
 
     # -- Auto stitch_steps -------------------------------------------------
@@ -334,6 +342,9 @@ def run_goal_sweep(mg, dataset, args):
         ref_dist = orig_dist if orig_dist > 0.1 else args.goal_spread
         m_per_step = max(ref_dist / base_steps, 0.05)
         stitch_steps = max(base_steps, math.ceil(max_dist / m_per_step))
+
+    _eff_horizon = max(1, data_cfg["num_timesteps"] - data_cfg.get("state_history", 1))
+    planning_horizon_s = _eff_horizon * 0.01
 
     # -- Run inference (batched) -------------------------------------------
     batch_size = getattr(args, 'batch_size', None) or N  # default: all at once
@@ -387,12 +398,12 @@ def run_goal_sweep(mg, dataset, args):
     achieved_displacements = []
     for i in range(N):
         rl_i = real_lengths[i]
-        final_pos = full_traj[i, rl_i - 1, 36:38]
-        goal_xy = goals_world[i, :2]
-        err = np.linalg.norm(goal_xy - final_pos)
+        final_pos = full_traj[i, rl_i - 1, 36:39]
+        goal_xyz = goals_world[i, :3]
+        err = np.linalg.norm(goal_xyz - final_pos)
         errors.append(err)
-        desired_displacements.append(goals_world[i, :2] - ref_obj_pos[:2])
-        achieved_displacements.append(final_pos - ref_obj_pos[:2])
+        desired_displacements.append(goals_world[i, :3] - ref_obj_pos[:3])
+        achieved_displacements.append(final_pos - ref_obj_pos[:3])
 
     return {
         "full_traj": full_traj,
@@ -405,6 +416,8 @@ def run_goal_sweep(mg, dataset, args):
         "ref_obj_pos": ref_obj_pos,
         "desired_displacements": np.array(desired_displacements),
         "achieved_displacements": np.array(achieved_displacements),
+        "stitch_steps": stitch_steps,
+        "planning_horizon_s": planning_horizon_s,
     }
 
 
@@ -455,8 +468,8 @@ def main():
         dd = result["desired_displacements"][i]
         ad = result["achieved_displacements"][i]
         print(f"  [{i:2d}]  err={errors[i]:.4f}m  "
-              f"desired=({dd[0]:+.3f},{dd[1]:+.3f})  "
-              f"achieved=({ad[0]:+.3f},{ad[1]:+.3f})  "
+              f"desired=({dd[0]:+.3f},{dd[1]:+.3f},{dd[2]:+.3f})  "
+              f"achieved=({ad[0]:+.3f},{ad[1]:+.3f},{ad[2]:+.3f})  "
               f"T_real={real_lengths[i]}")
     print(f"\n  Mean error: {np.mean(errors):.4f}m  "
           f"Median: {np.median(errors):.4f}m  Max: {np.max(errors):.4f}m")
@@ -503,9 +516,9 @@ def main():
     os.makedirs(os.path.dirname(args.metrics_log_path) or ".", exist_ok=True)
     now_iso = datetime.now(timezone.utc).isoformat()
     for i in range(N):
-        dxy = result["desired_displacements"][i]
-        mag = float(np.linalg.norm(dxy))
-        direction = (dxy / mag).tolist() if mag > 1e-9 else [0.0, 0.0]
+        dxyz = result["desired_displacements"][i]
+        mag = float(np.linalg.norm(dxyz))
+        direction = (dxyz / mag).tolist() if mag > 1e-9 else [0.0, 0.0, 0.0]
         rec = {
             "timestamp_utc": now_iso,
             "script": "batch_goal_sweep.py",
@@ -517,10 +530,12 @@ def main():
             "start_time": int(args.start_time),
             "goal_world": result["goals_world"][i].tolist(),
             "goal_local": result["goals_local"][i].tolist(),
-            "goal_direction_xy": direction,
-            "goal_magnitude_xy": mag,
+            "goal_direction_xyz": direction,
+            "goal_magnitude_xyz": mag,
             "error": float(result["errors"][i]),
             "generation_time_s": float(result.get("per_goal_time_s", np.zeros(N))[i]),
+            "time_per_inference_step_s": float(result.get("per_goal_time_s", np.zeros(N))[i]) / max(1, result.get("stitch_steps", 1)),
+            "planning_horizon_s": result.get("planning_horizon_s", 0.0),
             "trajectory_path": os.path.join(args.save_dir, f"trajectory_{i:03d}.npz"),
         }
         with open(args.metrics_log_path, "a", encoding="utf-8") as f:

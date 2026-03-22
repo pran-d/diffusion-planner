@@ -91,6 +91,8 @@ def build_last_frame_waypoints(
     lift_end=0.20,
     walk_start_z=0.80,
     rest_obj_z=None,
+    goal_obj_z=None,
+    normalize_goal_vec=True,
 ):
     """
     Build a partial waypoint at the last frame (obj_delta_xy + obj_z).
@@ -107,7 +109,13 @@ def build_last_frame_waypoints(
     values = torch.zeros(B, T, D)
     mask = torch.zeros(B, T, D, dtype=torch.bool)
 
-    if task_params_raw.shape[-1] >= 3:
+    if normalize_goal_vec and task_params_raw.shape[-1] >= 4:
+        # New format: [dir_x, dir_y, dir_z, magnitude]
+        direction = task_params_raw[:, :3]
+        distance = task_params_raw[:, 3:4]
+        total_remaining_delta = direction * distance
+    elif normalize_goal_vec and task_params_raw.shape[-1] >= 3:
+        # Legacy 2D format: [dir_x, dir_y, magnitude]
         direction = task_params_raw[:, :2]
         distance = task_params_raw[:, 2:3]
         total_remaining_delta = direction * distance
@@ -175,7 +183,8 @@ def build_last_frame_waypoints(
     t_last = T - 1
 
     if "obj_delta_xy" in feature_idx:
-        norm_obj_delta = dataset._normalize("obj_delta_xy", per_window_delta)
+        per_window_delta_xy = per_window_delta[:, :2]
+        norm_obj_delta = dataset._normalize("obj_delta_xy", per_window_delta_xy)
         if not isinstance(norm_obj_delta, torch.Tensor):
             norm_obj_delta = torch.tensor(norm_obj_delta, dtype=torch.float32)
         values[:, t_last, feature_idx["obj_delta_xy"]] = norm_obj_delta.reshape(B, -1)
@@ -209,15 +218,23 @@ def build_last_frame_waypoints(
 
         z_offset_end = torch.minimum(torch.full((B,), z_lift_end), z_dist_end)
 
-        if rest_obj_z is not None:
+        if goal_obj_z is not None:
+            goal_t = torch.as_tensor(goal_obj_z, dtype=torch.float32)
+            if goal_t.ndim == 0:
+                goal_t = goal_t.expand(B)
+            elif goal_t.shape[0] == 1 and B > 1:
+                goal_t = goal_t.expand(B)
+            base_z = goal_t
+        elif rest_obj_z is not None:
             rest_t = torch.as_tensor(rest_obj_z, dtype=torch.float32)
             if rest_t.ndim == 0:
                 rest_t = rest_t.expand(B)
             elif rest_t.shape[0] == 1 and B > 1:
                 rest_t = rest_t.expand(B)
+            base_z = rest_t
         else:
-            rest_t = torch.zeros(B)
-        target_abs_z = rest_t + z_offset_end
+            base_z = torch.zeros(B)
+        target_abs_z = base_z + z_offset_end
 
         target_tensor = target_abs_z.unsqueeze(-1)
         norm_z = dataset._normalize("obj_z", target_tensor)
@@ -246,6 +263,8 @@ def build_inference_waypoints(
     walk_start_z=0.80,
     current_obj_z=None,
     rest_obj_z=None,
+    goal_obj_z=None,
+    normalize_goal_vec=True,
 ):
     """
     Build complete waypoint specification for inference.
@@ -279,6 +298,8 @@ def build_inference_waypoints(
             lift_end=lift_end,
             walk_start_z=walk_start_z,
             rest_obj_z=rest_obj_z,
+            goal_obj_z=goal_obj_z,
+            normalize_goal_vec=normalize_goal_vec,
         )
         values = torch.where(wp_mask.to(values.device), wp_vals.to(values.device), values)
         mask = mask | wp_mask.to(mask.device)

@@ -35,13 +35,13 @@ def _append_jsonl(path, record):
         f.write(json.dumps(record) + "\n")
 
 
-def extract_initial_condition(dataset, sample_idx, num_task_params):
+def extract_initial_condition(dataset, sample_idx, local_goal_dim=3):
     """
     Extract the world-frame robot/object history and goal info from a dataset sample.
 
     Returns:
         initial_condition: dict with 'robot' (H, 36) and 'obj' (H, 7)
-        goal_local:        (num_task_params,) — object displacement (final − initial)
+        goal_local:        (local_goal_dim,) — object displacement (final − initial)
                            expressed in the yaw-rotated initial robot frame.
                            Axes: (dx_forward, dy_left, dz_up) aligned with the
                            pelvis at t=0 after stripping pitch/roll (yaw-only rotation).
@@ -83,7 +83,7 @@ def extract_initial_condition(dataset, sample_idx, num_task_params):
 
     delta_world = final_obj_pos[:3] - init_obj_pos[:3]
     delta_local_3d = (R_world_to_local @ delta_world[:, None])[:, 0]
-    goal_local = delta_local_3d[:num_task_params]
+    goal_local = delta_local_3d[:local_goal_dim]
 
     return initial_condition, goal_local, anchor, file_idx, batch_idx, start_time
 
@@ -215,8 +215,9 @@ def main():
         )
 
     num_task_params = data_cfg.get("num_task_params", 3)
+    local_goal_dim = min(3, num_task_params)
     initial_condition, goal_local, anchor, file_idx, batch_idx, start_time = \
-        extract_initial_condition(dataset, sample_idx, num_task_params)
+        extract_initial_condition(dataset, sample_idx, local_goal_dim)
 
     # Override goal if provided via CLI
     if args.task_params is not None:
@@ -261,6 +262,17 @@ def main():
     print(f"Initial obj pos:   {initial_condition['obj'][0, :3]}")
     print(f"Anchor final_obj_pos (world): {anchor['final_obj_pos']}")
 
+    # Ensure stitch_steps is fully determined for logging
+    if args.stitch_steps is None:
+        _eff_gen = max(1, data_cfg["num_timesteps"] - data_cfg.get("state_history", 1))
+        if args.target_traj_length is not None:
+            args.stitch_steps = max(1, math.ceil(args.target_traj_length / _eff_gen))
+        else:
+            args.stitch_steps = 1
+            
+    _eff_horizon = max(1, data_cfg["num_timesteps"] - data_cfg.get("state_history", 1))
+    planning_horizon_s = _eff_horizon * 0.01
+
     # ─── 5. Generate ──────────────────────────────────────────────────────────
     t0 = time.perf_counter()
     result, real_lengths = mg.generate_trajectory(
@@ -299,7 +311,8 @@ def main():
     yaw = yaw_from_quat(init_base_quat)
     R_local_to_world = yaw_to_rot_matrix(yaw)
     goal_3d = np.zeros(3, dtype=np.float64)
-    goal_3d[:len(goal_local)] = goal_local
+    n_goal = min(len(goal_local), 3)
+    goal_3d[:n_goal] = goal_local[:n_goal]
     goal_world = (R_local_to_world @ goal_3d[:, None])[:, 0] + init_obj_pos
     print(f"Goal world position: {goal_world}")
 
@@ -308,11 +321,12 @@ def main():
     desired = None
     achieved = None
     if full_trajectory.shape[-1] >= 43:
-        start_obj = full_trajectory[0, 0, 36:36 + num_task_params]
+        world_goal_dim = min(3, num_task_params)
+        start_obj = full_trajectory[0, 0, 36:36 + world_goal_dim]
         end_idx = int(real_lengths[0] - 1) if len(real_lengths) > 0 else -1
-        end_obj = full_trajectory[0, end_idx, 36:36 + num_task_params]
+        end_obj = full_trajectory[0, end_idx, 36:36 + world_goal_dim]
         achieved = end_obj - start_obj
-        desired = (goal_world - init_obj_pos)[:num_task_params]
+        desired = (goal_world - init_obj_pos)[:world_goal_dim]
         err = float(np.linalg.norm(desired - achieved))
         print("-" * 40)
         print(f"Desired displacement  (world): {desired}")
@@ -335,12 +349,12 @@ def main():
     print(f"Trajectory bundle saved to {save_path}  (shape: {full_trajectory.shape})")
 
     # ─── 8.1 Metrics logging ─────────────────────────────────────────────────
-    goal_xy = np.asarray(goal_local[:2], dtype=np.float64)
-    goal_mag = float(np.linalg.norm(goal_xy))
+    goal_xyz = np.asarray(goal_local[:3], dtype=np.float64)
+    goal_mag = float(np.linalg.norm(goal_xyz))
     if goal_mag > 1e-9:
-        goal_dir = (goal_xy / goal_mag).tolist()
+        goal_dir = (goal_xyz / goal_mag).tolist()
     else:
-        goal_dir = [0.0, 0.0]
+        goal_dir = [0.0, 0.0, 0.0]
     metrics_record = {
         "timestamp_utc": datetime.now(timezone.utc).isoformat(),
         "script": "inference_mg.py",
@@ -350,10 +364,12 @@ def main():
         "batch_idx": int(args.batch_idx),
         "start_time": int(args.start_time),
         "goal_local": np.asarray(goal_local, dtype=float).tolist(),
-        "goal_direction_xy": goal_dir,
-        "goal_magnitude_xy": goal_mag,
+        "goal_direction_xyz": goal_dir,
+        "goal_magnitude_xyz": goal_mag,
         "error_l2": err,
         "generation_time_s": float(gen_time_s),
+        "time_per_inference_step_s": float(gen_time_s) / max(1, args.stitch_steps),
+        "planning_horizon_s": planning_horizon_s,
         "save_path": save_path,
     }
     _append_jsonl(args.metrics_log_path, metrics_record)

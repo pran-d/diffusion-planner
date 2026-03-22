@@ -5,7 +5,7 @@ data:
   dataset_class: "flexible"
   batch_size: 1024
   num_features: 51
-  num_task_params: 3
+  num_task_params: 4
   num_observations: 45
   start_timestep: 0
   num_timesteps: 10

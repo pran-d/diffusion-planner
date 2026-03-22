@@ -1159,13 +1159,8 @@ class DFoTTrajectory(nn.Module):
 
         record = [] if return_all else None
 
-        if pbar is None:
-            pbar = tqdm(
-                total=scheduling_matrix.shape[0] - 1,
-                initial=0,
-                desc="Sampling with DFoT",
-                leave=False,
-            )
+        # Avoid creating tqdm by default in cluster inference paths.
+        # Caller may still pass a custom progress object with update().
         f_map = get_feature_indices(build_feature_layout())
         for m in range(scheduling_matrix.shape[0] - 1):
             from_noise_levels = scheduling_matrix[m]
@@ -1257,7 +1252,8 @@ class DFoTTrajectory(nn.Module):
                 xs_pred[..., 0, f_map['obj_rel_pos']] = _cur[..., 36:39]
                 xs_pred[..., 0, f_map['obj_rel_rot6d']] = _cur[..., 39:45]
             
-            pbar.update(1)
+            if pbar is not None:
+                pbar.update(1)
 
         if return_all:
             record.append(xs_pred.clone())

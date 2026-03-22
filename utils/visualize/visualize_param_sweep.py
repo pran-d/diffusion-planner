@@ -225,7 +225,7 @@ def run_evaluation_batch(
             # Keep a copy with actual (unclipped) distance for waypoint building
             tp_raw = tp.copy()
             if tp_raw.shape[-1] >= 3:
-                tp_raw[..., 2] = actual_dist.item() if hasattr(actual_dist, 'item') else float(actual_dist)
+                tp_raw[..., -1] = actual_dist.item() if hasattr(actual_dist, 'item') else float(actual_dist)
             raw_task_list.append(tp_raw)
         
         new_task_arr = np.stack(new_task_list)

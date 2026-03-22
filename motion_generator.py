@@ -9,7 +9,6 @@ from typing import List, Dict, Union, Optional
 from torch.utils.data import DataLoader, WeightedRandomSampler
 from torch.amp import GradScaler
 from torch import nn, optim
-from tqdm import tqdm
 from scipy.interpolate import interp1d
 from scipy.spatial.transform import Rotation as R
 from scipy.spatial.transform import Slerp
@@ -55,7 +54,7 @@ def compute_dataset_weights(dataset, sigma=0.2):
     # Pre-fetch if possible to avoid redundant file reads
     # But _get_single_traj uses ram_cache so it's fast
     
-    for f, b in tqdm(unique_traj_keys, desc="Extracting Task Params"):
+    for f, b in unique_traj_keys:
         raw = dataset._get_single_traj(f, b)
         
         # FlexibleWindowDataset: if 'obj' is missing
@@ -291,9 +290,7 @@ class MotionGenerator:
         for epoch in range(epochs):
             epoch_losses = []
             total_steps = min(max_batches, len(train_dataloader)) if max_batches else len(train_dataloader)
-            pbar = tqdm(enumerate(train_dataloader), total=total_steps, desc=f"Epoch {epoch+1}/{epochs}")
-            
-            for step, batch in pbar:
+            for step, batch in enumerate(train_dataloader):
 
                 if max_batches and step >= max_batches:
                     break
@@ -358,7 +355,6 @@ class MotionGenerator:
                 ema.step(self.diffuser.model.parameters())
 
                 epoch_losses.append(loss.item())
-                pbar.set_postfix({"loss": f"{loss.item():.4f}"})
             
             scheduler.step()
             mean_loss = np.mean(epoch_losses)
@@ -775,6 +771,8 @@ class MotionGenerator:
                         walk_start_z=walk_start_z,
                         current_obj_z=_current_obj_z,
                         rest_obj_z=_rest_obj_z,
+                        goal_obj_z=goal_world[:, 2],
+                        normalize_goal_vec=self.data_cfg.get("normalize_goal_vec", True),
                     )
 
                 # C. Generate normalized sample
@@ -862,20 +860,23 @@ class MotionGenerator:
                     _newly = np.zeros(effective_batch, dtype=bool)
                     _trigger_frame = np.full(effective_batch, -1, dtype=np.int64)
                     _active = ~_goal_reached  # only check trajectories not yet reached
+                    _goal_needs_ground = np.abs(goal_world[:, 2] - _rest_obj_z) < end_ground_z_tol
                     for _t in range(_seg_T):
                         _obj_xyz_t = segment_world[:, _t, 36:39]  # (B, 3)
                         # Update ground counter: on-ground if |obj_z - rest_z| < tol
                         _on_ground = np.abs(_obj_xyz_t[:, 2] - _rest_obj_z) < end_ground_z_tol
                         _ground_counter = np.where(_on_ground, _ground_counter + 1, 0)
-                        # XY distance to goal
-                        _xy_err = np.linalg.norm(
-                            _obj_xyz_t[:, :2] - goal_world[:, :2], axis=-1
+                        # 3D distance to goal
+                        _goal_err = np.linalg.norm(
+                            _obj_xyz_t[:, :3] - goal_world[:, :3], axis=-1
                         )  # (B,)
-                        # Check both conditions
+                        _ground_ok = (~_goal_needs_ground) | (_ground_counter >= end_ground_num_frames)
+
+                        # Check goal and ground condition (if required)
                         _hit = (
                             _active & ~_newly
-                            & (_xy_err < end_error_threshold)
-                            & (_ground_counter >= end_ground_num_frames)
+                            & (_goal_err < end_error_threshold)
+                            & _ground_ok
                         )
                         if _hit.any():
                             for _ni in np.where(_hit)[0]:
@@ -885,7 +886,7 @@ class MotionGenerator:
                             print(
                                 f"[goal] step {step+1}, frame {_t}: "
                                 f"sample {np.where(_hit)[0].tolist()} reached goal "
-                                f"(xy_err={_xy_err[_hit].round(4).tolist()}, "
+                                f"(goal_err={_goal_err[_hit].round(4).tolist()}, "
                                 f"ground_frames={_ground_counter[_hit].astype(int).tolist()})"
                             )
                     # Pad remainder of current segment for newly-reached trajectories
