@@ -54,6 +54,7 @@ from datasets.flexible_dataset import FlexibleWindowDataset
 from utils.data.load_dataset import preload_dataset
 from utils.math.math_tools import yaw_from_quat, yaw_to_rot_matrix
 from motion_generator import MotionGenerator
+from utils.inference_config import load_inference_defaults
 from utils.inference_utils import DEFAULT_LIFT_HEIGHT
 from batch_goal_sweep import run_goal_sweep
 
@@ -542,11 +543,13 @@ def plot_cross_ablation_trajectories(all_results: dict, out_dir: str):
 # CLI
 # ──────────────────────────────────────────────────────────────────────────────
 
-def parse_args():
+def parse_args(argv=None):
     p = argparse.ArgumentParser("Evaluate all ablation checkpoints")
+    p.add_argument("--inference_config", type=str, default="config/inference.yaml",
+                   help="Path to inference defaults YAML")
 
     # Ablation discovery
-    p.add_argument("--ablations_folder", type=str, required=True,
+    p.add_argument("--ablations_folder", type=str, default=None,
                    help="Root folder containing ablation config YAMLs")
     p.add_argument("--epoch", type=str, default="latest",
                    help="Checkpoint epoch (int) or 'latest' to auto-detect")
@@ -589,7 +592,18 @@ def parse_args():
     p.add_argument("--visualize", action="store_true",
                    help="Open MuJoCo viewer for each ablation (blocks)")
 
-    return p.parse_args()
+    cfg_defaults, _ = load_inference_defaults(
+        argv=argv,
+        section="evaluate_ablations",
+        default_path="config/inference.yaml",
+    )
+    if cfg_defaults:
+        p.set_defaults(**cfg_defaults)
+
+    args = p.parse_args(argv)
+    if args.ablations_folder is None:
+        p.error("Missing `--ablations_folder`. Set it via CLI or config/inference.yaml::evaluate_ablations.ablations_folder")
+    return args
 
 
 # ──────────────────────────────────────────────────────────────────────────────

@@ -25,6 +25,7 @@ from datasets.flexible_dataset import FlexibleWindowDataset
 from utils.data.load_dataset import preload_dataset
 from utils.math.math_tools import yaw_from_quat, yaw_to_rot_matrix
 from motion_generator import MotionGenerator
+from utils.inference_config import load_inference_defaults
 from utils.inference_utils import DEFAULT_LIFT_HEIGHT
 
 
@@ -87,11 +88,13 @@ def extract_initial_condition(dataset, sample_idx, num_task_params):
     return initial_condition, goal_local, anchor, file_idx, batch_idx, start_time
 
 
-def main():
+def parse_args(argv=None):
     parser = argparse.ArgumentParser(
         description="Inference via MotionGenerator (unified pipeline)"
     )
-    parser.add_argument("--epoch", type=str, required=True,
+    parser.add_argument("--inference_config", type=str, default="config/inference.yaml",
+                        help="Path to inference defaults YAML")
+    parser.add_argument("--epoch", type=str, default=None,
                         help="Checkpoint epoch number or path to .pth file")
     parser.add_argument("--ema", action="store_true",
                         help="Use EMA weights (only for numeric epoch)")
@@ -149,7 +152,23 @@ def main():
     parser.add_argument("--video_path", type=str, default=None,
                         help="Path to save video file (default: results/inference_mg_video.mp4)")
 
-    args = parser.parse_args()
+    cfg_defaults, _ = load_inference_defaults(
+        argv=argv,
+        section="inference_mg",
+        default_path="config/inference.yaml",
+    )
+    if cfg_defaults:
+        parser.set_defaults(**cfg_defaults)
+
+    args = parser.parse_args(argv)
+    if args.epoch is None:
+        parser.error("Missing `--epoch`. Set it via CLI or config/inference.yaml::inference_mg.epoch")
+    return args
+
+
+def main():
+
+    args = parse_args()
 
     # Handle mutually exclusive goal stop flags
     if args.disable_goal_stop:

@@ -31,6 +31,7 @@ from utils.data.load_dataset import preload_dataset
 from utils.math.math_tools import yaw_from_quat, yaw_to_rot_matrix
 from utils.visualize.visualize import MjVisualizer, DiffusionOverlayVisualizer
 from motion_generator import MotionGenerator
+from utils.inference_config import load_inference_defaults
 from utils.inference_utils import DEFAULT_LIFT_HEIGHT
 from inference_mg import extract_initial_condition
 
@@ -39,11 +40,13 @@ from inference_mg import extract_initial_condition
 # CLI
 # --------------------------------------------------------------------------- #
 
-def parse_args():
+def parse_args(argv=None):
     parser = argparse.ArgumentParser("Batch Goal Sweep -- single IC, N goals on 3 rings")
+    parser.add_argument("--inference_config", type=str, default="config/inference.yaml",
+                        help="Path to inference defaults YAML")
 
     # Checkpoint
-    parser.add_argument("--epoch", type=str, required=True,
+    parser.add_argument("--epoch", type=str, default=None,
                         help="Checkpoint epoch (int) or direct file path")
     parser.add_argument("--ema", action="store_true",
                         help="Use EMA weights for inference")
@@ -100,7 +103,18 @@ def parse_args():
     parser.add_argument("--video_path", type=str, default=None,
                         help="Path to save video file (default: results/goal_sweep_video.mp4)")
 
-    return parser.parse_args()
+    cfg_defaults, _ = load_inference_defaults(
+        argv=argv,
+        section="batch_goal_sweep",
+        default_path="config/inference.yaml",
+    )
+    if cfg_defaults:
+        parser.set_defaults(**cfg_defaults)
+
+    args = parser.parse_args(argv)
+    if args.epoch is None:
+        parser.error("Missing `--epoch`. Set it via CLI or config/inference.yaml::batch_goal_sweep.epoch")
+    return args
 
 
 # --------------------------------------------------------------------------- #

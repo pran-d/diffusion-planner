@@ -115,6 +115,23 @@ Key flags:
 | `--save_path results/run_01.npz` | Save full trajectory bundle as `.npz` |
 | `--metrics_log_path results/inference_metrics.jsonl` | Append goal direction/magnitude/error and generation time |
 
+#### Centralized inference defaults (no long CLI)
+
+All inference/eval scripts can read defaults from [config/inference.yaml](config/inference.yaml).
+
+```bash
+# Run with defaults from config/inference.yaml::inference_mg
+python inference_mg.py
+
+# Run batch goal sweep from config/inference.yaml::batch_goal_sweep
+python batch_goal_sweep.py
+
+# Override only one field at runtime (CLI overrides YAML)
+python inference_mg.py --epoch 700 --save_path results/run_700.npz
+```
+
+Use `--inference_config` to point to another YAML file.
+
 
 ### 2. MotionGenerator Python API
 
