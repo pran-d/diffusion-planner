@@ -24,6 +24,19 @@ from utils.inference_utils import build_inference_waypoints
 from diffusers import EMAModel
 
 
+class TimingContext:
+    """Small helper for accumulating named wall-clock timings."""
+
+    def __init__(self):
+        self.stats = {}
+
+    def add(self, key: str, dt: float):
+        self.stats[key] = self.stats.get(key, 0.0) + float(dt)
+
+    def get(self, key: str, default: float = 0.0) -> float:
+        return float(self.stats.get(key, default))
+
+
 def compute_dataset_weights(dataset, sigma=0.2):
     """
     Computes weights for each sample in the dataset based on the inverse density 
@@ -581,7 +594,11 @@ class MotionGenerator:
                             lift_start: float = 0.0,
                             lift_end: float = 0.20,
                             verbose: bool = False,
-                            walk_start_z: float = 0.80,):
+                            walk_start_z: float = 0.80,
+                            verbose_timing: bool = False,
+                            return_timing_stats: bool = False,
+                            use_fp16: Optional[bool] = None,
+                            compile_model: Optional[bool] = None,):
         """
         Generate trajectory via autoregressive diffusion.
         
@@ -638,6 +655,9 @@ class MotionGenerator:
              raise RuntimeError("Dataset not initialized. Call fit() or setup.")
 
         self.diffuser.model.eval()
+
+        # Runtime speedup toggles used by ablation runner
+        self.diffuser.set_inference_speedups(use_fp16=use_fp16, compile_model=compile_model)
         
         window_size = self.dataset.window_size  # model output length per segment
         history_size = self.dataset.history_size
@@ -727,6 +747,22 @@ class MotionGenerator:
         _rest_obj_z = float(current_anchors['ref_obj_pos'][0, 2])
 
         stitched_segments = []
+        timing_stats = {
+            "forward_time_s": 0.0,
+            "reconstruction_time_s": 0.0,
+            "total_time_s": 0.0,
+            "num_steps": int(stitch_steps),
+            "avg_forward_time_s": 0.0,
+            "avg_reconstruction_time_s": 0.0,
+            "avg_step_time_s": 0.0,
+            "gpu_peak_mb": 0.0,
+        }
+        _t_total_start = time.perf_counter()
+        if self.device.type == "cuda":
+            try:
+                torch.cuda.reset_peak_memory_stats(self.device)
+            except Exception:
+                pass
 
         # 4. Autoregressive Loop
         with torch.no_grad():
@@ -776,6 +812,7 @@ class MotionGenerator:
                     )
 
                 # C. Generate normalized sample
+                _t_forward_start = time.perf_counter()
                 normalized_sample = self.diffuser.getSample(
                     num_trajectories=effective_batch,
                     state_cond=curr_state_tens,
@@ -785,6 +822,7 @@ class MotionGenerator:
                     waypoint_values=wv,
                     waypoint_mask=wm,
                 )  # (B, T, D_out)
+                timing_stats["forward_time_s"] += (time.perf_counter() - _t_forward_start)
                 
                 # D. Denormalize
                 denorm_btc = self.dataset.denormalize_global(normalized_sample)
@@ -808,11 +846,13 @@ class MotionGenerator:
                     current_anchors['final_obj_pos'],
                 ], axis=-1)
                 
+                _t_recon_start = time.perf_counter()
                 res = reconstruct_sbto_trajectory(
                     anchor_arr, future_traj_np, 
                     inpaint=self.diffuser.model_cfg.get("inpaint", False)
                 )
                 r_world, o_world = res[0], res[1]
+                timing_stats["reconstruction_time_s"] += (time.perf_counter() - _t_recon_start)
 
                 # Always skip t=0 (anchor frame) — matches inference.py
                 r_world = r_world[:, history_size:, :]
@@ -951,6 +991,24 @@ class MotionGenerator:
                     curr_state_tens = curr_state_tens.to(self.device)
         
         full_trajectory = np.concatenate(stitched_segments, axis=1)
+        timing_stats["total_time_s"] = time.perf_counter() - _t_total_start
+        if timing_stats["num_steps"] > 0:
+            timing_stats["avg_forward_time_s"] = timing_stats["forward_time_s"] / timing_stats["num_steps"]
+            timing_stats["avg_reconstruction_time_s"] = timing_stats["reconstruction_time_s"] / timing_stats["num_steps"]
+            timing_stats["avg_step_time_s"] = timing_stats["total_time_s"] / timing_stats["num_steps"]
+        if self.device.type == "cuda":
+            try:
+                timing_stats["gpu_peak_mb"] = float(torch.cuda.max_memory_allocated(self.device) / (1024 ** 2))
+            except Exception:
+                timing_stats["gpu_peak_mb"] = 0.0
+        if verbose_timing:
+            print(
+                f"[timing] total={timing_stats['total_time_s']:.3f}s "
+                f"avg_step={timing_stats['avg_step_time_s']:.4f}s "
+                f"avg_forward={timing_stats['avg_forward_time_s']:.4f}s "
+                f"avg_recon={timing_stats['avg_reconstruction_time_s']:.4f}s "
+                f"peak_gpu={timing_stats['gpu_peak_mb']:.1f}MB"
+            )
 
         # Finalise real lengths for samples that never triggered goal/physics stop
         _real_lengths[_real_lengths < 0] = full_trajectory.shape[1]
@@ -974,5 +1032,7 @@ class MotionGenerator:
         # Smooth trajectory
         full_trajectory = self._smooth_trajectory(full_trajectory, sigma=2.0)
 
+        if return_timing_stats:
+            return full_trajectory, _real_lengths, timing_stats
         return full_trajectory, _real_lengths
 

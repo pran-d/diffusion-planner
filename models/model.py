@@ -2,6 +2,7 @@ import torch
 import torch.nn as nn
 import numpy as np
 from typing import Iterable
+from contextlib import nullcontext
 
 from .latent_diffusion import UNetDiffuser
 from .basic_diffusion import SimpleDiffuser
@@ -41,6 +42,22 @@ class RobotDiffuser():
             self.model = DFoTTrajectory(self.model_cfg, self.data_cfg, self.noise_schedule_cfg, self.training_cfg).to(self.device)
         else:
             raise ValueError(f"Unknown model type: {model_type}")           
+
+        self.use_fp16 = bool(self.model_cfg.get("use_fp16", False))
+        self.compile_model = bool(self.model_cfg.get("compile_model", False))
+        self._compiled_once = False
+
+        if self.compile_model and hasattr(torch, "compile"):
+            try:
+                backbone = None
+                if hasattr(self.model, "diffusion_model") and hasattr(self.model.diffusion_model, "model"):
+                    backbone = self.model.diffusion_model.model
+                if backbone is not None:
+                    self.model.diffusion_model.model = torch.compile(backbone, mode="reduce-overhead")
+                    self._compiled_once = True
+                    print("Enabled torch.compile on diffusion backbone (mode=reduce-overhead).")
+            except Exception as e:
+                print(f"[Warning] torch.compile failed, continuing without compile: {e}")
         
         if mode == "train":
             self.model.train()
@@ -109,14 +126,38 @@ class RobotDiffuser():
             'waypoint_mask': waypoint_mask,
         }
 
-        sample = self.model.sample(
-            num_trajectories, 
-            model_cond=model_cond,
-            cfg_w=cfg_w,
-            **sample_kwargs
+        autocast_ctx = (
+            torch.autocast(device_type=self.device.type, dtype=torch.float16)
+            if (self.use_fp16 and self.device.type == "cuda") else nullcontext()
         )
+        with torch.inference_mode():
+            with autocast_ctx:
+                sample = self.model.sample(
+                    num_trajectories,
+                    model_cond=model_cond,
+                    cfg_w=cfg_w,
+                    **sample_kwargs
+                )
         
         return sample.detach()
+
+    def set_inference_speedups(self, use_fp16: bool | None = None, compile_model: bool | None = None):
+        if use_fp16 is not None:
+            self.use_fp16 = bool(use_fp16)
+        if compile_model is not None:
+            want_compile = bool(compile_model)
+            if want_compile and (not self._compiled_once) and hasattr(torch, "compile"):
+                try:
+                    backbone = None
+                    if hasattr(self.model, "diffusion_model") and hasattr(self.model.diffusion_model, "model"):
+                        backbone = self.model.diffusion_model.model
+                    if backbone is not None:
+                        self.model.diffusion_model.model = torch.compile(backbone, mode="reduce-overhead")
+                        self._compiled_once = True
+                        print("Enabled torch.compile on diffusion backbone (runtime).")
+                except Exception as e:
+                    print(f"[Warning] torch.compile failed at runtime: {e}")
+            self.compile_model = want_compile
 
     
     def save_ema_weights(self, parameters: Iterable[torch.nn.Parameter], path):

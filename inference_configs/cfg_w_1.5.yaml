@@ -1,0 +1,3 @@
+name: cfg_w_1p5
+inference:
+  cfg_w: 1.5

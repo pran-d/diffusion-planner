@@ -621,26 +621,46 @@ class DFoTTrajectory(nn.Module):
         c_coeff = dm.add_shape_channels(c_coeff)
         sigma = dm.add_shape_channels(sigma)
 
-        # Conditional prediction (with indicator)
-        pred_cond = self._model_predictions_with_indicator(
-            x, clipped_curr, external_cond, external_cond_mask=None,
-            waypoint_mask=waypoint_mask,
-        )
+        if cfg_w == 1.0:
+            pred = self._model_predictions_with_indicator(
+                x, clipped_curr, external_cond, external_cond_mask=None,
+                waypoint_mask=waypoint_mask,
+            )
+            x_start = pred.pred_x_start
+            pred_noise = pred.pred_noise
+        else:
+            # Batched CFG: cond + uncond in one forward pass
+            if external_cond is not None:
+                if external_cond_mask is None:
+                    masked_ext = torch.zeros_like(external_cond)
+                else:
+                    masked_ext = (~external_cond_mask).float() * external_cond
+            else:
+                masked_ext = None
+            B = x.shape[0]
+            x_double = torch.cat([x, x], dim=0)
+            k_double = torch.cat([clipped_curr, clipped_curr], dim=0)
+            cond_double = (
+                torch.cat([external_cond, masked_ext], dim=0)
+                if external_cond is not None else None
+            )
+            wp_double = (
+                torch.cat([waypoint_mask, waypoint_mask], dim=0)
+                if waypoint_mask is not None else None
+            )
 
-        # Unconditional prediction (with indicator but masked external cond)
-        masked_ext = external_cond_mask * external_cond if external_cond is not None else None
-        pred_uncond = self._model_predictions_with_indicator(
-            x, clipped_curr, masked_ext, external_cond_mask=None,
-            waypoint_mask=waypoint_mask,
-        )
+            pred_both = self._model_predictions_with_indicator(
+                x_double, k_double, cond_double, external_cond_mask=None,
+                waypoint_mask=wp_double,
+            )
 
-        # CFG
-        x_start = pred_uncond.pred_x_start + cfg_w * (
-            pred_cond.pred_x_start - pred_uncond.pred_x_start
-        )
-        pred_noise = pred_uncond.pred_noise + cfg_w * (
-            pred_cond.pred_noise - pred_uncond.pred_noise
-        )
+            # First B = conditional, last B = unconditional
+            x_start = pred_both.pred_x_start[B:] + cfg_w * (
+                pred_both.pred_x_start[:B] - pred_both.pred_x_start[B:]
+            )
+            pred_noise = pred_both.pred_noise[B:] + cfg_w * (
+                pred_both.pred_noise[:B] - pred_both.pred_noise[B:]
+            )
 
         if cfg_w > 1.0:
             s = torch.quantile(torch.abs(x_start).flatten(1), 0.995, dim=1)

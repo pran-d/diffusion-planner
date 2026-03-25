@@ -1,0 +1,3 @@
+name: ddim_3steps
+inference:
+  inference_timesteps: 3

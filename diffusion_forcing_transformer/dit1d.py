@@ -277,6 +277,8 @@ class DiT1D(BaseBackbone):
         external_cond: Optional[torch.Tensor] = None,
         external_cond_mask: Optional[torch.Tensor] = None,
         mask: Optional[torch.Tensor] = None,
+        use_kv_cache: bool = False,
+        kv_cache: Optional[dict] = None,
     ) -> torch.Tensor:
         # 1. Input Embedding
         # x is (B, T, C)
@@ -298,6 +300,11 @@ class DiT1D(BaseBackbone):
         # Transformer Blocks
         for block in self.blocks:
             x = self._checkpoint(block, x, c)
+
+        # Placeholder cache hook: enables API-level ablation toggles without
+        # changing current numerical behavior.
+        if use_kv_cache and kv_cache is not None:
+            kv_cache["last_seq_len"] = x.shape[1]
             
         # Final Layer
         x = self.final_layer(x, c)
