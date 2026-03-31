@@ -209,6 +209,10 @@ class FlexibleWindowDataset(Dataset):
         # Pass through non-temporal metadata
         if 'fps' in raw_data:
             processed['fps'] = raw_data['fps']
+        if 'source_file_path' in raw_data:
+            processed['source_file_path'] = raw_data['source_file_path']
+        if 'source_folder_name' in raw_data:
+            processed['source_folder_name'] = raw_data['source_folder_name']
 
         return processed
 
@@ -289,7 +293,7 @@ class FlexibleWindowDataset(Dataset):
         print(f"Loaded {len(self.ram_cache)} files ({total_trajs} total trajectories) into RAM cache.")
 
     # Keys that are non-temporal (no time dimension to pad)
-    _NON_TEMPORAL_KEYS = {'goal_obj_world', 'fps'}
+    _NON_TEMPORAL_KEYS = {'goal_obj_world', 'fps', 'source_file_path', 'source_folder_name'}
 
     def _get_single_traj(self, file_idx, batch_idx):
         """Get padded (T, D) dict for a specific trajectory.

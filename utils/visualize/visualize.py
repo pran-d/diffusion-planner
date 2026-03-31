@@ -23,6 +23,7 @@ class MjVisualizer():
         self.step_request = {"delta": 0}
         self.clean_request = {"active": False}
         self.exit_request = {"active": False}
+        self.next_file_batch0_request = {"active": False}
         self.close_on_enter = close_on_enter
 
         def key_callback(keycode: int):
@@ -43,6 +44,10 @@ class MjVisualizer():
             # 'C' for clean
             elif keycode == 67:  
                 self.clean_request["active"] = True
+            # 'N': jump to next file, batch 0 (consumed by caller)
+            elif keycode == glfw.KEY_N:
+                self.next_file_batch0_request["active"] = True
+                self.exit_request["active"] = True
 
         self.viewer = mujoco.viewer.launch_passive(self.mj_model, self.mj_data, key_callback=key_callback)
 
