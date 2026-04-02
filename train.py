@@ -204,8 +204,9 @@ def check_physical_consistency(
 # ===============================
 parser = argparse.ArgumentParser(description="Clean Inference & Stitching Pipeline")
 parser.add_argument("--resume", type=int, default=None, help="Resume from checkpoint epoch (int)")
-parser.add_argument("--save_every", type=int, default=50, help="Save checkpoint every N epochs")
+parser.add_argument("--save_every", type=int, default=None, help="Save checkpoint every N epochs")
 parser.add_argument("--seed", type=int, default=42, help="Random seed for reproducibility")
+parser.add_argument("--no_tensorboard", action="store_true", help="Disable TensorBoard logging")
 
 args = parser.parse_args()
 
@@ -351,7 +352,11 @@ window_size = 5
 
 log_dir = get_log_path(model_cfg, data_cfg, training_cfg)
 os.makedirs(log_dir, exist_ok=True)
-writer = SummaryWriter(log_dir=log_dir)
+is_cluster_run = any(k in os.environ for k in ["SLURM_JOB_ID", "PBS_JOBID", "LSB_JOBID"])
+use_tensorboard = (not args.no_tensorboard) and (not is_cluster_run)
+writer = SummaryWriter(log_dir=log_dir) if use_tensorboard else None
+if writer is None:
+    print("TensorBoard logging disabled (cluster run or --no_tensorboard).")
 
 # ===============================
 # Training Loop
@@ -481,10 +486,11 @@ for epoch in range(starting_epoch, num_epochs):
 
         # Step-wise logging
         global_step = epoch * len(train_dataloader) + step
-        writer.add_scalar("Loss/train_step", loss.item(), global_step)
-        writer.add_scalar("Loss/pred_loss", pred_loss.mean().item(), global_step)
-        for aux_name, aux_val in aux_losses.items():
-            writer.add_scalar(f"Loss/{aux_name}", aux_val.item(), global_step)
+        if writer is not None:
+            writer.add_scalar("Loss/train_step", loss.item(), global_step)
+            writer.add_scalar("Loss/pred_loss", pred_loss.mean().item(), global_step)
+            for aux_name, aux_val in aux_losses.items():
+                writer.add_scalar(f"Loss/{aux_name}", aux_val.item(), global_step)
 
         if step % 100 == 0:
             aux_val = aux_total.item() if isinstance(aux_total, torch.Tensor) else float(aux_total)
@@ -492,16 +498,19 @@ for epoch in range(starting_epoch, num_epochs):
                 f"Epoch {epoch}/{num_epochs-1} Step {step}: "
                 f"loss={loss.item():.4f}, "
                 f"pred_loss={pred_loss.mean().item():.4f}, "
-                f"aux={aux_val:.4f}"
+                f"aux={aux_val:.4f}",
+                flush=True,
             )
 
     # Epoch summary
     mean_loss = np.mean(epoch_losses)
     epoch_losses_history.append(mean_loss)
-    writer.add_scalar("Loss/train_epoch", mean_loss, epoch)
+    if writer is not None:
+        writer.add_scalar("Loss/train_epoch", mean_loss, epoch)
     
     scheduler.step()
-    writer.add_scalar("Learning Rate", scheduler.get_last_lr()[0], epoch)
+    if writer is not None:
+        writer.add_scalar("Learning Rate", scheduler.get_last_lr()[0], epoch)
 
     window_mean = np.mean(epoch_losses_history[-window_size:])
     print(f"Epoch [{epoch}/{num_epochs-1}] - Windowed Mean Loss: {window_mean:.5f}")
@@ -596,4 +605,5 @@ plt.tight_layout()
 plt.savefig("loss_curve.png", dpi=300, bbox_inches="tight")
 plt.close(fig)
 
-writer.close()
+if writer is not None:
+    writer.close()

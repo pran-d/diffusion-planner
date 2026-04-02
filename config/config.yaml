@@ -61,13 +61,11 @@ model:
   # attn_resolutions: [2, 3]
 
 training:
-  save_dir: "./runs/ablations/symmetry_aug/"
-  log_dir: "./logs/ablations/symmetry_aug/"
-  suffix: "_mirroraug"
+  suffix: ""
   num_epochs: 1000
   balance_task_density: False
   learning_rate: 0.0005
-  save_every: 20
+  save_every: 50
   condition_dropout_prob: 
     state: 0.1
     task: 0.2

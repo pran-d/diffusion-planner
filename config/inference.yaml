@@ -4,6 +4,8 @@
 common:
   device: cuda
   cfg_w: 1.0
+  use_fp16: false
+  torch_compile: false
 
 inference_mg:
   epoch: null
@@ -45,7 +47,7 @@ batch_goal_sweep:
   stitch_steps: 150
   batch_size: null
   enable_goal_stop: true
-  goal_stop_threshold: 0.1
+  goal_stop_threshold: 0.2
   enable_physics_stop: false
   enable_phys_clamp: true
   last_frame_waypoint: true
@@ -74,7 +76,7 @@ evaluate_ablations:
   stitch_steps: 150
   batch_size: null
   enable_goal_stop: true
-  goal_stop_threshold: 0.1
+  goal_stop_threshold: 0.2
   enable_physics_stop: false
   enable_phys_clamp: true
   last_frame_waypoint: true

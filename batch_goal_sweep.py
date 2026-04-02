@@ -17,6 +17,8 @@ import argparse
 import math
 import os
 import re
+import subprocess
+import sys
 import tempfile
 import json
 import time
@@ -79,6 +81,10 @@ def parse_args(argv=None):
     parser.add_argument("--device",       type=str,   default="cuda")
     parser.add_argument("--batch_size", type=int, default=None,
                         help="Goals per inference batch (default: all at once)")
+    parser.add_argument("--use_fp16", action="store_true",
+                        help="Enable fp16 autocast during inference")
+    parser.add_argument("--torch_compile", action="store_true",
+                        help="Enable torch.compile() for inference model")
     parser.add_argument("--enable_goal_stop", action="store_true")
     parser.add_argument("--goal_stop_threshold", type=float, default=0.1)
     parser.add_argument("--enable_physics_stop", action="store_true")
@@ -223,13 +229,257 @@ def _build_guidance_vecs(obj_traj_w, goals_arr):
     return vecs
 
 
-def visualize_results(full_traj, obj_traj_w, goals_arr, args):
+def _save_overlay_video(
+    trajectories,
+    real_lengths,
+    goals_world,
+    out_path,
+    single_xml_path,
+    repeated_xml_path,
+    fps=100,
+    width=1280,
+    height=720,
+):
+    """Save one MP4 with all trajectories overlaid in a repeated-robot scene.
+
+    Rendering is done in a subprocess so GL backend can be selected before
+    importing MuJoCo (important on headless systems).
+    """
+    x = np.asarray(trajectories)
+    rl = np.asarray(real_lengths, dtype=np.int64)
+    gw = np.asarray(goals_world, dtype=np.float64)
+    if x.ndim != 3:
+        raise ValueError(f"Expected trajectories shape (N, T, D), got {x.shape}")
+    if gw.ndim != 2 or gw.shape[0] != x.shape[0] or gw.shape[1] < 3:
+        raise ValueError(f"Expected goals_world shape (N, 3+), got {gw.shape}")
+
+    with tempfile.TemporaryDirectory(prefix="goal_sweep_overlay_render_") as td:
+        payload = os.path.join(td, "payload.npz")
+        np.savez_compressed(payload, trajectories=x, real_lengths=rl, goals_world=gw[:, :3])
+
+        render_code = r'''
+import os, re, sys, tempfile
+import numpy as np
+import imageio
+import mujoco
+
+payload, out_path, single_xml, repeated_xml, fps, width, height = sys.argv[1:]
+fps = int(fps); width = int(width); height = int(height)
+arr = np.load(payload)
+x = arr["trajectories"]
+rl = arr["real_lengths"].astype(np.int64)
+gw = arr["goals_world"]
+
+single_model = mujoco.MjModel.from_xml_path(single_xml)
+nq_single = int(single_model.nq)
+num_robots = int(x.shape[0])
+
+with open(repeated_xml, "r", encoding="utf-8") as f:
+    lines = f.readlines()
+robot_starts = [i for i, line in enumerate(lines) if re.search(r'body name="pelvis_\d+"', line)]
+if not robot_starts:
+    raise ValueError(f"No pelvis_N bodies found in {repeated_xml}")
+header = "".join(lines[: robot_starts[0]])
+wb_close_idx = next((i for i, l in enumerate(lines) if "</worldbody>" in l), len(lines))
+block_end = robot_starts[1] if len(robot_starts) >= 2 else wb_close_idx
+template = "".join(lines[robot_starts[0]: block_end])
+footer = "".join(lines[wb_close_idx:])
+robot_blocks = [re.sub(r'_0(?=")', f'_{i}', template) for i in range(num_robots)]
+xml_content = header + "".join(robot_blocks) + footer
+
+src_dir = os.path.dirname(os.path.abspath(repeated_xml))
+fd, adaptive_xml = tempfile.mkstemp(prefix=f"goal_sweep_overlay_{num_robots}r_", suffix=".xml", dir=src_dir)
+os.close(fd)
+with open(adaptive_xml, "w", encoding="utf-8") as f:
+    f.write(xml_content)
+
+renderer = None
+try:
+    model = mujoco.MjModel.from_xml_path(adaptive_xml)
+    data = mujoco.MjData(model)
+    model.vis.global_.offwidth = max(model.vis.global_.offwidth, width)
+    model.vis.global_.offheight = max(model.vis.global_.offheight, height)
+    # Remove distance haze/fog for clearer videos.
+    try:
+        model.vis.map.haze = 0.0
+    except Exception:
+        pass
+    renderer = mujoco.Renderer(model, height=height, width=width)
+    try:
+        renderer.scene.flags[mujoco.mjtRndFlag.mjRND_SHADOW] = 0
+    except Exception:
+        pass
+    try:
+        renderer.scene.flags[mujoco.mjtRndFlag.mjRND_REFLECTION] = 0
+    except Exception:
+        pass
+    try:
+        renderer.scene.flags[mujoco.mjtRndFlag.mjRND_FOG] = 0
+    except Exception:
+        pass
+
+    T_max = int(x.shape[1])
+    nq_used = num_robots * nq_single
+    if nq_used > model.nq:
+        raise ValueError(f"Repeated XML nq={model.nq} is smaller than required {nq_used}")
+
+    # Camera framing: center on goal/end-point cloud and zoom out enough so
+    # all robots and markers remain visible in the final phase.
+    end_obj = []
+    for i in range(num_robots):
+        ti_end = int(max(1, rl[i])) - 1
+        end_obj.append(x[i, ti_end, 36:39])
+    end_obj = np.asarray(end_obj, dtype=np.float64)
+    pts = np.concatenate([gw[:, :3], end_obj], axis=0)
+    center = np.mean(pts, axis=0)
+    r_xy = np.linalg.norm(pts[:, :2] - center[:2], axis=1)
+    radius = float(np.max(r_xy)) if len(r_xy) else 1.0
+
+    cam = mujoco.MjvCamera()
+    mujoco.mjv_defaultFreeCamera(model, cam)
+    cam.lookat[:] = [float(center[0]), float(center[1]), float(center[2] + 0.8)]
+    cam.distance = max(1.5, 0.8 + 1.8 * radius)
+    cam.azimuth = 135.0
+    cam.elevation = -16.0
+
+    # Optional mocap markers/arrows if present in repeated XML.
+    goal_mocap_ids = []
+    arrow_mocap_ids = []
+    for i in range(num_robots):
+        bid_g = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_BODY, f"goal_marker_{i}")
+        goal_mocap_ids.append(model.body_mocapid[bid_g] if bid_g >= 0 else -1)
+
+        bid_a = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_BODY, f"guidance_arrow_{i}")
+        arrow_mocap_ids.append(model.body_mocapid[bid_a] if bid_a >= 0 else -1)
+
+    def quat_from_z_to_vec(v):
+        # Return wxyz quaternion rotating +Z axis to vector v.
+        z = np.array([0.0, 0.0, 1.0], dtype=np.float64)
+        n = float(np.linalg.norm(v))
+        if n < 1e-9:
+            return np.array([1.0, 0.0, 0.0, 0.0], dtype=np.float64)
+        t = v / n
+        cross = np.cross(z, t)
+        dot = float(np.dot(z, t))
+        cn = float(np.linalg.norm(cross))
+        if cn < 1e-9:
+            if dot > 0.0:
+                return np.array([1.0, 0.0, 0.0, 0.0], dtype=np.float64)
+            return np.array([0.0, 1.0, 0.0, 0.0], dtype=np.float64)
+        axis = cross / cn
+        angle = float(np.arccos(np.clip(dot, -1.0, 1.0)))
+        half = 0.5 * angle
+        s = float(np.sin(half))
+        return np.array([np.cos(half), axis[0] * s, axis[1] * s, axis[2] * s], dtype=np.float64)
+
+    os.makedirs(os.path.dirname(out_path) or ".", exist_ok=True)
+    with imageio.get_writer(out_path, fps=fps) as writer:
+        for t in range(T_max):
+            q_blocks = []
+            for i in range(num_robots):
+                ti = min(t, int(max(1, rl[i])) - 1)
+                q_blocks.append(x[i, ti, :nq_single])
+
+                # Goal marker (green box) at fixed goal position.
+                gm = goal_mocap_ids[i]
+                if gm >= 0:
+                    data.mocap_pos[gm] = gw[i, :3]
+
+                # Guidance arrow from current object position towards goal.
+                am = arrow_mocap_ids[i]
+                if am >= 0:
+                    obj = x[i, ti, 36:39]
+                    d = gw[i, :3] - obj
+                    q = quat_from_z_to_vec(d)
+                    data.mocap_pos[am] = obj
+                    data.mocap_quat[am] = q
+
+            data.qpos[:nq_used] = np.concatenate(q_blocks, axis=0)
+            mujoco.mj_kinematics(model, data)
+            mujoco.mj_comPos(model, data)
+            renderer.update_scene(data, camera=cam)
+            frame = renderer.render()
+            if frame.dtype != np.uint8:
+                frame = (np.clip(frame, 0.0, 1.0) * 255.0).astype(np.uint8)
+            writer.append_data(frame)
+finally:
+    try:
+        if renderer is not None:
+            renderer.close()
+    except Exception:
+        pass
+    try:
+        if os.path.exists(adaptive_xml):
+            os.unlink(adaptive_xml)
+    except Exception:
+        pass
+'''
+
+        errors = []
+        for backend, pyopengl in (("egl", "egl"), ("osmesa", "osmesa")):
+            env = os.environ.copy()
+            env["MUJOCO_GL"] = backend
+            env["PYOPENGL_PLATFORM"] = pyopengl
+            env["OMP_NUM_THREADS"] = env.get("OMP_NUM_THREADS", "1")
+            env["MKL_NUM_THREADS"] = env.get("MKL_NUM_THREADS", "1")
+            env.pop("DISPLAY", None)
+
+            proc = subprocess.run(
+                [
+                    sys.executable,
+                    "-c",
+                    render_code,
+                    payload,
+                    out_path,
+                    single_xml_path,
+                    repeated_xml_path,
+                    str(int(fps)),
+                    str(int(width)),
+                    str(int(height)),
+                ],
+                env=env,
+                capture_output=True,
+                text=True,
+            )
+            if proc.returncode == 0:
+                return
+            errors.append(
+                f"backend={backend}\nstdout:\n{proc.stdout}\nstderr:\n{proc.stderr}"
+            )
+
+        raise RuntimeError("Overlay render failed for EGL and OSMesa backends.\n" + "\n---\n".join(errors))
+
+
+def visualize_results(full_traj, obj_traj_w, goals_arr, real_lengths, args):
     """Visualise all N trajectories side-by-side in MuJoCo."""
     N, T, _ = full_traj.shape
     xml_path, repeated_xml_path = get_mj_xml_paths()
     guidance_vecs = _build_guidance_vecs(obj_traj_w, goals_arr)
 
-    if os.path.exists(repeated_xml_path) and not getattr(args, 'video', False):
+    # Video path: mirror run_inference_ablations behavior and avoid creating
+    # any GLFW viewer in the parent process (headless-safe).
+    if getattr(args, 'video', False):
+        video_path = getattr(args, 'video_path', None) or os.path.join(args.save_dir, "videos", "overlaid_robots.mp4")
+        if os.path.exists(xml_path) and os.path.exists(repeated_xml_path):
+            _save_overlay_video(
+                trajectories=full_traj,
+                real_lengths=real_lengths,
+                goals_world=goals_arr,
+                out_path=video_path,
+                single_xml_path=xml_path,
+                repeated_xml_path=repeated_xml_path,
+                fps=100,
+                width=1280,
+                height=720,
+            )
+            print(f"[video] Saved {video_path}")
+        else:
+            print(
+                f"[video] Missing XML for overlay video (single={xml_path}, repeated={repeated_xml_path}); skipping."
+            )
+        return
+
+    if os.path.exists(repeated_xml_path):
         adaptive_xml = None
         try:
             adaptive_xml = build_adaptive_xml(repeated_xml_path, N)
@@ -256,17 +506,12 @@ def visualize_results(full_traj, obj_traj_w, goals_arr, args):
     markers = [np.tile(goals_arr[i:i+1], (T, 1)) for i in range(N)]
     t_arr = np.arange(T) * 0.01
     vis = MjVisualizer(xml_path, close_on_enter=False)
-    
-    if getattr(args, 'video', False):
-        video_path = getattr(args, 'video_path', None) or "results/goal_sweep_video.mp4"
-        os.makedirs(os.path.dirname(video_path) or ".", exist_ok=True)
-        vis.render_trajectory_to_video(t=t_arr, x_traj=full_traj[0], save_path=video_path)
-    else:
-        vis.visualize_trajectory(
-            t=t_arr, x_traj=full_traj[0], repeat=True,
-            guidance_vec=guidance_vecs[0], goal_pos=goals_arr[0],
-            overlay_paths=overlay_paths, markers=markers,
-        )
+
+    vis.visualize_trajectory(
+        t=t_arr, x_traj=full_traj[0], repeat=True,
+        guidance_vec=guidance_vecs[0], goal_pos=goals_arr[0],
+        overlay_paths=overlay_paths, markers=markers,
+    )
     vis.close()
 
 
@@ -380,9 +625,11 @@ def run_goal_sweep(mg, dataset, args):
             lift_end=getattr(args, 'lift_end', 0.20),
             walk_start_z=getattr(args, 'walk_start_z', 0.80),
             no_lower_dist=getattr(args, 'no_lower_dist', 0.4),
+            use_fp16=bool(getattr(args, 'use_fp16', False)),
+            compile_model=bool(getattr(args, 'torch_compile', False)),
         )
         elapsed = time.perf_counter() - t0
-        per_traj_elapsed = elapsed / max(bs, 1)
+        per_traj_elapsed = elapsed
         # traj: (bs, T, 43),  rl: (bs,)
         for j in range(bs):
             all_trajs.append(traj[j])
@@ -459,6 +706,10 @@ def main():
     real_lengths = result["real_lengths"]
     ref_obj_pos = result["ref_obj_pos"]
     N = len(goals_world)
+    per_goal_time_s = np.asarray(result.get("per_goal_time_s", np.zeros(N, dtype=np.float64)), dtype=np.float64)
+    stitch_steps = int(max(1, result.get("stitch_steps", 1)))
+    planning_horizon_s = float(result.get("planning_horizon_s", 0.0))
+    avg_window_generation_time_s = float(np.mean(per_goal_time_s) / stitch_steps) if len(per_goal_time_s) else 0.0
 
     # -- 4. Print summary --------------------------------------------------
     print(f"\nRef obj pos: {ref_obj_pos}")
@@ -473,6 +724,8 @@ def main():
               f"T_real={real_lengths[i]}")
     print(f"\n  Mean error: {np.mean(errors):.4f}m  "
           f"Median: {np.median(errors):.4f}m  Max: {np.max(errors):.4f}m")
+    print(f"  Avg window generation time: {avg_window_generation_time_s:.4f}s/window")
+    print(f"  Planning horizon per window: {planning_horizon_s:.4f}s/window")
     print("=" * 70)
 
     # -- 5. Save -----------------------------------------------------------
@@ -493,9 +746,28 @@ def main():
         real_lengths=result["real_lengths"],
         desired_displacements=result["desired_displacements"],
         achieved_displacements=result["achieved_displacements"],
-        per_goal_time_s=result.get("per_goal_time_s", np.zeros_like(result["errors"])),
+        per_goal_time_s=per_goal_time_s,
+        avg_window_generation_time_s=np.array([avg_window_generation_time_s], dtype=np.float64),
+        planning_horizon_s=np.array([planning_horizon_s], dtype=np.float64),
         ref_obj_pos=ref_obj_pos,
     )
+
+    summary_json = os.path.join(args.save_dir, "summary_metrics.json")
+    with open(summary_json, "w", encoding="utf-8") as f:
+        json.dump(
+            {
+                "avg_window_generation_time_s": avg_window_generation_time_s,
+                "planning_horizon_per_window_s": planning_horizon_s,
+                "avg_trajectory_generation_time_s": float(np.mean(per_goal_time_s)) if len(per_goal_time_s) else 0.0,
+                "stitch_steps": stitch_steps,
+                "num_goals": int(N),
+                "mean_error_m": float(np.mean(errors)),
+                "median_error_m": float(np.median(errors)),
+                "max_error_m": float(np.max(errors)),
+            },
+            f,
+            indent=2,
+        )
 
     # Individual trajectory NPZ files.
     for i in range(N):
@@ -533,9 +805,10 @@ def main():
             "goal_direction_xyz": direction,
             "goal_magnitude_xyz": mag,
             "error": float(result["errors"][i]),
-            "generation_time_s": float(result.get("per_goal_time_s", np.zeros(N))[i]),
-            "time_per_inference_step_s": float(result.get("per_goal_time_s", np.zeros(N))[i]) / max(1, result.get("stitch_steps", 1)),
-            "planning_horizon_s": result.get("planning_horizon_s", 0.0),
+            "generation_time_s": float(per_goal_time_s[i]),
+            "time_per_inference_step_s": float(per_goal_time_s[i]) / stitch_steps,
+            "avg_window_generation_time_s": avg_window_generation_time_s,
+            "planning_horizon_s": planning_horizon_s,
             "trajectory_path": os.path.join(args.save_dir, f"trajectory_{i:03d}.npz"),
         }
         with open(args.metrics_log_path, "a", encoding="utf-8") as f:
@@ -545,7 +818,7 @@ def main():
 
     # -- 6. Visualise ------------------------------------------------------
     if args.visualize or args.video:
-        visualize_results(full_traj, result["obj_traj_w"], goals_world, args)
+        visualize_results(full_traj, result["obj_traj_w"], goals_world, real_lengths, args)
 
 
 if __name__ == "__main__":
