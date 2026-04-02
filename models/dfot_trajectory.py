@@ -222,6 +222,10 @@ class DFoTTrajectory(nn.Module):
         
         self.noise_level = self.noise_scheduler_config.get("noise_level", "random_independent")
         self.scheduling_matrix = self.noise_scheduler_config.get("scheduling_matrix", "full_sequence")
+        self.hierarchical_noise_cfg = self.noise_scheduler_config.get("hierarchical_noise", {})
+        self.hierarchical_schedule_cfg = self.noise_scheduler_config.get("hierarchical_schedule", {})
+        self.hierarchical_noise_enabled = bool(self.hierarchical_noise_cfg.get("enabled", False))
+        self.hierarchical_schedule_enabled = bool(self.hierarchical_schedule_cfg.get("enabled", False))
         self.uniform_future = False
 
         self.is_full_sequence = (
@@ -273,6 +277,36 @@ class DFoTTrajectory(nn.Module):
         self.group_keep_probs = partial_cfg.get("group_keep_prob", {})
         self.waypoint_noise_fraction = self.inbetweening_cfg.get("waypoint_noise_fraction", 0.25)
 
+        # Hierarchical diffusion feature groups (phase-1: root/object plan first,
+        # phase-2: joints/body pose later).
+        self.phase1_feature_keys = self.hierarchical_noise_cfg.get(
+            "phase1_feature_keys",
+            [
+                "delta_xy",
+                "delta_yaw",
+                "obj_delta_xy",
+                "obj_z",
+                "obj_rel_pos",
+                "obj_rel_rot6d",
+            ],
+        )
+        self.phase2_feature_keys = self.hierarchical_noise_cfg.get(
+            "phase2_feature_keys",
+            [
+                "joints",
+                "body_z",
+                "body_rot6d",
+            ],
+        )
+        self._phase1_feature_mask = self._build_feature_mask(
+            self.phase1_feature_keys,
+            data_config["num_features"],
+        )
+        self._phase2_feature_mask = self._build_feature_mask(
+            self.phase2_feature_keys,
+            data_config["num_features"],
+        )
+
         # Optional: group-wise input embeddings for the DiT1D backbone.
         # Instead of a single nn.Linear(D, hidden) the backbone uses per-group
         # projections whose outputs are summed → hidden, giving the model an
@@ -309,6 +343,14 @@ class DFoTTrajectory(nn.Module):
             self.resample_steps = self.inbetweening_cfg.get("resample_steps", 0)
 
 
+    def _build_feature_mask(self, feature_keys, feature_dim: int) -> torch.Tensor:
+        mask = torch.zeros(feature_dim, dtype=torch.bool)
+        for key in feature_keys:
+            sl = self.feature_index_map.get(key)
+            if sl is not None:
+                mask[sl] = True
+        return mask
+
     #### Training Utils ####
     def _get_training_noise_levels(
             self, xs: torch.Tensor, masks: torch.Tensor = None,
@@ -324,21 +366,59 @@ class DFoTTrajectory(nn.Module):
                 device=xs.device,
             )
 
-            match self.noise_level:
-                case "random_independent":  # independent noise levels (Diffusion Forcing)
-                    noise_levels = rand_fn((batch_size, n_tokens))
-                case "random_uniform":  # uniform noise levels (Typical Video Diffusion)
-                    noise_levels = rand_fn((batch_size, 1)).repeat(1, n_tokens)
+            if self.hierarchical_noise_enabled:
+                feature_dim = xs.shape[-1]
+                phase1_mask = self._phase1_feature_mask.to(xs.device)
+                phase2_mask = self._phase2_feature_mask.to(xs.device)
+
+                phase1_max_ratio = float(self.hierarchical_noise_cfg.get("phase1_max_ratio", 0.5))
+                phase2_min_ratio = float(self.hierarchical_noise_cfg.get("phase2_min_ratio", 0.0))
+                phase1_max = max(0, min(self.timesteps - 1, int(round((self.timesteps - 1) * phase1_max_ratio))))
+                phase2_min = max(0, min(self.timesteps - 1, int(round((self.timesteps - 1) * phase2_min_ratio))))
+
+                def _rand_range(shape, low: int, high_exclusive: int):
+                    high_exclusive = max(low + 1, high_exclusive)
+                    return torch.randint(low, high_exclusive, shape, device=xs.device)
+
+                if self.noise_level == "random_independent":
+                    p1 = _rand_range((batch_size, n_tokens), 0, phase1_max + 1)
+                    p2 = _rand_range((batch_size, n_tokens), phase2_min, self.timesteps)
+                elif self.noise_level == "random_uniform":
+                    p1 = _rand_range((batch_size, 1), 0, phase1_max + 1).repeat(1, n_tokens)
+                    p2 = _rand_range((batch_size, 1), phase2_min, self.timesteps).repeat(1, n_tokens)
+                else:
+                    raise ValueError(f"Unknown noise level mode: {self.noise_level}")
+
+                noise_levels = p2.unsqueeze(-1).repeat(1, 1, feature_dim)
+                if phase1_mask.any():
+                    noise_levels[..., phase1_mask] = p1.unsqueeze(-1)
+                if phase2_mask.any():
+                    noise_levels[..., phase2_mask] = p2.unsqueeze(-1)
+            else:
+                match self.noise_level:
+                    case "random_independent":  # independent noise levels (Diffusion Forcing)
+                        noise_levels = rand_fn((batch_size, n_tokens))
+                    case "random_uniform":  # uniform noise levels (Typical Video Diffusion)
+                        noise_levels = rand_fn((batch_size, 1)).repeat(1, n_tokens)
+                    case _:
+                        raise ValueError(f"Unknown noise level mode: {self.noise_level}")
 
             if self.uniform_future:  # simplified training (Appendix A.5)
-                noise_levels = rand_fn((batch_size, 1)).repeat(
-                    1, n_tokens
-                )
+                if noise_levels.ndim == 3:
+                    noise_levels = rand_fn((batch_size, 1, noise_levels.shape[-1])).repeat(
+                        1, n_tokens, 1
+                    )
+                else:
+                    noise_levels = rand_fn((batch_size, 1)).repeat(
+                        1, n_tokens
+                    )
 
             # treat frames that are not available as "full noise"
             if masks is not None:
+                valid_tokens = reduce(masks.bool(), "b t ... -> b t", torch.any)
+                valid_tokens = valid_tokens.unsqueeze(-1) if noise_levels.ndim == 3 else valid_tokens
                 noise_levels = torch.where(
-                    reduce(masks.bool(), "b t ... -> b t", torch.any),
+                    valid_tokens,
                     noise_levels,
                     torch.full_like(
                         noise_levels,
@@ -562,7 +642,8 @@ class DFoTTrajectory(nn.Module):
             h = h + indicator
 
         # 3. Condition embedding (same as DiT1D.forward)
-        c = backbone.noise_level_pos_embedding(k)
+        model_k = self.diffusion_model.get_model_noise_levels(k)
+        c = backbone.noise_level_pos_embedding(model_k)
         if external_cond is not None:
             c = c + backbone.external_cond_embedding(external_cond, external_cond_mask)
 
@@ -616,10 +697,10 @@ class DFoTTrajectory(nn.Module):
         )
         c_coeff = (1 - alpha_next - sigma**2).sqrt()
 
-        alpha = dm.add_shape_channels(alpha)
-        alpha_next = dm.add_shape_channels(alpha_next)
-        c_coeff = dm.add_shape_channels(c_coeff)
-        sigma = dm.add_shape_channels(sigma)
+        alpha = dm.expand_to_x(alpha, x)
+        alpha_next = dm.expand_to_x(alpha_next, x)
+        c_coeff = dm.expand_to_x(c_coeff, x)
+        sigma = dm.expand_to_x(sigma, x)
 
         if cfg_w == 1.0:
             pred = self._model_predictions_with_indicator(
@@ -673,7 +754,7 @@ class DFoTTrajectory(nn.Module):
 
         # Only update frames where noise level decreases
         mask = curr_noise_level == next_noise_level
-        x_pred = torch.where(dm.add_shape_channels(mask), x, x_pred)
+        x_pred = torch.where(dm.expand_to_x(mask, x), x, x_pred)
         return x_pred
 
     #### ============== ####
@@ -901,13 +982,15 @@ class DFoTTrajectory(nn.Module):
             partially_known = waypoint_mask.any(dim=-1) & ~fully_known  # (B, T)
 
             # Fully-known frames → noise_level = 0 (clean signal to model)
-            k = torch.where(fully_known, torch.zeros_like(k), k)
+            full_mask = fully_known.unsqueeze(-1) if k.ndim == 3 else fully_known
+            k = torch.where(full_mask, torch.zeros_like(k), k)
 
             # Partially-known frames → intermediate noise level
             if partially_known.any():
                 max_wp_k = max(int(self.waypoint_noise_fraction * self.timesteps), 1)
                 wp_k = torch.randint(0, max_wp_k, k.shape, device=k.device)
-                k = torch.where(partially_known, wp_k, k)
+                partial_mask = partially_known.unsqueeze(-1) if k.ndim == 3 else partially_known
+                k = torch.where(partial_mask, wp_k, k)
 
         # --- Forward diffusion: q_sample ---
         noise = torch.randn_like(x)
@@ -949,7 +1032,7 @@ class DFoTTrajectory(nn.Module):
         loss_weight = self.diffusion_model.compute_loss_weights(
             k, self.diffusion_model.loss_weighting.strategy
         )
-        loss_weight = self.diffusion_model.add_shape_channels(loss_weight)
+        loss_weight = self.diffusion_model.expand_to_x(loss_weight, loss)
         loss = loss * loss_weight
 
         # Zero out loss on pinned features so the model isn't penalised for
@@ -1085,32 +1168,77 @@ class DFoTTrajectory(nn.Module):
         
         return noise_level
 
+    def _generate_hierarchical_two_phase_scheduling_matrix(
+        self,
+        horizon: int,
+    ) -> torch.Tensor:
+        """Create an (M, T, D) schedule where phase-1 features finish early."""
+        K = self.sampling_timesteps
+        M = K + 1
+        phase1_end_ratio = float(self.hierarchical_schedule_cfg.get("phase1_end_ratio", 0.5))
+        phase1_end_step = max(1, min(K, int(round(K * phase1_end_ratio))))
+
+        steps = np.arange(M)
+        phase2_idx = np.clip(K - steps, 0, K)
+        phase1_idx = np.where(
+            steps <= phase1_end_step,
+            np.clip(K - np.rint(steps * K / phase1_end_step).astype(np.int64), 0, K),
+            0,
+        )
+
+        phase1_curve = np.repeat(phase1_idx[:, None], horizon, axis=1)
+        phase2_curve = np.repeat(phase2_idx[:, None], horizon, axis=1)
+
+        D = self.x_shape[0]
+        out_idx = np.repeat(phase2_curve[:, :, None], D, axis=2)
+        phase1_mask = self._phase1_feature_mask.cpu().numpy()
+        if phase1_mask.any():
+            out_idx[:, :, phase1_mask] = phase1_curve[:, :, None]
+
+        scheduling_matrix = torch.from_numpy(out_idx).long()
+        scheduling_matrix = self.diffusion_model.ddim_idx_to_noise_level(scheduling_matrix)
+        return scheduling_matrix
+
     def _generate_scheduling_matrix(
         self,
         horizon: int,
         padding: int = 0,
     ):
-        if self.scheduling_matrix == "full_sequence":
+        if self.scheduling_matrix == "hierarchical_two_phase" or self.hierarchical_schedule_enabled:
+            scheduling_matrix = self._generate_hierarchical_two_phase_scheduling_matrix(horizon)
+        elif self.scheduling_matrix == "full_sequence":
             scheduling_matrix = np.arange(self.sampling_timesteps, -1, -1)[
                 :, None
             ].repeat(horizon, axis=1)
+            scheduling_matrix = torch.from_numpy(scheduling_matrix).long()
+            scheduling_matrix = self.diffusion_model.ddim_idx_to_noise_level(
+                scheduling_matrix
+            )
         elif self.scheduling_matrix == "autoregressive":
              scheduling_matrix = self._generate_pyramid_scheduling_matrix(
                  horizon, self.sampling_timesteps
              )
+             scheduling_matrix = torch.from_numpy(scheduling_matrix).long()
+             scheduling_matrix = self.diffusion_model.ddim_idx_to_noise_level(
+                 scheduling_matrix
+             )
         else:
              raise ValueError(f"Unknown scheduling matrix type: {self.scheduling_matrix}")
-        
-        scheduling_matrix = torch.from_numpy(scheduling_matrix).long()
-
-        scheduling_matrix = self.diffusion_model.ddim_idx_to_noise_level(
-            scheduling_matrix
-        )
 
         # paded entries are labeled as pure noise
-        scheduling_matrix = F.pad(
-            scheduling_matrix, (0, padding, 0, 0), value=self.timesteps - 1
-        )
+        if padding > 0:
+            if scheduling_matrix.ndim == 2:
+                scheduling_matrix = F.pad(
+                    scheduling_matrix, (0, padding, 0, 0), value=self.timesteps - 1
+                )
+            else:
+                pad_vals = torch.full(
+                    (scheduling_matrix.shape[0], padding, scheduling_matrix.shape[2]),
+                    self.timesteps - 1,
+                    dtype=scheduling_matrix.dtype,
+                    device=scheduling_matrix.device,
+                )
+                scheduling_matrix = torch.cat([scheduling_matrix, pad_vals], dim=1)
 
         return scheduling_matrix
 
@@ -1153,7 +1281,10 @@ class DFoTTrajectory(nn.Module):
             init_sched = self._generate_scheduling_matrix(
                 horizon - padding, padding,
             ).to(xs_pred.device)
-            init_noise_levels = repeat(init_sched[0], "t -> b t", b=batch_size)
+            if init_sched.ndim == 2:
+                init_noise_levels = repeat(init_sched[0], "t -> b t", b=batch_size)
+            else:
+                init_noise_levels = repeat(init_sched[0], "t d -> b t d", b=batch_size)
             xs_pred = self._inject_waypoints(
                 xs_pred, waypoint_values, waypoint_mask,
                 noise_levels=init_noise_levels,
@@ -1170,11 +1301,14 @@ class DFoTTrajectory(nn.Module):
             padding,
         )
         scheduling_matrix = scheduling_matrix.to(xs_pred.device)
-        scheduling_matrix = repeat(scheduling_matrix, "m t -> m b t", b=batch_size)
+        if scheduling_matrix.ndim == 2:
+            scheduling_matrix = repeat(scheduling_matrix, "m t -> m b t", b=batch_size)
+        else:
+            scheduling_matrix = repeat(scheduling_matrix, "m t d -> m b t d", b=batch_size)
     
         # prune scheduling matrix to remove identical adjacent rows
         diff = scheduling_matrix[1:] - scheduling_matrix[:-1]
-        skip = torch.argmax((~reduce(diff == 0, "m b t -> m", torch.all)).float())
+        skip = torch.argmax((~reduce(diff == 0, "m b ... -> m", torch.all)).float())
         scheduling_matrix = scheduling_matrix[skip:]
 
         record = [] if return_all else None
@@ -1187,8 +1321,9 @@ class DFoTTrajectory(nn.Module):
             to_noise_levels = scheduling_matrix[m + 1]
 
             # update context mask by changing 0 -> 2 for fully generated tokens
+            finished_tokens = reduce(from_noise_levels == -1, "b t ... -> b t", torch.all)
             context_mask = torch.where(
-                torch.logical_and(context_mask == 0, from_noise_levels == -1),
+                torch.logical_and(context_mask == 0, finished_tokens),
                 2,
                 context_mask,
             )

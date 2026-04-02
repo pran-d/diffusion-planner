@@ -408,6 +408,12 @@ def _build_temp_config(base_config_path: str, merged_ablation_cfg: dict) -> str:
     speed = merged_ablation_cfg.get("speedup_tricks", {})
 
     main_cfg.setdefault("noise_scheduler", {})["inference_timesteps"] = int(inf.get("inference_timesteps", main_cfg["noise_scheduler"].get("inference_timesteps", 10)))
+    if "scheduling_matrix" in inf:
+        main_cfg.setdefault("noise_scheduler", {})["scheduling_matrix"] = inf.get("scheduling_matrix")
+    if "hierarchical_noise" in inf:
+        main_cfg.setdefault("noise_scheduler", {})["hierarchical_noise"] = inf.get("hierarchical_noise")
+    if "hierarchical_schedule" in inf:
+        main_cfg.setdefault("noise_scheduler", {})["hierarchical_schedule"] = inf.get("hierarchical_schedule")
     main_cfg.setdefault("model", {})["use_fp16"] = bool(speed.get("use_fp16", False))
     main_cfg.setdefault("model", {})["compile_model"] = bool(speed.get("torch_compile", False))
     main_cfg.setdefault("model", {})["use_kv_cache"] = bool(speed.get("kv_cache", False))

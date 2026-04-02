@@ -25,6 +25,13 @@ runtime:
 inference:
   inference_timesteps: 10
   cfg_w: 1.0
+  # Optional overrides forwarded into noise_scheduler at runtime.
+  scheduling_matrix: full_sequence
+  hierarchical_noise:
+    enabled: false
+  hierarchical_schedule:
+    enabled: false
+    phase1_end_ratio: 0.5
   stitch_steps: null
   use_last_frame_wp: true
   arrival_ratio: 0.85

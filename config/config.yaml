@@ -169,3 +169,18 @@ noise_scheduler:
   noise_level: "random_uniform"
   scheduling_matrix: "full_sequence"
   use_fourier_noise_embedding: False
+  noise_level_conditioning_reduce: "max"  # reduce (B,T,D) -> (B,T) for timestep embedding
+
+  hierarchical_noise:
+    enabled: False
+    # Phase 1 (root/object planning) uses lower noise than phase 2.
+    phase1_feature_keys: [delta_xy, delta_yaw, obj_delta_xy, obj_z, obj_rel_pos, obj_rel_rot6d]
+    phase2_feature_keys: [joints, body_z, body_rot6d]
+    phase1_max_ratio: 0.5   # max k for phase1 as fraction of train_timesteps
+    phase2_min_ratio: 0.0   # min k for phase2 as fraction of train_timesteps
+
+  hierarchical_schedule:
+    enabled: False
+    # If enabled (or scheduling_matrix == hierarchical_two_phase),
+    # phase1 features reach clean state earlier than phase2.
+    phase1_end_ratio: 0.5

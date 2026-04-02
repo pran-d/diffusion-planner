@@ -6,6 +6,10 @@ common:
   cfg_w: 1.0
   use_fp16: false
   torch_compile: false
+  scheduling_matrix: full_sequence
+  hierarchical_schedule:
+    enabled: false
+    phase1_end_ratio: 0.5
 
 inference_mg:
   epoch: null
