@@ -13,7 +13,7 @@ from einops.layers.torch import Rearrange
 import numpy as np
 from utils.configcls import Config
 
-from utils.math.sbto_utils import build_feature_layout, get_feature_indices
+from utils.math.sbto_utils import build_feature_layout
 
 # =========================
 # Conditioning Embeddings
@@ -250,6 +250,23 @@ class DFoTTrajectory(nn.Module):
             if dim > 0:
                 self.feature_index_map[key] = slice(fidx, fidx + dim)
                 fidx += dim
+
+        # Build mapping from observation-conditioning vector indices -> model
+        # feature indices for inpaint pinning at t=0.
+        # current_state in the dataset is formed as the trailing
+        # `num_observations` features from the full feature vector.
+        self.obs_feature_index_map = {}
+        total_dim = int(data_config.get("num_features", fidx))
+        obs_dim = int(data_config.get("num_observations", 0))
+        obs_start = max(0, total_dim - obs_dim)
+        obs_end = total_dim
+        for key, sl in self.feature_index_map.items():
+            if sl.stop <= obs_start or sl.start >= obs_end:
+                continue
+            local_start = max(sl.start, obs_start) - obs_start
+            local_stop = min(sl.stop, obs_end) - obs_start
+            if local_stop > local_start:
+                self.obs_feature_index_map[key] = slice(local_start, local_stop)
 
         # Build feature group slices for partial masking
         partial_cfg = self.inbetweening_cfg.get("partial_masking", {})
@@ -1315,7 +1332,8 @@ class DFoTTrajectory(nn.Module):
 
         # Avoid creating tqdm by default in cluster inference paths.
         # Caller may still pass a custom progress object with update().
-        f_map = get_feature_indices(build_feature_layout())
+        f_map = self.feature_index_map
+        obs_f_map = self.obs_feature_index_map
         for m in range(scheduling_matrix.shape[0] - 1):
             from_noise_levels = scheduling_matrix[m]
             to_noise_levels = scheduling_matrix[m + 1]
@@ -1401,11 +1419,14 @@ class DFoTTrajectory(nn.Module):
                 # Pin t=0 of the output window to the current (most recent) history frame.
                 # state_cond is (B, H, obs_dim); index -1 is the latest observation.
                 _cur = self.state_cond[..., -1, :]  # (B, obs_dim)
-                xs_pred[..., 0, f_map['joints']] = _cur[..., :29]
-                xs_pred[..., 0, f_map['body_z']] = _cur[..., 29:30]
-                xs_pred[..., 0, f_map['body_rot6d']] = _cur[..., 30:36]
-                xs_pred[..., 0, f_map['obj_rel_pos']] = _cur[..., 36:39]
-                xs_pred[..., 0, f_map['obj_rel_rot6d']] = _cur[..., 39:45]
+                for key in ("joints", "body_z", "body_rot6d", "obj_rel_pos", "obj_rel_rot6d"):
+                    x_sl = f_map.get(key)
+                    obs_sl = obs_f_map.get(key)
+                    if x_sl is None or obs_sl is None:
+                        continue
+                    if (x_sl.stop - x_sl.start) != (obs_sl.stop - obs_sl.start):
+                        continue
+                    xs_pred[..., 0, x_sl] = _cur[..., obs_sl]
             
             if pbar is not None:
                 pbar.update(1)

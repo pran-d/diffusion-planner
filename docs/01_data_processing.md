@@ -16,7 +16,7 @@ Raw trajectories are stored as `.npz` files with the following fields (per the "
 | `joint_pos`       | `(T, 29)`    | Joint angles for the G1 humanoid                      |
 | `obj_xyz_quat`    | `(T, 7)`     | Object position + quaternion in world frame            |
 | `task_type`       | scalar/str    | Task identifier (e.g., "walk_carry_place")             |
-| `task_params`     | `(3,)` or dict | Goal object position in world frame                  |
+| `task_params`     | `(4,)` or dict | Goal parameters (local dir components + distance by default) |
 
 Three input schemas are supported and internally converted:
 
@@ -44,10 +44,10 @@ This is the core dataset class. It loads raw trajectories, windows them into fix
 
 ### 2.2 Windowing & Indexing (`_index_dataset`)
 
-Trajectories are windowed into segments of length `window_size = num_timesteps + num_history`:
+Trajectories are windowed into segments of length `window_size = num_timesteps // downsample` (default: `10`):
 
-- **`num_timesteps`**: 20 (future prediction horizon)
-- **`num_history`**: 1 (state history for conditioning, derived from `state_history`)
+- **`num_timesteps`**: 10 (default prediction horizon)
+- **`state_history`**: 2 (used for `current_state` extraction/conditioning)
 - **`stride`**: 2 (window stride for overlapping windows)
 
 For each trajectory of length `L`:
@@ -151,11 +151,11 @@ Task parameters are computed by `compute_task_params()`:
 3. Compute normalized direction: `dir = goal_local / (d + ε)`
 4. Clip distance to `max_goal_dist` (default: 3.0)
 5. Optionally normalize distance to `[0, 1]` by dividing by `max_goal_dist` (when `normalize_goal_vec: True`)
-6. Return: `[dir_x, dir_y, clipped_distance]` — shape `(3,)`
+6. Return shape depends on `num_task_params` (default `4`): normalized local direction components + clipped distance.
 
 ### 2.6 Current State (State Conditioning)
 
-The **current state** (observation) is extracted from the last `num_history` (1) timesteps. It consists of the last `num_observations` (45) dimensions of the feature vector:
+The **current state** (observation) is extracted from the first `state_history` frames of each window. It uses the last `num_observations` (45) dimensions of the feature vector:
 
 ```
 current_state = features[history_frame, -45:]
@@ -190,9 +190,9 @@ Config: `state_noise_std: 0.01`
 
 Normalization statistics are computed over the entire dataset using batched iteration:
 
-- **Min-Max normalization** (default, `normalization.type: min_max`):
+- **Min-Max normalization** (default, `normalization_type: min_max`):
   - Computes per-feature `min` and `max` across all timesteps and trajectories
-  - Normalizes to `[-1, 1]`: `x_norm = 2 * (x - min) / (max - min + ε) - 1`
+   - Normalizes to `[0, 1]`: `x_norm = (x - min) / (max - min + ε)`
   
 - **Mean-Std normalization** (alternative):
   - Computes per-feature `mean` and `std`
@@ -212,9 +212,9 @@ Each sample from the dataset is a tuple of 4 tensors:
 
 | Name            | Shape              | Description                                                |
 |-----------------|--------------------|------------------------------------------------------------|
-| `future_states` | `(T, 51)`          | Normalized SBTO features for the full window (history + prediction). `T = num_history + num_timesteps = 1 + 20 = 21` |
-| `current_state` | `(45,)`            | Normalized current state observation (from last history frame) |
-| `task_params`   | `(3,)`             | Goal direction + distance in robot-local frame              |
+| `future_states` | `(T, 51)`          | Normalized SBTO features for one window (`T = window_size`, default `10`) |
+| `current_state` | `(H, 45)`          | Normalized current-state history (`H = state_history`, default `2`) |
+| `task_params`   | `(4,)`             | Goal conditioning vector (default dim 4)              |
 | `anchor`        | `(anchor_dim,)`    | Anchor values for inverse SBTO reconstruction               |
 
 ---
@@ -279,5 +279,5 @@ FlexibleWindowDataset.__getitem__(idx)
         │
         ▼
 Output: (future_states, current_state, task_params, anchor)
-         (T, 51)       (45,)          (3,)         (anchor_dim,)
+         (T, 51)       (H, 45)        (4,)         (anchor_dict)
 ```

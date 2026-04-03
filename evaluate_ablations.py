@@ -21,6 +21,7 @@ Usage:
 """
 
 import argparse
+import copy
 import glob
 import math
 import os
@@ -56,7 +57,7 @@ from utils.math.math_tools import yaw_from_quat, yaw_to_rot_matrix
 from motion_generator import MotionGenerator
 from utils.inference_config import load_inference_defaults
 from utils.inference_utils import DEFAULT_LIFT_HEIGHT
-from batch_goal_sweep import run_goal_sweep
+from batch_goal_sweep import run_goal_sweep, _save_overlay_video
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -74,15 +75,29 @@ def derive_suffix_from_filename(cfg_path: str) -> str | None:
     return m.group(1) or ""
 
 
-def patch_suffix_in_config(cfg_path: str, suffix: str) -> str:
-    """Return path to a temp YAML with training.suffix set to *suffix*."""
-    with open(cfg_path, "r") as f:
-        data = yaml.safe_load(f)
-    if not isinstance(data, dict):
-        return cfg_path
-    data.setdefault("training", {})["suffix"] = suffix
-    tmp_path = cfg_path + ".eval_patched.yaml"
-    with open(tmp_path, "w") as f:
+def deep_merge(base: dict, override: dict) -> dict:
+    out = copy.deepcopy(base)
+    for k, v in (override or {}).items():
+        if isinstance(v, dict) and isinstance(out.get(k), dict):
+            out[k] = deep_merge(out[k], v)
+        else:
+            out[k] = copy.deepcopy(v)
+    return out
+
+
+def build_merged_temp_config(base_cfg: dict, override_cfg_path: str, suffix: str | None) -> str:
+    """Return path to a temp YAML that is base+override, with optional suffix override."""
+    with open(override_cfg_path, "r", encoding="utf-8") as f:
+        override = yaml.safe_load(f) or {}
+    if not isinstance(override, dict):
+        override = {}
+
+    data = deep_merge(base_cfg, override)
+    if suffix is not None:
+        data.setdefault("training", {})["suffix"] = suffix
+
+    tmp_path = override_cfg_path + ".eval_patched.yaml"
+    with open(tmp_path, "w", encoding="utf-8") as f:
         yaml.dump(data, f, default_flow_style=False, allow_unicode=True)
     return tmp_path
 
@@ -344,6 +359,118 @@ def compute_physics_metrics(result: dict, mj_xml_path: str = None):
     return result
 
 
+def compute_additional_metrics(result: dict):
+    """
+    Compute additional per-goal quality metrics from the rollout data.
+
+    Adds arrays and aggregate scalars to *result*:
+      success_5cm / success_10cm / success_20cm      (N,)
+      disp_ratio                                     (N,)
+      disp_angle_error_deg                           (N,)  (NaN if undefined)
+      goal_z_error                                   (N,)
+      obj_path_len                                   (N,)
+      obj_straightness                               (N,)
+      robot_base_path_len                            (N,)
+      obj_jerk_rms                                   (N,)
+      metrics_summary                                dict of scalar aggregates
+    """
+    full_traj = result["full_traj"]               # (N, T, 43)
+    real_lengths = result["real_lengths"]         # (N,)
+    goals_world = result["goals_world"]           # (N, 3)
+    errors = result["errors"]                     # (N,)
+    desired = result["desired_displacements"]     # (N, D)
+    achieved = result["achieved_displacements"]   # (N, D)
+
+    N = full_traj.shape[0]
+    eps = 1e-8
+
+    # -- Success rates at practical thresholds --
+    success_5cm = (errors <= 0.05).astype(np.float32)
+    success_10cm = (errors <= 0.10).astype(np.float32)
+    success_20cm = (errors <= 0.20).astype(np.float32)
+
+    # -- Desired vs achieved displacement quality --
+    des_mag = np.linalg.norm(desired, axis=-1)
+    ach_mag = np.linalg.norm(achieved, axis=-1)
+    disp_ratio = ach_mag / np.maximum(des_mag, eps)
+
+    dot = np.sum(desired * achieved, axis=-1)
+    denom = des_mag * ach_mag
+    disp_angle_error_deg = np.full(N, np.nan, dtype=np.float64)
+    valid = denom > eps
+    if np.any(valid):
+        cosang = np.clip(dot[valid] / denom[valid], -1.0, 1.0)
+        disp_angle_error_deg[valid] = np.degrees(np.arccos(cosang))
+
+    # -- Final goal z error --
+    goal_z_error = np.zeros(N, dtype=np.float64)
+
+    # -- Path and smoothness metrics from trajectories --
+    obj_path_len = np.zeros(N, dtype=np.float64)
+    obj_straightness = np.zeros(N, dtype=np.float64)
+    robot_base_path_len = np.zeros(N, dtype=np.float64)
+    obj_jerk_rms = np.zeros(N, dtype=np.float64)
+
+    for i in range(N):
+        rl = max(int(real_lengths[i]), 1)
+        obj_tr = full_traj[i, :rl, 36:39]
+        base_tr = full_traj[i, :rl, 0:3]
+
+        # Goal z error at final valid frame
+        goal_z_error[i] = abs(float(obj_tr[-1, 2]) - float(goals_world[i, 2]))
+
+        if rl >= 2:
+            obj_steps = np.linalg.norm(np.diff(obj_tr, axis=0), axis=-1)
+            base_steps = np.linalg.norm(np.diff(base_tr, axis=0), axis=-1)
+            obj_path_len[i] = float(np.sum(obj_steps))
+            robot_base_path_len[i] = float(np.sum(base_steps))
+
+            obj_net = np.linalg.norm(obj_tr[-1] - obj_tr[0])
+            obj_straightness[i] = float(obj_net / max(obj_path_len[i], eps))
+        else:
+            obj_path_len[i] = 0.0
+            robot_base_path_len[i] = 0.0
+            obj_straightness[i] = 1.0
+
+        if rl >= 4:
+            # Discrete jerk proxy (3rd finite difference, frame-normalized)
+            j = np.diff(obj_tr, n=3, axis=0)
+            obj_jerk_rms[i] = float(np.sqrt(np.mean(np.sum(j * j, axis=-1))))
+        else:
+            obj_jerk_rms[i] = 0.0
+
+    # -- Aggregated summary --
+    per_goal_time = result.get("per_goal_time_s")
+    metrics_summary = {
+        "success_rate_5cm": float(np.mean(success_5cm)),
+        "success_rate_10cm": float(np.mean(success_10cm)),
+        "success_rate_20cm": float(np.mean(success_20cm)),
+        "mean_disp_ratio": float(np.mean(disp_ratio)),
+        "median_disp_ratio": float(np.median(disp_ratio)),
+        "mean_disp_angle_error_deg": float(np.nanmean(disp_angle_error_deg)),
+        "mean_goal_z_error": float(np.mean(goal_z_error)),
+        "mean_obj_path_len": float(np.mean(obj_path_len)),
+        "mean_obj_straightness": float(np.mean(obj_straightness)),
+        "mean_robot_base_path_len": float(np.mean(robot_base_path_len)),
+        "mean_obj_jerk_rms": float(np.mean(obj_jerk_rms)),
+    }
+    if per_goal_time is not None:
+        metrics_summary["mean_per_goal_time_s"] = float(np.mean(per_goal_time))
+
+    result["success_5cm"] = success_5cm
+    result["success_10cm"] = success_10cm
+    result["success_20cm"] = success_20cm
+    result["disp_ratio"] = disp_ratio
+    result["disp_angle_error_deg"] = disp_angle_error_deg
+    result["goal_z_error"] = goal_z_error
+    result["obj_path_len"] = obj_path_len
+    result["obj_straightness"] = obj_straightness
+    result["robot_base_path_len"] = robot_base_path_len
+    result["obj_jerk_rms"] = obj_jerk_rms
+    result["metrics_summary"] = metrics_summary
+    return result
+
+
 # ──────────────────────────────────────────────────────────────────────────────
 # Physics-metric plots
 # ──────────────────────────────────────────────────────────────────────────────
@@ -590,6 +717,11 @@ def parse_args(argv=None):
 
     # Output
     p.add_argument("--output_root", type=str, default="results/ablation_eval")
+    p.add_argument("--video", action="store_true",
+                   help="Save one overlaid MuJoCo video per ablation")
+    p.add_argument("--video_fps", type=int, default=100)
+    p.add_argument("--video_width", type=int, default=1280)
+    p.add_argument("--video_height", type=int, default=720)
     p.add_argument("--visualize", action="store_true",
                    help="Open MuJoCo viewer for each ablation (blocks)")
 
@@ -623,8 +755,14 @@ def main():
         sys.exit(1)
 
     # ── Discover ablation configs ────────────────────────────────────────────
-    pattern = os.path.join(ablations_folder, "**/*.yaml")
-    cfg_files = sorted(glob.glob(pattern, recursive=True))
+    patterns = [
+        os.path.join(ablations_folder, "**/*.yaml"),
+        os.path.join(ablations_folder, "**/*.yml"),
+    ]
+    cfg_files = []
+    for pattern in patterns:
+        cfg_files.extend(glob.glob(pattern, recursive=True))
+    cfg_files = sorted(set(cfg_files))
     cfg_files = [f for f in cfg_files
                  if not f.endswith(".patched.yaml")
                  and not f.endswith(".eval_patched.yaml")]
@@ -638,6 +776,12 @@ def main():
     backup = MAIN_CONFIG_FILE + ".eval_bak"
     if os.path.exists(MAIN_CONFIG_FILE):
         shutil.copy(MAIN_CONFIG_FILE, backup)
+
+    with open(MAIN_CONFIG_FILE, "r", encoding="utf-8") as f:
+        base_main_cfg = yaml.safe_load(f) or {}
+    if not isinstance(base_main_cfg, dict):
+        print(f"ERROR: Base config '{MAIN_CONFIG_FILE}' is not a YAML mapping.")
+        sys.exit(1)
 
     os.makedirs(args.output_root, exist_ok=True)
 
@@ -654,11 +798,8 @@ def main():
             # Derive suffix & patch
             suffix = derive_suffix_from_filename(cfg_path)
             patched_path = None
-            if suffix is not None:
-                patched_path = patch_suffix_in_config(cfg_path, suffix)
-                active_cfg = patched_path
-            else:
-                active_cfg = cfg_path
+            patched_path = build_merged_temp_config(base_main_cfg, cfg_path, suffix)
+            active_cfg = patched_path
 
             try:
                 # ── Install config as the main config ────────────────────────
@@ -704,6 +845,7 @@ def main():
 
                 # ── Run sweep ────────────────────────────────────────────────
                 result = run_goal_sweep(mg, dataset, args)
+                compute_additional_metrics(result)
                 all_results[abl_name] = result
 
                 # ── Save per-ablation arrays ─────────────────────────────────
@@ -727,6 +869,32 @@ def main():
                     per_goal_time_s=result.get("per_goal_time_s", np.zeros_like(result["errors"])),
                 )
 
+                # ── Optional video export (headless-safe overlay renderer) ──
+                if args.video:
+                    try:
+                        xml_path, repeated_xml_path = get_mj_xml_paths()
+                        if os.path.exists(xml_path) and os.path.exists(repeated_xml_path):
+                            video_path = os.path.join(abl_dir, "videos", "overlaid_robots.mp4")
+                            _save_overlay_video(
+                                trajectories=result["full_traj"],
+                                real_lengths=result["real_lengths"],
+                                goals_world=result["goals_world"],
+                                out_path=video_path,
+                                single_xml_path=xml_path,
+                                repeated_xml_path=repeated_xml_path,
+                                fps=int(args.video_fps),
+                                width=int(args.video_width),
+                                height=int(args.video_height),
+                            )
+                            print(f"  Saved overlay video → {video_path}")
+                        else:
+                            print(
+                                f"  ⚠  Missing XML for video export "
+                                f"(single={xml_path}, repeated={repeated_xml_path})"
+                            )
+                    except Exception as e:
+                        print(f"  ⚠  Video export failed: {e}")
+
                 # ── Per-ablation plots ───────────────────────────────────────
                 plot_polar_error(result, abl_name,
                                  os.path.join(abl_dir, "polar_error.png"))
@@ -745,11 +913,33 @@ def main():
                     if pk in result:
                         np.save(os.path.join(abl_dir, f"{pk}.npy"), result[pk])
 
+                # Save additional metric arrays
+                for mk in [
+                    "success_5cm", "success_10cm", "success_20cm",
+                    "disp_ratio", "disp_angle_error_deg", "goal_z_error",
+                    "obj_path_len", "obj_straightness",
+                    "robot_base_path_len", "obj_jerk_rms",
+                ]:
+                    if mk in result:
+                        np.save(os.path.join(abl_dir, f"{mk}.npy"), result[mk])
+
                 # ── Print summary ────────────────────────────────────────────
                 errs = result["errors"]
                 print(f"  Mean err: {np.mean(errs):.4f}m  "
                       f"Median: {np.median(errs):.4f}m  "
                       f"Max: {np.max(errs):.4f}m")
+                ms = result.get("metrics_summary", {})
+                print(f"  Success @5/10/20cm: "
+                    f"{100.0 * ms.get('success_rate_5cm', 0.0):.1f}% / "
+                    f"{100.0 * ms.get('success_rate_10cm', 0.0):.1f}% / "
+                    f"{100.0 * ms.get('success_rate_20cm', 0.0):.1f}%")
+                print(f"  Disp ratio mean/median: "
+                    f"{ms.get('mean_disp_ratio', float('nan')):.3f} / "
+                    f"{ms.get('median_disp_ratio', float('nan')):.3f}  "
+                    f"Dir err: {ms.get('mean_disp_angle_error_deg', float('nan')):.2f}°")
+                print(f"  Obj path len: {ms.get('mean_obj_path_len', float('nan')):.3f}m  "
+                    f"straightness: {ms.get('mean_obj_straightness', float('nan')):.3f}  "
+                    f"jerk RMS: {ms.get('mean_obj_jerk_rms', float('nan')):.5f}")
                 print(f"  Yaw jump — mean: {np.degrees(np.mean(result['yaw_jump_mean'])):.2f}°  "
                       f"max: {np.degrees(np.mean(result['yaw_jump_max'])):.2f}°")
                 if not np.all(np.isnan(result["hand_obj_dist_mean"])):
@@ -760,7 +950,7 @@ def main():
                 if args.visualize:
                     from batch_goal_sweep import visualize_results
                     visualize_results(result["full_traj"], result["obj_traj_w"],
-                                      result["goals_world"], args)
+                                      result["goals_world"], result["real_lengths"], args)
 
                 # ── Cleanup GPU memory before next ablation ──────────────────
                 del mg, dataset, data_buffer
@@ -803,17 +993,33 @@ def main():
         csv_path = os.path.join(args.output_root, "summary.csv")
         with open(csv_path, "w") as f:
             header = ("ablation,mean_error,median_error,max_error,std_error,"
+                      "success_rate_5cm,success_rate_10cm,success_rate_20cm,"
+                      "mean_disp_ratio,median_disp_ratio,mean_disp_angle_error_deg,"
+                      "mean_goal_z_error,mean_obj_path_len,mean_obj_straightness,"
+                      "mean_robot_base_path_len,mean_obj_jerk_rms,"
                       "mean_yaw_jump_deg,max_yaw_jump_deg,"
                       "mean_hand_obj_dist,max_hand_obj_dist,n_goals\n")
             f.write(header)
             for name, r in all_results.items():
                 errs = r["errors"]
+                ms = r.get("metrics_summary", {})
                 yj_m = np.degrees(np.mean(r.get("yaw_jump_mean", [0])))
                 yj_x = np.degrees(np.mean(r.get("yaw_jump_max", [0])))
                 ho_m = np.nanmean(r.get("hand_obj_dist_mean", [np.nan]))
                 ho_x = np.nanmean(r.get("hand_obj_dist_max", [np.nan]))
                 f.write(f"{name},{np.mean(errs):.5f},{np.median(errs):.5f},"
                         f"{np.max(errs):.5f},{np.std(errs):.5f},"
+                        f"{ms.get('success_rate_5cm', np.nan):.5f},"
+                        f"{ms.get('success_rate_10cm', np.nan):.5f},"
+                        f"{ms.get('success_rate_20cm', np.nan):.5f},"
+                        f"{ms.get('mean_disp_ratio', np.nan):.5f},"
+                        f"{ms.get('median_disp_ratio', np.nan):.5f},"
+                        f"{ms.get('mean_disp_angle_error_deg', np.nan):.5f},"
+                        f"{ms.get('mean_goal_z_error', np.nan):.5f},"
+                        f"{ms.get('mean_obj_path_len', np.nan):.5f},"
+                        f"{ms.get('mean_obj_straightness', np.nan):.5f},"
+                        f"{ms.get('mean_robot_base_path_len', np.nan):.5f},"
+                        f"{ms.get('mean_obj_jerk_rms', np.nan):.5f},"
                         f"{yj_m:.3f},{yj_x:.3f},"
                         f"{ho_m:.5f},{ho_x:.5f},{len(errs)}\n")
         print(f"  Saved summary CSV → {csv_path}")

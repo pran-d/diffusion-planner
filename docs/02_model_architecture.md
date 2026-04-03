@@ -352,17 +352,17 @@ The random Fourier weights `W` are fixed (not learned), providing a smooth conti
 ```yaml
 model:
   type: dfot
-  backbone: dit1d
+   backbone_type: dit1d
   hidden_size: 256
   depth: 8
   num_heads: 4
   num_features: 51
-  num_timesteps: 20
-  state_dim: 45
-  task_dim: 3
-  state_cond_drop_prob: 0.1
-  task_cond_drop_prob: 0.2
-  generation_mode: full_sequence
+   num_timesteps: 10
+   state_history: 2
+   num_observations: 45
+   num_task_params: 4
+   group_wise_embedding: true
+   history_aggregation: attn
 ```
 
 ---
@@ -387,8 +387,8 @@ model:
 
 ```
                     ┌─────────────────┐
-                    │  current_state  │ (B, 45)
-                    │   task_params   │ (B, 3)
+                    │  current_state  │ (B, H, 45)
+                    │   task_params   │ (B, 4)
                     └────────┬────────┘
                              │
                     ┌────────▼────────┐

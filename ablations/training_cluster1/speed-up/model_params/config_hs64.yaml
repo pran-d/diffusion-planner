@@ -1,0 +1,6 @@
+model:
+  hidden_size: 64
+  depth: 12
+  num_heads: 4
+  mlp_ratio: 4.0
+  pos_emb_type: "learned_1d"

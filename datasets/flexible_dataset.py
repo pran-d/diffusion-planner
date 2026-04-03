@@ -88,7 +88,7 @@ class FlexibleWindowDataset(Dataset):
             self._calculate_stats()
         
         if self.max_obj_displacement is None:
-            self.max_obj_displacement = self.stats.get("max_task_params")[2]
+            self.max_obj_displacement = self.stats.get("max_task_params")[-1]
             print("Using max_obj_displacement =", self.max_obj_displacement)
 
     @property

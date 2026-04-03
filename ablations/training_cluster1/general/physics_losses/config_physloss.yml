@@ -1,0 +1,5 @@
+training:
+  smoothness_loss_weight: 0.2   # penalise frame-to-frame jitter in predicted trajectory
+  grasp_consistency_loss_weight: 0.8 # penalise obj_rel_pos drift during grasping phases
+  feet_sliding_loss_weight: 0.0 # proxy: penalise ankle velocity during GT stance phases
+    # smoothness_feature_groups: [joints, body_rot6d]  # optional: restrict to specific groups

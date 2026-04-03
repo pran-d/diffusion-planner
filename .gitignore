@@ -11,3 +11,4 @@ config/paths.yaml
 config/ablations/
 unitree_g1/
 uv.lock
+reports/

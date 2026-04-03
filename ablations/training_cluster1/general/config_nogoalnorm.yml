@@ -1,0 +1,3 @@
+data:
+  normalize_goal_vec: False
+  num_task_params: 3

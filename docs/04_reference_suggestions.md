@@ -81,7 +81,7 @@ PLT decomposes motion priors into **part-specific discrete codebooks** (e.g., up
 
 #### 2. Geometric Auxiliary Losses (from PARC)
 
-**Current approach**: Your training uses only the v-prediction MSE loss with fused_min_snr weighting.
+**Current approach**: The baseline now uses v-prediction + fused_min_snr **and** optional auxiliary losses (`smoothness`, `grasp_consistency`, `feet_sliding`).
 
 **Suggested improvement**: Add geometric consistency losses:
 - **Foot/end-effector contact loss**: Penalize foot sliding when the robot should be in ground contact (detectable from `body_z` and joint kinematics via forward kinematics)
@@ -92,18 +92,18 @@ PLT decomposes motion priors into **part-specific discrete codebooks** (e.g., up
 
 #### 3. Multi-Frame Conditioning (from PARC)
 
-**Current approach**: You condition on a single history frame (`state_history: 1`), providing a 45-dim snapshot.
+**Current approach**: The model now conditions on multi-frame history (`state_history: 2` by default) and aggregates it with an attention-based history aggregator.
 
 **Suggested improvement**: Increase to 2–3 conditioning frames to provide velocity/acceleration context:
 - Encode 2–3 past frames (potentially with a small temporal encoder or by concatenating)
 - This gives the model implicit velocity information, improving prediction of dynamic motions
 - PARC uses 2 conditioning frames and finds it critical for maintaining momentum
 
-**Implementation effort**: Low-Medium. Increase `state_history`, modify `state_embedding` to handle multi-frame input (e.g., via a 1D conv or flattened MLP), and adjust the dataset to return more history.
+**Implementation effort**: Largely completed in current code. Remaining work is testing longer history windows (e.g., 3+) and tuning aggregation variants.
 
 #### 4. Feature-Group-Aware Architecture (inspired by PLT)
 
-**Current approach**: Your waypoint indicator projection treats the 51-dim mask uniformly. The partial masking config already defines feature groups (locomotion, pick_place, etc.).
+**Current approach**: Group-aware input embedding is now available (`group_wise_embedding=True`), while waypoint indicator projection remains uniform over the full 51D mask.
 
 **Suggested improvement**: Make the architecture explicitly aware of feature groups:
 - Use **group-wise embedding layers** in the input embedder (separate linear projections for each feature group, then concatenate)
@@ -193,7 +193,7 @@ This would create a **latent diffusion** model for trajectories (you already hav
 
 ### Phase 1 (Quick Wins — 1-2 weeks)
 
-1. **Multi-frame conditioning** (#3): Increase `state_history` to 2–3, modify state embedding
+1. **Multi-frame conditioning** (#3): Already implemented for `state_history=2`; next step is tuning 3+ history lengths
 2. **Temporal smoothness loss** (part of #2): Add jerk penalty on predicted x₀
 3. **Physics-informed thresholding** (#10): Replace percentile thresholding with kinematic limits
 
@@ -201,7 +201,7 @@ This would create a **latent diffusion** model for trajectories (you already hav
 
 4. **Blended denoising** (#1): Implement overlap-based window stitching
 5. **Geometric losses** (#2): Foot contact, object grasping consistency
-6. **Feature-group embeddings** (#4): Group-wise input projection in DiT1D
+6. **Feature-group embeddings** (#4): Implemented; next step is cross-group attention variants
 
 ### Phase 3 (Advanced — 1-2 months)
 

@@ -54,7 +54,7 @@ batch_goal_sweep:
   goal_stop_threshold: 0.2
   enable_physics_stop: false
   enable_phys_clamp: true
-  last_frame_waypoint: true
+  last_frame_waypoint: false
   arrival_ratio: 0.85
   lift_height: 0.5
   lift_start: 0.0
@@ -69,7 +69,7 @@ batch_goal_sweep:
 
 evaluate_ablations:
   ablations_folder: null
-  epoch: latest
+  epoch: 200
   ema: true
   num_goals: 12
   goal_spread: 5
@@ -83,7 +83,7 @@ evaluate_ablations:
   goal_stop_threshold: 0.2
   enable_physics_stop: false
   enable_phys_clamp: true
-  last_frame_waypoint: true
+  last_frame_waypoint: false
   arrival_ratio: 0.85
   lift_height: 0.5
   lift_start: 0.0
@@ -92,3 +92,5 @@ evaluate_ablations:
   no_lower_dist: 0.4
   output_root: results/ablation_eval
   visualize: false
+  video: true
+  video_path: null
