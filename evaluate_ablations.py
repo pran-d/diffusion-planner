@@ -21,6 +21,7 @@ Usage:
 """
 
 import argparse
+import copy
 import glob
 import math
 import os
@@ -56,7 +57,7 @@ from utils.math.math_tools import yaw_from_quat, yaw_to_rot_matrix
 from motion_generator import MotionGenerator
 from utils.inference_config import load_inference_defaults
 from utils.inference_utils import DEFAULT_LIFT_HEIGHT
-from batch_goal_sweep import run_goal_sweep
+from batch_goal_sweep import run_goal_sweep, _save_overlay_video
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -74,15 +75,29 @@ def derive_suffix_from_filename(cfg_path: str) -> str | None:
     return m.group(1) or ""
 
 
-def patch_suffix_in_config(cfg_path: str, suffix: str) -> str:
-    """Return path to a temp YAML with training.suffix set to *suffix*."""
-    with open(cfg_path, "r") as f:
-        data = yaml.safe_load(f)
-    if not isinstance(data, dict):
-        return cfg_path
-    data.setdefault("training", {})["suffix"] = suffix
-    tmp_path = cfg_path + ".eval_patched.yaml"
-    with open(tmp_path, "w") as f:
+def deep_merge(base: dict, override: dict) -> dict:
+    out = copy.deepcopy(base)
+    for k, v in (override or {}).items():
+        if isinstance(v, dict) and isinstance(out.get(k), dict):
+            out[k] = deep_merge(out[k], v)
+        else:
+            out[k] = copy.deepcopy(v)
+    return out
+
+
+def build_merged_temp_config(base_cfg: dict, override_cfg_path: str, suffix: str | None) -> str:
+    """Return path to a temp YAML that is base+override, with optional suffix override."""
+    with open(override_cfg_path, "r", encoding="utf-8") as f:
+        override = yaml.safe_load(f) or {}
+    if not isinstance(override, dict):
+        override = {}
+
+    data = deep_merge(base_cfg, override)
+    if suffix is not None:
+        data.setdefault("training", {})["suffix"] = suffix
+
+    tmp_path = override_cfg_path + ".eval_patched.yaml"
+    with open(tmp_path, "w", encoding="utf-8") as f:
         yaml.dump(data, f, default_flow_style=False, allow_unicode=True)
     return tmp_path
 
@@ -590,6 +605,11 @@ def parse_args(argv=None):
 
     # Output
     p.add_argument("--output_root", type=str, default="results/ablation_eval")
+    p.add_argument("--video", action="store_true",
+                   help="Save one overlaid MuJoCo video per ablation")
+    p.add_argument("--video_fps", type=int, default=100)
+    p.add_argument("--video_width", type=int, default=1280)
+    p.add_argument("--video_height", type=int, default=720)
     p.add_argument("--visualize", action="store_true",
                    help="Open MuJoCo viewer for each ablation (blocks)")
 
@@ -623,8 +643,14 @@ def main():
         sys.exit(1)
 
     # ── Discover ablation configs ────────────────────────────────────────────
-    pattern = os.path.join(ablations_folder, "**/*.yaml")
-    cfg_files = sorted(glob.glob(pattern, recursive=True))
+    patterns = [
+        os.path.join(ablations_folder, "**/*.yaml"),
+        os.path.join(ablations_folder, "**/*.yml"),
+    ]
+    cfg_files = []
+    for pattern in patterns:
+        cfg_files.extend(glob.glob(pattern, recursive=True))
+    cfg_files = sorted(set(cfg_files))
     cfg_files = [f for f in cfg_files
                  if not f.endswith(".patched.yaml")
                  and not f.endswith(".eval_patched.yaml")]
@@ -638,6 +664,12 @@ def main():
     backup = MAIN_CONFIG_FILE + ".eval_bak"
     if os.path.exists(MAIN_CONFIG_FILE):
         shutil.copy(MAIN_CONFIG_FILE, backup)
+
+    with open(MAIN_CONFIG_FILE, "r", encoding="utf-8") as f:
+        base_main_cfg = yaml.safe_load(f) or {}
+    if not isinstance(base_main_cfg, dict):
+        print(f"ERROR: Base config '{MAIN_CONFIG_FILE}' is not a YAML mapping.")
+        sys.exit(1)
 
     os.makedirs(args.output_root, exist_ok=True)
 
@@ -654,11 +686,8 @@ def main():
             # Derive suffix & patch
             suffix = derive_suffix_from_filename(cfg_path)
             patched_path = None
-            if suffix is not None:
-                patched_path = patch_suffix_in_config(cfg_path, suffix)
-                active_cfg = patched_path
-            else:
-                active_cfg = cfg_path
+            patched_path = build_merged_temp_config(base_main_cfg, cfg_path, suffix)
+            active_cfg = patched_path
 
             try:
                 # ── Install config as the main config ────────────────────────
@@ -727,6 +756,32 @@ def main():
                     per_goal_time_s=result.get("per_goal_time_s", np.zeros_like(result["errors"])),
                 )
 
+                # ── Optional video export (headless-safe overlay renderer) ──
+                if args.video:
+                    try:
+                        xml_path, repeated_xml_path = get_mj_xml_paths()
+                        if os.path.exists(xml_path) and os.path.exists(repeated_xml_path):
+                            video_path = os.path.join(abl_dir, "videos", "overlaid_robots.mp4")
+                            _save_overlay_video(
+                                trajectories=result["full_traj"],
+                                real_lengths=result["real_lengths"],
+                                goals_world=result["goals_world"],
+                                out_path=video_path,
+                                single_xml_path=xml_path,
+                                repeated_xml_path=repeated_xml_path,
+                                fps=int(args.video_fps),
+                                width=int(args.video_width),
+                                height=int(args.video_height),
+                            )
+                            print(f"  Saved overlay video → {video_path}")
+                        else:
+                            print(
+                                f"  ⚠  Missing XML for video export "
+                                f"(single={xml_path}, repeated={repeated_xml_path})"
+                            )
+                    except Exception as e:
+                        print(f"  ⚠  Video export failed: {e}")
+
                 # ── Per-ablation plots ───────────────────────────────────────
                 plot_polar_error(result, abl_name,
                                  os.path.join(abl_dir, "polar_error.png"))
@@ -760,7 +815,7 @@ def main():
                 if args.visualize:
                     from batch_goal_sweep import visualize_results
                     visualize_results(result["full_traj"], result["obj_traj_w"],
-                                      result["goals_world"], args)
+                                      result["goals_world"], result["real_lengths"], args)
 
                 # ── Cleanup GPU memory before next ablation ──────────────────
                 del mg, dataset, data_buffer

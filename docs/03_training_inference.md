@@ -10,13 +10,13 @@ The training loop uses standard PyTorch with the following components:
 
 | Component              | Details                                                   |
 |------------------------|-----------------------------------------------------------|
-| Optimizer              | AdamW, lr=1e-4, weight_decay=1e-6                         |
+| Optimizer              | AdamW, lr from config (`5e-4` by default)                |
 | LR Scheduler           | CosineAnnealingLR with T_max = total epochs               |
-| Mixed Precision        | GradScaler with autocast (fp16)                            |
-| EMA                    | Exponential Moving Average of model weights, decay=0.999   |
+| Mixed Precision        | GradScaler + `torch.autocast` (as implemented in code)     |
+| EMA                    | Exponential Moving Average of model weights, decay=0.9995  |
 | Gradient Clipping      | `max_norm=1.0`                                             |
 | Early Stopping         | patience=100, target_loss=0.005                            |
-| Sampler                | WeightedRandomSampler for task density balancing           |
+| Sampler                | Optional WeightedRandomSampler (`balance_task_density`)    |
 
 ### 1.2 Training Step
 
@@ -26,7 +26,7 @@ Each training step:
 future_states, current_state, task_params, anchor = batch
 
 # Construct model condition tuple
-model_cond = (current_state, task_params)  # (B, 45), (B, 3)
+model_cond = (current_state, task_params)  # (B, H, 45), (B, 4) by default
 
 # Forward pass with automatic mixed precision
 with autocast():
@@ -51,7 +51,7 @@ The EMA model maintains a shadow copy of all model parameters:
 ema_param = decay * ema_param + (1 - decay) * model_param
 ```
 
-- Decay: 0.999
+- Decay: 0.9995 (default)
 - The EMA model is used for:
   - Validation loss computation
   - Physical consistency evaluation
@@ -496,12 +496,11 @@ Post-generation checks:
 
 ```yaml
 training:
-  batch_size: 256
-  epochs: 1000
-  learning_rate: 1e-4
-  weight_decay: 1e-6
+   batch_size: 1024         # in data section (`data.batch_size`)
+   num_epochs: 1000
+   learning_rate: 5e-4
   grad_clip: 1.0
-  ema_decay: 0.999
+   ema_decay: 0.9995
   early_stopping_patience: 100
   target_loss: 0.005
 ```
@@ -511,8 +510,8 @@ training:
 ```yaml
 inference:
   guidance_scale: 1.0       # CFG scale
-  stitch_steps: 5           # number of autoregressive windows
-  resample_steps: 2         # RePaint resampling iterations
+   stitch_steps: null/auto   # often auto-derived from target horizon
+   resample_steps: 3         # training in-betweening default
   deterministic: true        # DDIM (no stochastic noise)
   inference_timesteps: 10    # denoising steps
 ```

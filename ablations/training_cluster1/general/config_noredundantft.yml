@@ -1,0 +1,11 @@
+data:
+  num_features: 48
+  num_observations: 45
+  feature_order:
+    - delta_xy
+    - delta_yaw
+    - joints
+    - body_z
+    - body_rot6d
+    - obj_rel_pos
+    - obj_rel_rot6d

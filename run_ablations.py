@@ -8,13 +8,14 @@ import re
 import copy
 import tempfile
 import yaml
+import argparse
 
 # =============================================================================
 # ABLATION STUDIES CONFIGURATION
 # =============================================================================
 # Define the root folder containing your ablation configs.
 # The script will automatically find all .yaml files in this folder and its subfolders.
-ABLATIONS_FOLDER = "config/ablations/mar_12/"
+ABLATIONS_FOLDER = "ablations/training_cluster1/"
 
 # The main configuration file that will be overwritten during training
 MAIN_CONFIG_FILE = "config/config.yaml"
@@ -49,7 +50,9 @@ def derive_suffix_from_filename(cfg_path: str) -> str | None:
     m = re.fullmatch(r'config(_.*)?', stem)
     if m is None:
         return None
-    return m.group(1) or ""   # group(1) is None when there is no underscore part
+    suffix = m.group(1) or ""   # group(1) is None when there is no underscore part
+    # Guard against accidental spaces in filenames (e.g. config_ds2 _1.yaml)
+    return re.sub(r"\s+", "", suffix)
 
 
 def build_merged_temp_config(base_cfg: dict, override_cfg_path: str, suffix: str | None) -> str:
@@ -92,19 +95,57 @@ def build_merged_temp_config(base_cfg: dict, override_cfg_path: str, suffix: str
 # =============================================================================
 
 def main():
-    if not os.path.isdir(ABLATIONS_FOLDER):
-        print(f"ERROR: The directory '{ABLATIONS_FOLDER}' does not exist.")
+    parser = argparse.ArgumentParser(description="Run training ablations by merging each override config into base config.")
+    parser.add_argument("--ablations_folder", default=ABLATIONS_FOLDER, help="Folder containing ablation YAML files")
+    parser.add_argument("--main_config", default=MAIN_CONFIG_FILE, help="Base config to overwrite during each run")
+    parser.add_argument(
+        "--start_index",
+        type=int,
+        default=0,
+        help="Start index (inclusive) of sorted ablations to run",
+    )
+    parser.add_argument(
+        "--end_index",
+        type=int,
+        default=-1,
+        help="End index (exclusive) of sorted ablations to run; -1 means run to the end",
+    )
+    args = parser.parse_args()
+
+    ablations_folder = args.ablations_folder
+    main_config_file = args.main_config
+
+    if not os.path.isdir(ablations_folder):
+        print(f"ERROR: The directory '{ablations_folder}' does not exist.")
         sys.exit(1)
 
-    # Recursively find all .yaml files in the ablations folder
-    search_pattern = os.path.join(ABLATIONS_FOLDER, "**/*.yaml")
-    ablation_files = glob.glob(search_pattern, recursive=True)
+    # Recursively find all .yaml/.yml files in the ablations folder
+    search_patterns = [
+        os.path.join(ablations_folder, "**/*.yaml"),
+        os.path.join(ablations_folder, "**/*.yml"),
+    ]
+    ablation_files = []
+    for pattern in search_patterns:
+        ablation_files.extend(glob.glob(pattern, recursive=True))
     
     # Sort them alphabetically so they run in a predictable order
     ablation_files = sorted(ablation_files)
 
+    # Deduplicate accidental whitespace variants (e.g. config_ds2 _1.yaml vs config_ds2_1.yaml)
+    deduped = []
+    seen_keys = set()
+    for f in ablation_files:
+        rel = os.path.relpath(f, ablations_folder)
+        key = re.sub(r"\s+", "", rel)
+        if key in seen_keys:
+            print(f"[skip] Duplicate-by-whitespace config ignored: {rel}")
+            continue
+        seen_keys.add(key)
+        deduped.append(f)
+    ablation_files = deduped
+
     # Filter out the main config file just in case it is inside the search folder
-    ablation_files = [f for f in ablation_files if os.path.abspath(f) != os.path.abspath(MAIN_CONFIG_FILE)]
+    ablation_files = [f for f in ablation_files if os.path.abspath(f) != os.path.abspath(main_config_file)]
 
     # Skip any .patched.yaml files left over from a previous interrupted run
     ablation_files = [f for f in ablation_files if not f.endswith(".patched.yaml")]
@@ -112,12 +153,29 @@ def main():
     ablation_files = [f for f in ablation_files if not os.path.basename(f).startswith("abl_train_cfg_")]
 
     if not ablation_files:
-        print(f"Warning: No '.yaml' files found in '{ABLATIONS_FOLDER}'.")
+        print(f"Warning: No '.yaml' or '.yml' files found in '{ablations_folder}'.")
         sys.exit(0)
 
+    total_available = len(ablation_files)
+    start_index = max(0, args.start_index)
+    end_index = total_available if args.end_index < 0 else min(args.end_index, total_available)
+
+    if start_index >= end_index:
+        print(
+            f"Warning: empty ablation slice requested start_index={args.start_index}, "
+            f"end_index={args.end_index}, total={total_available}. Nothing to run."
+        )
+        sys.exit(0)
+
+    print(
+        f"Running ablation slice [{start_index}:{end_index}) "
+        f"out of {total_available} total files."
+    )
+    ablation_files = ablation_files[start_index:end_index]
+
     # 1. Backup Current Config
-    original_config = MAIN_CONFIG_FILE
-    backup_config = f"{MAIN_CONFIG_FILE}.bak"
+    original_config = main_config_file
+    backup_config = f"{main_config_file}.bak"
     
     if os.path.exists(original_config):
         print(f"Backing up {original_config} -> {backup_config}")
@@ -137,7 +195,7 @@ def main():
     try:
         for i, cfg_path in enumerate(ablation_files):
             # Extract folder/file name for a cleaner display comment
-            relative_name = os.path.relpath(cfg_path, ABLATIONS_FOLDER)
+            relative_name = os.path.relpath(cfg_path, ablations_folder)
 
             # Derive suffix from filename and patch it into a temporary copy
             suffix = derive_suffix_from_filename(cfg_path)
@@ -163,7 +221,7 @@ def main():
 
                 # 3. Run Training
                 print("Starting training process...")
-                cmd = ["python", "train.py"]
+                cmd = [sys.executable, "train.py"]
                 
                 start_t = time.time()
                 subprocess.run(cmd, check=True)

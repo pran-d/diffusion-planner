@@ -1,0 +1,2 @@
+noise_scheduler:
+  train_timesteps: 1000

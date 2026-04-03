@@ -114,10 +114,47 @@ def load_config(config_path: str, auto_conf: bool = False) -> dict:
     return model_cfg, data_cfg, training_cfg, noise_sched_cfg
 
 def get_run_path(model_cfg: dict, data_cfg: dict, training_cfg: dict) -> str:
-    input_size = data_cfg.get('num_timesteps', 'unknown') // data_cfg.get('downsample', 1)
-    num_channels = data_cfg.get('num_features', 'unknown')
+    # Some ablation configs are partial overrides (e.g. training-only), so
+    # model/data keys may be missing. Fill missing run-name fields from the
+    # base config/config.yaml when available.
+    model_type = model_cfg.get('type', None)
+    num_timesteps = data_cfg.get('num_timesteps', None)
+    downsample = data_cfg.get('downsample', None)
+    num_channels = data_cfg.get('num_features', None)
+
+    if model_type is None or num_timesteps is None or downsample is None or num_channels is None:
+        base_cfg_path = os.path.join(_CONFIG_DIR, "config.yaml")
+        if os.path.exists(base_cfg_path):
+            try:
+                base = load_yaml_with_includes(base_cfg_path) or {}
+                base_model = base.get("model", {}) if isinstance(base.get("model", {}), dict) else {}
+                base_data = base.get("data", {}) if isinstance(base.get("data", {}), dict) else {}
+                if model_type is None:
+                    model_type = base_model.get("type", None)
+                if num_timesteps is None:
+                    num_timesteps = base_data.get("num_timesteps", None)
+                if downsample is None:
+                    downsample = base_data.get("downsample", None)
+                if num_channels is None:
+                    num_channels = base_data.get("num_features", None)
+            except Exception:
+                pass
+
+    try:
+        num_timesteps_i = int(num_timesteps)
+        downsample_i = max(1, int(downsample))
+        input_size = num_timesteps_i // downsample_i
+    except (TypeError, ValueError):
+        input_size = 'unknown'
+
+    try:
+        num_channels = int(num_channels)
+    except (TypeError, ValueError):
+        num_channels = 'unknown'
+
+    model_type = model_type if isinstance(model_type, str) and model_type else 'model'
     suffix = training_cfg.get('suffix', '')
-    save_dir = f"{model_cfg.get('type', 'model')}_ts{input_size}_f{num_channels}"
+    save_dir = f"{model_type}_ts{input_size}_f{num_channels}"
     save_dir += f"{suffix}/"
     return save_dir
 

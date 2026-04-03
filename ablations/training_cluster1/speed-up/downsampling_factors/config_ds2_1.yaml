@@ -1,0 +1,3 @@
+data:
+  num_timesteps: 5
+  downsample: 2
