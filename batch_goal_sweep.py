@@ -589,7 +589,7 @@ def run_goal_sweep(mg, dataset, args):
         stitch_steps = max(base_steps, math.ceil(max_dist / m_per_step))
 
     _eff_horizon = max(1, data_cfg["num_timesteps"] - data_cfg.get("state_history", 1))
-    planning_horizon_s = _eff_horizon * 0.01
+    planning_horizon_s = _eff_horizon * data_cfg.get("raw_dt", 0.01) * data_cfg.get("downsample", 1)
 
     # -- Run inference (batched) -------------------------------------------
     batch_size = getattr(args, 'batch_size', None) or N  # default: all at once

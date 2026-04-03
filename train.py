@@ -311,6 +311,16 @@ elif data_cfg.get("dataset_class", "flexible") == "flexible":
         training_cfg=training_cfg,
     )
 
+if len(dataset) <= 0:
+    raise ValueError(
+        "Resolved dataset is empty (0 windows). "
+        f"data_path={data_path}, "
+        f"task_list_path={data_cfg.get('task_list_path')}, "
+        f"file_names={data_cfg.get('file_names')}. "
+        "Check that requested files exist for tasks in the task list "
+        "and that windowing params (num_timesteps/stride/downsample) are valid."
+    )
+
 sampler = None
 shuffle = True
 

@@ -20,10 +20,7 @@ if [[ $# -gt 0 && "$1" != -* ]]; then
 fi
 
 # Enable video export by setting ENABLE_VIDEO=1
-cmd=(uv run python batch_goal_sweep.py --epoch "$epoch")
-if [[ "${ENABLE_VIDEO:-0}" == "1" ]]; then
-	cmd+=(--video)
-fi
+cmd=(uv run python batch_goal_sweep.py --video --epoch "$epoch")
 
 # Forward any extra arguments passed to this script
 cmd+=("$@")

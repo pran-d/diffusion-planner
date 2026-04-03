@@ -94,6 +94,7 @@ def load_config(config_path: str, auto_conf: bool = False) -> dict:
     data_cfg.setdefault("dir_path", paths.get("data_dir", "./"))
     data_cfg.setdefault("train_path", paths.get("train_path", ""))
     data_cfg.setdefault("task_list_path", paths.get("task_list_path", ""))
+    data_cfg.setdefault("file_names", paths.get("file_names", None))
     # Training / run paths
     training_cfg.setdefault("save_dir", paths.get("save_dir", "./runs/"))
     training_cfg.setdefault("log_dir", paths.get("log_dir", "./logs/"))

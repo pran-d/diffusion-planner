@@ -5,6 +5,8 @@ import time
 import sys
 import glob
 import re
+import copy
+import tempfile
 import yaml
 
 # =============================================================================
@@ -20,6 +22,16 @@ MAIN_CONFIG_FILE = "config/config.yaml"
 # =============================================================================
 # HELPERS
 # =============================================================================
+
+def deep_merge(base: dict, override: dict) -> dict:
+    """Recursively merge ``override`` into ``base`` and return a new dict."""
+    out = copy.deepcopy(base)
+    for k, v in (override or {}).items():
+        if isinstance(v, dict) and isinstance(out.get(k), dict):
+            out[k] = deep_merge(out[k], v)
+        else:
+            out[k] = v
+    return out
 
 def derive_suffix_from_filename(cfg_path: str) -> str | None:
     """
@@ -40,33 +52,38 @@ def derive_suffix_from_filename(cfg_path: str) -> str | None:
     return m.group(1) or ""   # group(1) is None when there is no underscore part
 
 
-def patch_suffix_in_config(cfg_path: str, suffix: str) -> str:
+def build_merged_temp_config(base_cfg: dict, override_cfg_path: str, suffix: str | None) -> str:
     """
-    Load the YAML at cfg_path, set training.suffix = suffix, and write the
-    result to a temporary file next to the original.  Returns the temp path.
+    Merge the ablation override YAML into base config and optionally force
+    ``training.suffix`` from filename-derived ``suffix``.
 
-    If the YAML does not have a training.suffix key we add it so the patch is
-    always applied regardless of what the file contains.
+    This enables ablation files to only define changed values.
     """
-    with open(cfg_path, "r") as f:
-        data = yaml.safe_load(f)
+    with open(override_cfg_path, "r") as f:
+        override = yaml.safe_load(f)
 
-    if not isinstance(data, dict):
-        # Malformed YAML — just return the original unpatched.
-        return cfg_path
+    if override is None:
+        override = {}
+    if not isinstance(override, dict):
+        print("  [warn] Override config is not a YAML mapping; treating as empty override.")
+        override = {}
 
-    training_section = data.setdefault("training", {})
-    old_suffix = training_section.get("suffix", "<not set>")
-    training_section["suffix"] = suffix
+    data = deep_merge(base_cfg, override)
 
-    if old_suffix != suffix:
-        print(f"  [patch] training.suffix: '{old_suffix}' → '{suffix}'")
-    else:
-        print(f"  [patch] training.suffix already matches: '{suffix}' (no change)")
+    if suffix is not None:
+        training_section = data.setdefault("training", {})
+        old_suffix = training_section.get("suffix", "<not set>")
+        training_section["suffix"] = suffix
 
-    tmp_path = cfg_path + ".patched.yaml"
+        if old_suffix != suffix:
+            print(f"  [patch] training.suffix: '{old_suffix}' → '{suffix}'")
+        else:
+            print(f"  [patch] training.suffix already matches: '{suffix}' (no change)")
+
+    fd, tmp_path = tempfile.mkstemp(prefix="abl_train_cfg_", suffix=".yaml")
+    os.close(fd)
     with open(tmp_path, "w") as f:
-        yaml.dump(data, f, default_flow_style=False, allow_unicode=True)
+        yaml.safe_dump(data, f, default_flow_style=False, allow_unicode=True, sort_keys=False)
     return tmp_path
 
 
@@ -91,6 +108,8 @@ def main():
 
     # Skip any .patched.yaml files left over from a previous interrupted run
     ablation_files = [f for f in ablation_files if not f.endswith(".patched.yaml")]
+    # Skip temp merged files created by this runner (if any exist from interruptions)
+    ablation_files = [f for f in ablation_files if not os.path.basename(f).startswith("abl_train_cfg_")]
 
     if not ablation_files:
         print(f"Warning: No '.yaml' files found in '{ABLATIONS_FOLDER}'.")
@@ -103,6 +122,15 @@ def main():
     if os.path.exists(original_config):
         print(f"Backing up {original_config} -> {backup_config}")
         shutil.copy(original_config, backup_config)
+    else:
+        print(f"ERROR: Main config file '{original_config}' does not exist.")
+        sys.exit(1)
+
+    with open(backup_config, "r") as f:
+        base_config_data = yaml.safe_load(f)
+    if not isinstance(base_config_data, dict):
+        print(f"ERROR: Base config '{backup_config}' is not a YAML mapping.")
+        sys.exit(1)
 
     total_start = time.time()
 
@@ -121,12 +149,11 @@ def main():
             print(f"Source Config: {cfg_path}")
             if suffix is None:
                 print(f"  [warn] Filename does not match 'config[_...].yaml' — "
-                      f"using training.suffix as-is from the file.")
-                active_cfg = cfg_path
+                      f"using training.suffix from merged config.")
             else:
                 print(f"  Derived suffix from filename: '{suffix}'")
-                patched_path = patch_suffix_in_config(cfg_path, suffix)
-                active_cfg = patched_path
+            patched_path = build_merged_temp_config(base_config_data, cfg_path, suffix)
+            active_cfg = patched_path
             print("#" * 80 + "\n")
 
             try:

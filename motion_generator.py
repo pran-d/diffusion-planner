@@ -789,13 +789,14 @@ class MotionGenerator:
                 # B. Build waypoints (full keyframe at t=0 + optional last-frame partial wp)
                 wv, wm = None, None
                 if getattr(self.diffuser.model, 'inbetweening_enabled', False):
+                    model_feature_dim = int(getattr(self.diffuser.model, 'x_shape', torch.Size([self.data_cfg['num_features']]))[0])
                     remaining = max(stitch_steps - step, 1)
                     _current_obj_z = torch.from_numpy(
                         current_anchors['ref_obj_pos'][:, 2].astype(np.float32)
                     )
                     wv, wm = build_inference_waypoints(
                         curr_state_tens, task_actual, self.dataset,
-                        self.data_cfg['num_features'], window_size,
+                        model_feature_dim, window_size,
                         use_last_frame_wp=use_last_frame_wp,
                         stitch_steps=stitch_steps,
                         remaining_steps=remaining,

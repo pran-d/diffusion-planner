@@ -8,7 +8,7 @@ data:
   num_task_params: 4
   num_observations: 45
   start_timestep: 0
-  num_timesteps: 10
+  num_timesteps: 20
   state_history: 2
   stride: 2
   normalize_goal_vec: True
@@ -62,7 +62,7 @@ model:
 
 training:
   suffix: ""
-  num_epochs: 1000
+  num_epochs: 500
   balance_task_density: False
   learning_rate: 0.0005
   save_every: 50
@@ -109,13 +109,13 @@ training:
       pose:       [body_z, body_rot6d]
       object:     [obj_rel_pos, obj_rel_rot6d]
     group_drop_prob:
-      left_leg:   0.3
-      right_leg:  0.3
-      torso:      0.2
-      left_arm:   0.4
-      right_arm:  0.4
-      pose:       0.2
-      object:     0.3
+      left_leg:   0.25
+      right_leg:  0.25
+      torso:      0.25
+      left_arm:   0.25
+      right_arm:  0.25
+      pose:       0.25
+      object:     0.25
 
   # Stitched rollouts (multi-window training for long-horizon)
   stitched_rollouts:
