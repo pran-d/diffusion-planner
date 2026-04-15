@@ -1,0 +1,26 @@
+\begin{table}[!h]
+\centering
+\caption*{List of Symbols}
+\begin{tabular}{ll}
+\toprule
+Symbol & Meaning \\
+\midrule
+$\tau$ & Full generated trajectory \\
+$x_0$ & Clean trajectory window \\
+$x_k$ & Noisy trajectory at diffusion step $k$ \\
+$c$ & Conditioning vector (history and goal) \\
+$h$ & State history context \\
+$g$ & Goal displacement / task condition \\
+$w_{cfg}$ & Classifier-free guidance weight \\
+$M$ & Binary in-painting mask \\
+$\mathcal{L}_{diff}$ & Diffusion reconstruction loss \\
+$\mathcal{L}_{sm}$ & Temporal smoothness loss \\
+$\mathcal{L}_{gr}$ & Grasp-consistency loss \\
+$e_T$ & Terminal goal error \\
+$\phi_{jit}$ & Jitter diagnostic \\
+$\phi_{pen}$ & Penetration diagnostic \\
+$\mathcal{E}_g$ & Elite set at evolutionary generation $g$ \\
+$F(\tau)$ & Scalar fitness score \\
+\bottomrule
+\end{tabular}
+\end{table}

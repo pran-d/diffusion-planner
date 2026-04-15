@@ -1,0 +1,16 @@
+\section{Conclusion}
+
+This work presents a diffusion-based framework for long-horizon whole-body trajectory generation in robotic loco-manipulation. By leveraging base-relative coordinate transformations, 1D diffusion transformers, and robust conditioning strategies, the proposed system generates task-conditioned motion primitives that generalize across spatial configurations.
+
+\subsection{Work done so far}
+We have developed a conditional diffusion-based framework for whole-body trajectory generation, leveraging trajectory segmentation and egocentric data representations for learning useful motion primitives. While the proposed system is able to achieve in-distribution reconstruction with low error, it is unable to generalize by systematically stitching different segments.
+
+\subsection{Future Work}
+Challenges in physical consistency, constraint satisfaction and long-horizon (OOD) stability are to be solved.
+
+\begin{itemize}
+    \item \textbf{Physics Integration}: Use trajectory optimization or simulation RL rollouts to resolve kinematic violations.
+    \item \textbf{Inference-time guidance}: Use geometric cost gradients to improve constraint satisfaction at inference.
+    \item \textbf{Model-based diffusion}: Leverage the diffusion process as an optimization problem, incorporating costs into the modeled distribution itself.
+\end{itemize}
+

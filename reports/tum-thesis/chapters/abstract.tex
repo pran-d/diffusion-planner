@@ -1,0 +1,7 @@
+Humanoid loco-manipulation requires planning in a high-dimensional, multi-modal space from limited demonstrations. This thesis studies conditional diffusion models as high-level generators of whole-body kinematic trajectories for object-relocation tasks. Instead of predicting a single deterministic future, the model learns a conditional distribution over short-horizon motion segments and generates trajectories through iterative denoising.
+
+The proposed approach combines an egocentric, yaw-invariant representation with a diffusion-transformer denoiser conditioned on state history and task goals. Long-horizon behavior is produced by autoregressive stitching of generated windows. The thesis explores robustness mechanisms including classifier-free conditioning dropout, masked state in-painting, and inference-time heuristic consistency checks.
+
+The objective of this work is to evaluate diffusion-based kinematic planning in a broader control pipeline where an RL tracker follows generated plans. In this setting, the generated trajectories are not dynamically solved during diffusion sampling; instead, they provide kinematically consistent motion references that are subsequently corrected and executed by the tracker.
+
+Overall, the thesis shows that conditional diffusion is a practical and expressive approach for sparse-demonstration kinematic trajectory generation, and establishes a systematic basis for using such models in humanoid loco-manipulation pipelines.

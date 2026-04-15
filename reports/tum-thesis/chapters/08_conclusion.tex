@@ -1,0 +1,18 @@
+This thesis presented a conditional diffusion framework for humanoid kinematic planning in object-relocation loco-manipulation tasks. The work reformulated planning as distribution learning over short-horizon trajectories, designed an egocentric representation pipeline for robust conditioning, and implemented a diffusion-forcing transformer model with state in-painting-aware denoising and autoregressive stitching.
+
+Empirical analysis showed that the proposed planner reconstructs in-distribution trajectories with strong local fidelity and can generalize directionally to unseen goals. At the same time, long-horizon precision and physical consistency remain the principal bottlenecks, especially when multiple generated segments are stitched autoregressively.
+
+In direct answer to the research questions from Chapter~1, the most effective data-representation choices are egocentric yaw-normalized conditioning, clipped goal magnitudes, longer history windows, and partial masking with auxiliary regularization. The dominant failure modes are autoregressive drift, stitching discontinuities, and imperfect physical executability under hard OOD goals.
+
+The main conclusion is that diffusion models are highly effective as \emph{kinematic motion priors} for humanoid planning, but should be embedded in hybrid pipelines that enforce dynamics and contact constraints downstream. From this perspective, the planner developed in this thesis is a strong high-level module rather than a complete standalone controller. The RL tracking and evolutionary pipeline in Chapter~\ref{chap:rl_evo} is therefore not an auxiliary add-on, but the practical mechanism that converts planner outputs into dynamically usable rollouts and expands feasible task-space coverage.
+
+Future work should prioritize: (i) physics-aware correction or optimization in the denoising loop, (ii) overlap-based receding-horizon stitching with stronger continuity constraints, (iii) adaptive guidance for improved OOD goal adherence, and (iv) tighter planner--tracker co-design for closed-loop execution quality.
+
+An important next milestone is a \textbf{two-phase motion planner} that separates global and local planning problems while using a single diffusion backbone:
+\begin{itemize}
+	\item \textbf{Global phase:} coarse transport intent (object route, body progression, heading/timing).
+	\item \textbf{Local phase:} contact-aware whole-body refinement (joints, grasp consistency, smooth transitions).
+\end{itemize}
+Rather than training separate models, the two phases can be realized by \textbf{noise-level scheduling} (and feature-group denoising order) inside one model: global channels denoise earlier and local channels later. This is expected to reduce dependence on hand-crafted waypoint heuristics and yield more principled constrained generation.
+
+Finally, broader validation should include different tasks and different styles of loco-manipulation, such as diverse pick-carry-place patterns, turning-dominant versus walking-dominant transport, and scene/terrain-conditioned behaviors. Demonstrating robust transfer across such style/task variation is the key step from a strong planning prior toward a generally deployable humanoid planning system.

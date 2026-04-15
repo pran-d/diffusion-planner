@@ -1,0 +1,109 @@
+This chapter describes the downstream control and data-expansion stack used around the diffusion planner: an RL tracking controller and an evolutionary rollout pipeline.
+
+\section{Role of the RL--Evolutionary Stack}
+\label{sec:rl_evo_role}
+
+The diffusion model generates \emph{kinematic} trajectories conditioned on history and task parameters. These trajectories are not guaranteed to be dynamically feasible in simulation or on hardware. Therefore, a separate tracking controller is used to execute generated plans. In practice, trajectories that are nearly physically feasible at the kinematic level can be tracked and corrected in simulation, yielding dynamically valid executions suitable for archive expansion.
+
+Conceptually, the stack can be written as
+\begin{equation}
+\text{task } a \;\xrightarrow{\;\text{diffusion planner}\;}\; \hat\tau(a)
+\;\xrightarrow{\;\text{RL tracker in simulation}\;}\; \tau^{sim}(a)
+\;\xrightarrow{\;\text{selection}\;}\; \mathcal{E},
+\label{eq:rl_evo_flow}
+\end{equation}
+where $\hat\tau(a)$ is a generated kinematic trajectory, $\tau^{sim}(a)$ is the simulated tracked trajectory, and $\mathcal{E}$ is the elite subset used for archive growth and retraining.
+
+\begin{figure}[!h]
+    \centering
+    \includegraphics[width=0.95\linewidth]{rl_evo_overview.png}
+    \caption{High-level evolutionary pipeline with tracking controller. The motion-generator block is instantiated by the conditional diffusion planner from Chapter~\ref{chap:methodology}.}
+    \label{fig:rl_evo_overview}
+\end{figure}
+
+\section{RL Tracking Controller}
+\label{sec:rl_tracker}
+
+The controller is a feedback policy that tracks the generated kinematic reference under simulator dynamics. Let $o_t$ denote the controller observation and $u_t$ denote the control action. The stochastic policy is
+\begin{equation}
+\pi_\psi(u_t \mid o_t),
+\end{equation}
+with parameters $\psi$. The policy is optimized to maximize expected discounted return
+\begin{equation}
+J(\psi)=\mathbb{E}_{\pi_\psi}\!\left[\sum_{t=0}^{T-1}\gamma^t r_t\right].
+\label{eq:ppo_obj_generic}
+\end{equation}
+
+A practical reward decomposition for tracking is
+\begin{equation}
+r_t = w_{trk} r_t^{trk} + w_{task} r_t^{task} + w_{reg} r_t^{reg},
+\label{eq:tracker_reward_decomp}
+\end{equation}
+where $r_t^{trk}$ measures reference tracking quality (pose/velocity consistency), $r_t^{task}$ measures task progress, and $r_t^{reg}$ penalizes undesirable control artifacts. The exact term definitions are implementation-specific and follow the controller training setup.
+
+Importantly, this feedback stage can attenuate small physical inconsistencies in the diffusion reference. Mild jitter, slight contact mismatch, or local kinematic roughness are often reduced by closed-loop tracking under simulator dynamics and control regularization, so the executed trajectory $\tau^{sim}$ is typically smoother and more dynamically feasible even when the planner reference $\hat\tau$ is only near-feasible at the kinematic level.
+
+\section{Evolutionary Data Augmentation Pipeline}
+\label{sec:evolutionary_pipeline}
+
+The pipeline iteratively expands the task-space coverage from sparse demonstrations:
+\begin{enumerate}
+    \item sample task parameters $a \sim p(a)$,
+    \item generate candidate trajectories with the diffusion planner,
+    \item roll out each candidate with the RL tracker in simulation,
+    \item score rollouts and select elites,
+    \item append elites to the archive and retrain/update models.
+\end{enumerate}
+
+If $\mathcal{C}_g$ denotes candidates in generation $g$ and $F(\tau)$ denotes rollout fitness, elite selection is
+\begin{equation}
+\mathcal{E}_g = \{\tau \in \mathcal{C}_g \;\mid\; F(\tau) \ge \kappa_g\},
+\label{eq:elite_selection}
+\end{equation}
+where $\kappa_g$ is a generation-dependent threshold (or top-$K$ equivalent). A generic scalarized fitness form is
+\begin{equation}
+F(\tau)=\alpha\,S_{task}(\tau)-\beta\,C_{viol}(\tau)-\delta\,C_{rough}(\tau),
+\label{eq:fitness_scalar}
+\end{equation}
+with task success score $S_{task}$ and penalties for violations and roughness.
+
+\section{Diffusion Model as Motion Generator}
+\label{sec:diffusion_in_evo}
+
+The motion generator in the evolutionary loop is instantiated by the conditional diffusion planner. Candidate generation is therefore stochastic and multi-modal:
+\begin{equation}
+\hat\tau_i \sim p_\theta(\tau \mid a, h), \qquad i=1,\dots,N,
+\label{eq:candidate_sampling_diffusion}
+\end{equation}
+where $h$ is the history/initial condition. This replacement improves diversity of candidate motions while preserving conditional control through task parameters and masking-based constraints.
+
+\section{Task-Space Coverage Results}
+\label{sec:rl_evo_coverage}
+
+The evolutionary loop is used to grow feasible coverage in task space while preserving trackability under dynamics. For a 2D task space, coverage at generation $g$ can be summarized by the convex-hull area of elite task parameters:
+\begin{equation}
+\mathcal{C}_g = \mathrm{Area}\!\left(\mathrm{ConvHull}\left(\{a_i\}_{i\in\mathcal{E}_g}\right)\right).
+\label{eq:coverage_metric}
+\end{equation}
+Increasing $\mathcal{C}_g$ indicates successful expansion beyond the seed demonstrations.
+
+\begin{figure}[!h]
+    \centering
+    \includegraphics[width=0.78\linewidth]{initial_taskspace_coverage.png}
+    \includegraphics[width=0.78\linewidth]{final_taskspace_coverage.png}
+    \caption{Task-space coverage in the evolutionary pipeline: initial archive coverage (top) and final archive coverage (bottom). The feasible region expands substantially from the seed set to the final generation.}
+    \label{fig:rl_evo_task_coverage}
+\end{figure}
+
+This trend is compatible with the planner-side displacement evidence in Figure~\ref{fig:abl_base_disp_vectors}: stronger OOD directional goal following at the kinematic level gives the controller-filtered archive better candidates to retain, which can support steadier task-space expansion.
+
+\section{Practical Role in This Thesis}
+\label{sec:rl_evo_practical_role}
+
+The RL--evolutionary stack has two practical roles in this thesis:
+\begin{itemize}
+    \item \textbf{Execution role:} convert kinematic plans into tracked dynamic rollouts.
+    \item \textbf{Data role:} filter and recycle high-quality rollouts to improve task-space coverage under sparse initial demonstrations.
+\end{itemize}
+
+Accordingly, the diffusion model is evaluated as a kinematic planner within a broader system, rather than as a standalone dynamically-feasible controller.

@@ -1,0 +1,139 @@
+This chapter formulates the thesis problem from three complementary perspectives: (i) task-space generalization under sparse demonstrations, (ii) kinematic motion generation as conditional sequence modeling, and (iii) constrained planning for long-horizon rollout. Each perspective captures a different aspect of the same objective: generating reusable whole-body motion plans for object relocation.
+
+\section{Task Space and Sparse-Demonstration Setting}
+
+We consider object-relocation tasks in which the desired box displacement is a vector
+\[
+g \in \mathcal{G} \subseteq \mathbb{R}^{3},
+\]
+typically representing local-frame translation $(\Delta x,\Delta y,\Delta z)$. In practice, only a finite set of demonstrated goals is available:
+\[
+\mathcal{G}_{\mathrm{demo}} = \{g^{(1)},\dots,g^{(N)}\} \subset \mathcal{G}, \qquad N \ll \infty.
+\]
+The key difficulty is that $\mathcal{G}$ is continuous and large, whereas $\mathcal{G}_{\mathrm{demo}}$ is sparse. Hence the planner must interpolate and extrapolate to unseen goals $g \notin \mathcal{G}_{\mathrm{demo}}$.
+
+In the full task definition, object relocation is naturally a 6D objective (3D translation and 3D orientation change). In this thesis, the planning target is simplified to a 3D displacement space to isolate and study kinematic trajectory generation under sparse goal coverage while keeping the analysis tractable.
+
+An important representation decision is yaw invariance: trajectories that are equivalent up to global heading should map to nearby feature trajectories. Let $\psi_0$ be the anchor yaw at window start, and let $R_z(-\psi_0)$ be the planar rotation into the anchor frame. For any world-frame planar displacement $\Delta p_t^{w}\in\mathbb{R}^2$, the yaw-normalized displacement is
+\[
+\Delta p_t^{loc}=R_z(-\psi_0)\,\Delta p_t^{w}.
+\]
+This reduces effective sparsity by collapsing orientation-equivalent demonstrations into a shared local coordinate system.
+
+\begin{figure}[!h]
+    \centering
+    \includegraphics[width=0.78\linewidth]{yaw_invariance.png}
+    \caption{Yaw-invariant trajectory encoding. Global orientation differences are normalized in the local anchor frame, improving data reuse across sparse demonstrations.}
+    \label{fig:problem_yaw_invariance}
+\end{figure}
+
+Let $s_t \in \mathcal{S} \subset \mathbb{R}^{d}$ denote the robot--object kinematic state at time $t$, including base pose terms, body-joint coordinates, and object-relative channels. Given a history window
+\[
+h_t = (s_{t-H_h+1},\dots,s_t),
+\]
+and a task goal $g$, the planner outputs a future trajectory segment
+\[
+\tau_{t+1:t+H} = (s_{t+1},\dots,s_{t+H}).
+\]
+
+\section{Kinematic Motion Generation with Reusable Primitives}
+
+Rather than memorizing full demonstrations end-to-end, we treat each demonstration as a composition of shorter reusable motion primitives. Intuitively, different combinations of lower-body locomotion, torso orientation, and upper-body manipulation phases are required to cover the full task space of object displacements.
+
+Let a full trajectory be represented as a sequence of primitive segments:
+\[
+\tau = \Pi(\pi_1,\pi_2,\dots,\pi_M),
+\]
+where each primitive $\pi_m \in \mathbb{R}^{H\times d}$ is a short kinematic segment and $\Pi$ denotes temporal composition. Generalization is then achieved by recombining locally valid segments under new task conditions, instead of reproducing one fixed global template.
+
+This view motivates segmented training windows and autoregressive composition at inference: the model learns a local primitive distribution and reuses it to synthesize unseen long-horizon trajectories.
+
+\begin{figure}[t]
+    \centering
+    \includegraphics[width=0.72\linewidth]{trajectory_segmentation.png}
+    \caption{Kinematic trajectory segmentation into short reusable windows. The planner learns local motion primitives and composes them for long-horizon generation.}
+    \label{fig:problem_segmentation_primitives}
+\end{figure}
+
+\section{Learning Objective as Conditional Distribution Modeling}
+
+Because multiple physically plausible strategies can solve the same relocation task, the target is inherently multi-modal. We therefore model a conditional trajectory distribution
+\[
+p_{\theta}(\tau \mid h_t,g)
+\]
+instead of a deterministic map.
+
+From demonstrations, we obtain a finite dataset
+\[
+\mathcal{D}=\{(h_i,g_i,\tau_i)\}_{i=1}^{M}, \qquad g_i \in \mathcal{G}_{\mathrm{demo}}.
+\]
+In our setting, these expert trajectories are not directly captured from robot execution logs. Instead, they come from a data-generation pipeline that first retargets human demonstrations into kinematically feasible humanoid motions and then refines them with sampling-based trajectory optimization to improve dynamic consistency. This design follows the progression from interaction-preserving retargeting in OmniRetarget to trajectory-level dynamic refinement in DynaRetarget \cite{omniretarget,dynaretarget}.
+
+The statistical goal is to minimize expected loss under the (unknown) data distribution:
+\[
+\theta^{\star} = \arg\min_{\theta}\; \mathbb{E}_{(h,g,\tau)\sim p_{\mathrm{data}}}\big[\ell(\tau, p_{\theta}(\cdot\mid h,g))\big],
+\]
+which is implemented through empirical risk minimization on $\mathcal{D}$.
+
+Equivalently, one may view learning as conditional density matching:
+\[
+\min_{\theta}\; D_{\mathrm{KL}}\!\left(p_{\mathrm{data}}(\tau\mid h,g)\;\|\;p_{\theta}(\tau\mid h,g)\right).
+\]
+Generalization quality is determined by how well $p_{\theta}(\tau\mid h,g)$ extends to sparse and unseen goals.
+
+The formulation also supports iterative data augmentation. Let $\mathcal{T}$ denote a tracking operator (RL controller plus environment rollout) and $\mathcal{F}$ a validity filter that accepts trajectories satisfying task and kinematic-quality criteria. Starting from demonstrations $\mathcal{D}^{(0)}$, one iteration is
+\[
+\tilde{\mathcal{D}}^{(r)}=\mathcal{F}\!\left(\mathcal{T}(\tau),\; \tau\sim p_{\theta^{(r)}}(\tau\mid h,g)\right),
+\qquad
+\mathcal{D}^{(r+1)}=\mathcal{D}^{(r)}\cup\tilde{\mathcal{D}}^{(r)}.
+\]
+This defines an evolutionary loop in which generated-and-tracked motions expand training coverage over the goal space, and the diffusion planner is re-estimated on the augmented dataset, following the same high-level principle as iterative generator--tracker pipelines \cite{xu2025parc}.
+
+\section{Constrained Planning View}
+
+For a sampled trajectory $\tau=(s_{1},\dots,s_{H})$, feasible behavior should satisfy three conditions.
+
+\paragraph{Task completion.}
+Let $o_t=\phi(s_t)$ denote the object pose component. For a desired displacement $g$, endpoint error should remain below a tolerance:
+\[
+\|\psi(o_H,o_0)-g\|_2 \le \varepsilon_g,
+\]
+where $\psi(o_H,o_0)$ extracts achieved displacement.
+
+\paragraph{Kinematic admissibility.}
+State and incremental motion should remain in admissible sets:
+\[
+s_t \in \mathcal{S}_{\mathrm{adm}}, \qquad (s_{t+1}-s_t)\in \mathcal{V}_{\mathrm{adm}}.
+\]
+This compactly captures joint limits, plausible frame-to-frame variation, and representation-level sanity constraints.
+
+\paragraph{Demonstration-manifold consistency.}
+Generated trajectories should remain close to the demonstrated behavior manifold, avoiding implausible yet numerically valid states.
+
+\paragraph{Conceptual objective.}
+A compact objective view is
+\[
+\min_{\tau}\; J_{\mathrm{task}}(\tau;g)+\lambda_{\mathrm{kin}}J_{\mathrm{kin}}(\tau)+\lambda_{\mathrm{prior}}J_{\mathrm{prior}}(\tau),
+\]
+where diffusion learning provides the motion prior implicit in $J_{\mathrm{prior}}$.
+
+At the pipeline level, the objective extends across iterations as
+\[
+\min_{\theta,\,\pi}\;\mathbb{E}_{g\sim p(g)}\!\left[J\!\left(\mathcal{T}_{\pi}(\tau),g\right)\right],
+\qquad \tau\sim p_{\theta}(\tau\mid h,g),
+\]
+with planner parameters $\theta$ and tracker policy $\pi$ improved through alternating planner training and tracker-based data augmentation.
+
+\section{Conditional Diffusion for Long-Horizon Trajectory Planning}
+In this thesis, conditional diffusion is used as a trajectory-window generator inside a long-horizon planner. The model predicts future kinematic segments under state-history and goal conditions, while rollout over long tasks is obtained through autoregressive stitching of successive windows. The detailed denoising equations, $v$-prediction objective, and stitching mechanism are deferred to Chapter 4, where they are presented as methodological design choices.
+
+\subsection{Evaluation axes implied by the formulation}
+
+The above formulation implies three complementary evaluation axes:
+\begin{itemize}
+    \item \textbf{In-distribution fidelity:} Does $p_{\theta}(\tau\mid h,g)$ reproduce demonstrated local motion patterns?
+    \item \textbf{Task-space generalization:} Does performance remain strong for goals in $\mathcal{G}\setminus\mathcal{G}_{\mathrm{demo}}$?
+    \item \textbf{Constraint consistency:} Do sampled trajectories remain kinematically plausible under long-horizon stitching?
+\end{itemize}
+
+These criteria define the empirical analyses in later chapters and directly measure whether sparse-demonstration learning can scale to a large continuous displacement space in $\mathbb{R}^3$.

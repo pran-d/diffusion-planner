@@ -1,0 +1,86 @@
+%__________________________________________________%
+% Copy this and use as your blueprint
+
+% Last updated: 2025-04-19
+
+% Author: Marcus Rundström
+%__________________________________________________%
+\documentclass[12pt]{report}
+\input{Setup} % Here is all usepackages
+
+\begin{document}
+
+\input{0 - Title page} % Title page and table of contents. If you do not want a title page and table of contents, you may remove this line.
+
+\titleformat*{\section}{\large\bfseries}
+\titleformat*{\subsection}{\normalsize\bfseries}
+\titleformat*{\subsubsection}{\normalsize\bfseries}
+
+%_________________________________________________________________________________________________________________%
+% \title{{Kinematic Trajectory Planning for Robot Loco-Manipulation via Conditional Diffusion}$^$}
+
+% \author{Name name$^{\dagger}$}
+
+% \date{\today} %date that changes automatically
+
+% \maketitle
+
+\begin{abstract}
+
+    \setstretch{1.0} 
+    \noindent Whole-body loco-manipulation for humanoid robots presents significant challenges due to the high-dimensional state space and the multi-modal nature of valid solutions. This work proposes a hierarchical framework that leverages a conditional diffusion model as a high-level kinematic planner, trained on retargeted human motion capture data. By utilizing a 1D Diffusion Transformer architecture and an egocentric state representation, the model learns to synthesize diverse, locally consistent motion primitives. These primitives can be "stitched" together to generate long-horizon trajectories for novel goals not seen during training. We evaluate the framework's performance on trajectory reconstruction and generalization to out-of-distribution targets, demonstrating its effectiveness as a generative prior. Finally, we analyze current limitations regarding physical feasibility and goal reaching, laying the groundwork for future integration with physics-aware tracking controllers.
+
+    % \let\thefootnote\relax\footnotetext{ 
+ 
+    % \let\thefootnote\relax\footnotetext{
+    %     \footnotesize $^{\dagger}$University, Department} % footnote
+
+    \noindent \textbf{Keywords}: \textit{Conditional Diffusion Models, Motion Planner, Object Relocation}
+
+    \vspace{10em}
+    
+    \noindent
+    \textbf{Supervisor:} \\[1.6cm]
+    \underline{\hspace{7cm}} \\[0.3cm]
+    Prof. Bijo Sebastian
+
+\noindent
+
+\end{abstract}
+
+
+
+
+
+\thispagestyle{empty} % To remove page number at this page.
+\newpage 
+
+
+%_________________________________________________________________________________________________________________%
+
+\setcounter{page}{1} % To begin numbering at the first page of the introduction
+\input{1-Introduction}
+
+\input{2-Background}
+
+\input{3-Method}
+
+\input{4-Results}
+
+\input{5-Conclusion}
+
+%\newpage
+
+\addcontentsline{toc}{section}{References}
+    \bibliographystyle{econ}
+\bibliography{biblography.bib} 
+
+\newpage
+
+\titleformat*{\section}{\LARGE\bfseries}
+\titleformat{\subsection}{\Large\bfseries}
+\titleformat{\subsubsection}{\normalsize\bfseries}
+
+\input{Appendix}
+
+\end{document}

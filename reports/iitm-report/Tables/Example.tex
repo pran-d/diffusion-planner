@@ -1,0 +1,35 @@
+
+\begin{table}[H]
+
+    \centering
+    
+  
+\begin{adjustbox}{width=\textwidth}
+    \begin{threeparttable}
+    \caption{Main Results: Reduced form estimates of 24-hour mortality}
+\begin{tabular}{lccccccc} \hline\hline
+& \multicolumn{7}{c}{24-hour mortality} \\ 
+\hline
+& \multicolumn{4}{c}{Parametric RD} & \multicolumn{2}{c}{Non-parametric RD}  & Donut RD\\
+\cmidrule(lr){2-5} \cmidrule(lr){6-7}\cmidrule(lr){8-8}
+& (1) & (2) & (3) & (4)  & (5) & (6)& (7)\\
+VLBW & -0.00366** & -0.00347** & -0.00340** & -0.00560* &-0.00319* & -0.00336* & 0.00162\\
+ & (0.00180) & (0.00174) & (0.00173) & (0.00338) &(0.00180) & (0.00202) & (0.00179)  \\
+% & & & & & & & \\
+Mean & 0.00380  & 0.00380 & 0.00380 & 0.00380 & 0.00358 & 0.00409 & 0.00380\\
+\hline
+Observations & 14,990 & 14,990 & 14,943 & 5,195 & 12,794 & 10,803 & 11,950\\
+Controls &  & \checkmark & \checkmark & \checkmark & \checkmark & \checkmark & \checkmark\\
+Year \& province &  &  & \checkmark & \checkmark & \checkmark & \checkmark & \checkmark \\ \hline \hline
+\end{tabular}
+\label{Regression main results}
+\begin{tablenotes}
+\footnotesize
+\item \textit{Notes:} The dependent variable is a dummy equal to 1 if not surviving the first 24 hours, zero otherwise. The first column reports OLS-estimates. Columns 2 and 3 add controls such as the mother's age, sex of the infant, mother's nationality, education level, C-section, and year- and province-fixed effects. The fourth column includes only infants with a gestational age lower than 32 weeks. The fifth and sixth columns show non-parametric RD estimates on the interval [1430, 1570], respectively [1445, 1555]. The seventh column reports estimates from the donut RD. The mean of the dependent variable corresponds to the selected interval above the threshold. Robust standard errors in parenthesis. *** p$<$0.01, ** p$<$0.05, * p$<$0.1.
+\end{tablenotes}
+\end{threeparttable}
+    
+ \end{adjustbox}
+\end{table}
+
+\normalsize

@@ -1,0 +1,80 @@
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+%%%%%%%%%%%%%%%% Set up %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+\usepackage[utf8]{inputenc}
+\usepackage[english]{babel} % Language
+\usepackage[T1]{fontenc}
+
+
+%%%%%%%%%%%%%%%%%%%%%%%%% References and links %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+
+\usepackage[hyperfootnotes=false]{hyperref} % Allows to hyperref references, footnotes, etc.
+\hypersetup{colorlinks=true,citecolor={BrickRed}, linkcolor={BrickRed}, urlcolor={BrickRed}}  
+%\usepackage[natbibapa]{apacite} % reference style
+\usepackage[dvipsnames]{xcolor}
+    \usepackage[authoryear]{natbib}
+%%%%%%%%%%%%%%%%%%%%%%%%% Tables and figures %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+
+\usepackage[flushleft]{threeparttable} % must-have for making table notes.
+\usepackage{float} % used for putting pictures exactly where you want them. Use [H]
+\usepackage{multirow,booktabs}
+\usepackage{makecell}
+\usepackage{graphics}
+\usepackage{graphicx}
+\usepackage{adjustbox} % Allows to adjust tables and figures.
+\graphicspath{ {./images/} }
+\usepackage{booktabs,caption}
+\usepackage{comment}
+
+%%%%%%%%%%%%%%%%%%%%%%%%% Math and symbols %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+
+\usepackage{amsmath} % For math symbols
+\usepackage{array} % For making arrays in math environments
+\usepackage{amsthm} % For math symbols
+\usepackage{amssymb} % For math symbols
+\renewcommand\qedsymbol{Q.E.D.} % Changes the conclusion of a theorem. 
+\theoremstyle{definition}
+\newtheorem{definition}{Definition}[]
+\newtheorem{theorem}{Proposition}
+\usepackage{tocloft} % To change space in TOC
+\usepackage{tikz} %allows for additional symbols such as \checkmark
+\usepackage{caption}
+\usepackage{subcaption}
+\usetikzlibrary{shapes, arrows, positioning}
+
+%%%%%%%%%%%%%%%%%%%%%%%%% Format and font %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+
+\usepackage{geometry} % Allows to adjusts margins
+\geometry{top = 25mm, bottom = 25mm, right = 25mm, left = 25mm}
+\usepackage{titlesec} % Allows to customize contents in table of contents. 
+\renewcommand{\abstractname}{\vspace{-\baselineskip}}
+\renewcommand{\theequation}{\arabic{equation}} %\renewcommand{\theequation}{\arabic{section}.\arabic{equation}} if you want, for example Equation 2.1
+%\usepackage{lmodern} %Use an usepackage to access fontfaces. 
+%\fontfamily{lmr}\selectfont % Type the fontface
+\usepackage{setspace} \setstretch{1.5} 
+\usepackage{parskip} %this command will skip indent and make space between paragraphs.
+\usepackage{pdfpages} % Allows for inserting pdf:s.
+\usepackage{pdflscape} % Allows for rotating pages.
+\usepackage[bottom]{footmisc} %sticks footnotes to the bottom of page
+\interfootnotelinepenalty=10000 % makes footnotes stay on the same page and not continue on next.
+\usepackage{csquotes}% Recommended for quotes
+
+\renewcommand{\thesection}{\Roman{section}}
+% \renewcommand{\thesubsection}{\Alph{subsection}} If you want only the subsection to be "A."
+\renewcommand{\thesubsection}{\thesection.\Alph{subsection}}
+\renewcommand{\thesubsubsection}{\thesubsection.\roman{subsubsection}}
+
+\renewcommand{\thetable}{\Roman{table}}
+\renewcommand{\thefigure}{\Roman{figure}}
+\renewcommand{\theequation}{\arabic{equation}}
+%\renewcommand{\theequation}{\arabic{section}.\arabic{equation}} if you want for example Equation 2.1
+
+\providecommand{\tightlist}{%
+  \setlength{\itemsep}{0pt}\setlength{\parskip}{0pt}}
+
+
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+%%%%%%%%%%%%%%%%% End set up %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+
+

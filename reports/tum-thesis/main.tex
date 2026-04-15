@@ -1,0 +1,120 @@
+%%
+% This is an Overleaf template for Master's and Bachelor's theses
+% using the TUM Corporate Desing https://www.tum.de/cd
+%
+% For further details on how to use the template, take a look at our
+% GitLab repository and browse through our test documents
+% https://gitlab.lrz.de/latex4ei/tum-templates.
+%
+% The tumbook class is based on the KOMA-Script class scrbook.
+% If you need further customization please consult the KOMA-Script guide
+% https://ctan.org/pkg/koma-script.
+% Additional class options are passed down to the base class.
+%
+% If you encounter any bugs or undesired behaviour, please raise an issue
+% in our GitLab repository
+% https://gitlab.lrz.de/latex4ei/tum-templates/issues
+% and provide a description and minimal working example of your problem.
+%%
+
+
+\documentclass[
+  a4paper,            % paper size (a4paper, a5paper)
+  thesis=student,     % define the type of the thesis (student, phd, none)
+  english,            % define the document language (english, german)
+  % BCOR=5mm,           % define a binding offset for the document
+  % coverBCOR=1cm,      % define a different binding offset for the cover page
+  % coverpage=false,    % disable the cover page (e.g. if a tumcover is used)
+  titlepage=false,    % disable the additional title page
+  oneside,            % use onesided or twosided layout (oneside, twoside)
+  % headmarks=true,     % enable headmarks (true, false)
+  % font=times          % define main text font (helvet, times, palatino, libertine)
+]{tumbook}
+
+% For theses that are printed with a transparent cover it is recommended to
+% use the coverpage and provide the proper coverBCOR, so the distance between
+% the binding strip and the content is properly set to 1 * logoheight.
+% In this case, the publisher and titleback information is most certainly
+% empty and the titlepage may be turned off.
+%
+% For theses that are printed with a soft cover or by a publisher it is
+% recommended to create a cover using the tumcover class and therefore turn
+% off the coverpage here. In this case, you most certainly have publisher and
+% titleback information and you should keep the titlepage option enabled.
+
+
+% load additional packages
+\usepackage{amsmath,amssymb,amsfonts}
+\usepackage{booktabs}
+\usepackage{siunitx}
+\usepackage{graphicx}
+\usepackage{hyperref}
+\graphicspath{{./Figures/}}
+
+
+% thesis metadata
+\title{Imitation Learning from Sparse Demonstrations for Kinematic Motion Planning in Robot Loco-Manipulation}
+\subtitle{Long-horizon Trajectory Generation through Auto-regressive Stitching using Masked Goal-conditioned Diffusion}
+\author{Pranav Debbad}
+
+\degree{Master of Science (M.Sc.)}
+\dateSubmitted{14.04.2026}
+
+\examiner{Prof.\@~Dr.\@ Majid Khadiv}
+\supervisor{Prof.\@~Dr.\@ Majid Khadiv}
+
+
+\begin{document}
+
+\frontmatter
+\maketitle
+\chapter{Abstract}
+\input{chapters/abstract.tex}
+\chapter*{Acknowledgements}
+\addcontentsline{toc}{chapter}{Acknowledgements}
+\input{chapters/acknowledgements.tex}
+\tableofcontents
+
+\listoffigures
+\listoftables
+
+\mainmatter
+\chapter{Introduction}
+\input{chapters/01_introduction.tex}
+
+\chapter{Problem Formulation and Foundations}
+\input{chapters/02_problem_formulation_and_foundations.tex}
+
+\chapter{Related Work}
+\input{chapters/03_related_work.tex}
+
+\chapter{Methodology: Diffusion-Based Planning}
+\label{chap:methodology}
+\input{chapters/04_methodology.tex}
+
+\chapter{Experimental Setup}
+\input{chapters/05_experimental_setup.tex}
+
+\chapter{Results}
+\input{chapters/06_results.tex}
+
+\chapter{RL Tracking Controller and Evolutionary Pipeline}
+\label{chap:rl_evo}
+\input{chapters/07_rl_controller_and_evolutionary_pipeline.tex}
+
+\chapter{Discussion}
+\input{chapters/07_discussion.tex}
+
+\chapter{Conclusion and Future Work}
+\input{chapters/08_conclusion.tex}
+
+\appendix
+\chapter{Additional Material}
+\input{chapters/appendix.tex}
+
+\backmatter
+\nocite{*}
+\bibliographystyle{ieeetr}
+\bibliography{references}
+
+\end{document}

@@ -1,0 +1,29 @@
+
+\section{Introduction}\label{introduction}
+
+\subsection{Problem Statement}\label{introduction-problem-statement}
+
+Humanoid robots possess high degrees of freedom (DoF) to replicate human kinematics, enabling versatile interaction in real-world environments often designed for humans. However, achieving robust whole-body loco-manipulation—such as bending to pick up objects, squatting for heavy objects and pushing a target—requires contending with conflicting timescales: dynamically maintaining stability at the sub-second scale while planning long-horizon interactions spanning tens of seconds.
+
+The high-dimensional, nonlinear dynamics of these systems make analytical control intractable. While Reinforcement Learning (RL) offers robustness, it often suffers from sample inefficiency and poor generalization outside specific reward-engineered tasks. Consequently, Imitation Learning (IL) from human motion capture data has emerged as a promising alternative, as this avoids manually collecting data through teleoperation, and generates natural human-like motions in the robot embodiment. However, standard supervised learning approaches struggle with multi-modal problems such as humanoid motion planning, where there are multiple solutions to the same problem, as they collapse to either one trajectory or the average of two valid trajectories which is often invalid.
+
+In this context, denoising diffusion models (\cite{wolf2025diffusion, tevet2023human}) have emerged as a powerful solution. By modeling the task as a conditional generative process $p_\theta(\tau|s_t,g_t)$, diffusion models can capture complex, multi-modal distributions of valid behaviors, scaling effectively to multi-task learning and generalizing beyond specific demonstrations.
+
+\subsection{Motivation}\label{motivation}
+
+To address the challenge of multiple timescales, this work adopts a hierarchical control pipeline:
+\begin{itemize}
+    \item A \textbf{high-level planner} generates a kinematic state trajectory to achieve long-horizon goals.
+    \item A \textbf{low-level controller} tracks this trajectory, handling the dynamics stably and robustly.
+\end{itemize}
+
+Given the requirements of these two stages, it becomes possible to leverage the strengths of different learning-based methods:
+\begin{itemize}
+    \item Conditional generative models (diffusion, flow-matching, etc): By formulating trajectory generation as sampling from the conditional distribution \(p(\tau | s_t, g_t)\), the underlying multi-modal distribution of valid kinematic solutions can be captured. This is a probabilistic alternative for kinematic planning, which can provide a diverse set of reference plans.
+    \item Reinforcement learning policy: A downstream RL policy that aims to handle the underactuated robot dynamics to track this generated trajectory as closely as possible.
+\end{itemize}
+
+This pipeline may further include a vision-language-action (VLA) model that translates the robot's visual inputs and user instruction (often through text, voice, etc) into a sequence of tasks parameterized as task variables $\{c_1, c_2, c_3...\}$ , which are passed to the conditional generative model. Thus, different tasks such as "reach", "grasp", "pick", "place", and other "primitive" skills as defined by the VLA, can describe another variable to condition the generative model.
+
+The motivation of this work is to develop a high-level motion planner, capable of generating kinematic robot trajectories from a given current state to accomplish a specified task. While the long-term objective is to design a generalist, task-conditioned planner that can stitch together motions for multiple high-level tasks, the first step is to study motion generation within a single task domain. Accordingly, this work focuses on the task of object relocation — moving an object from an initial position to a desired goal — while generalizing across arbitrary start and goal configurations. This setting provides a testbed for learning task-conditioned motion planning, and an opportunity to evaluate the use of generative models to capture a distribution of kinematically and dynamically feasible robot trajectories. The hypothesis is that the model will be able to "imagine" valid (physically feasible) solutions for unseen tasks (locations not included in the original data), which would otherwise require expensive optimization.
+

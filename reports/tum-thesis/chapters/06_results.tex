@@ -1,0 +1,220 @@
+This chapter summarizes the empirical behavior of the diffusion planner on reconstruction and goal-conditioned generation, with emphasis on sparse-demonstration robustness and ablation-driven design choices.
+
+\section{In-Distribution Trajectory Reconstruction}
+
+On held-out windows drawn from the same distribution as training data, the model reproduces global motion phase and major joint dynamics with good fidelity. The generated trajectories capture plausible coordination between lower-body locomotion and upper-body manipulation cues, indicating that the denoiser has learned meaningful local motion priors rather than static averages.
+
+This behavior is consistent with three implementation choices: (i) a diffusion transformer backbone for high-frequency temporal detail, (ii) the continuous 6D rotation representation in Equation~\ref{eq:rot6d_exp} (used in the pipeline to avoid orientation discontinuities), and (iii) SBTO densification of only four reference motions to increase training density without requiring additional demonstrations.
+
+\begin{figure}[!h]
+	\centering
+	\includegraphics[width=0.95\linewidth]{task2_model_vs_gt_joints.png}
+	\caption{Joint-trajectory reconstruction on held-out windows. The model follows phase trends and dominant amplitudes while retaining stochastic variability expected from diffusion sampling.}
+	\label{fig:tum_recon_joints}
+\end{figure}
+
+Qualitative overlays show that errors are typically concentrated in highly articulated joints and transition frames. Compared with deterministic one-shot regression, diffusion sampling yields less mode collapse and more realistic local variability.
+
+For reporting, reconstruction quality can be summarized as
+\begin{equation}
+\mathrm{MSE}_{rec} = \frac{1}{Td}\sum_{t=1}^{T}\lVert \hat x_t - x_t \rVert_2^2,
+\end{equation}
+where $x_t$ is ground truth and $\hat x_t$ is generated state. In our qualitative analysis, low-frequency phase alignment remains strong, whereas residuals are concentrated in fast transitions.
+
+\section{Goal-Conditioned Generalization to Unseen Targets}
+
+Under OOD goal displacements, the model generally biases trajectories toward the requested direction. However, exact endpoint convergence remains inconsistent, particularly for long horizons requiring multiple stitched windows. The dominant behavior is often \emph{goal-directed but imperfect}: the object moves approximately toward target regions but does not always reach final tolerance.
+
+The clipped-goal parameterization (Equation~\ref{eq:goal_clip}) contributes to better directional transfer beyond the nominal training distance. Without clipping, runs tend to overfit to dataset-scale relocation magnitudes; with clipping, longer-distance requests more often produce coherent progression toward the target, although precise terminal convergence is still limited by accumulated rollout error.
+
+\begin{figure}[!h]
+	\centering
+	\includegraphics[width=0.95\linewidth]{id_vs_ood_generation_config_base.png}
+	\caption{In-distribution-like versus out-of-distribution generation using \texttt{config\_base} ablation statistics. The split is computed from goal-sweep radii (smallest radius bucket as ID-like; larger-radius buckets as OOD). Left: desired vs achieved displacement vectors. Right: endpoint XY error distribution and success rates.}
+	\label{fig:tum_goal_error}
+\end{figure}
+
+This observation supports a key thesis claim: conditional diffusion provides a useful prior for novel goals, yet still requires stronger long-horizon consistency mechanisms for precise task completion.
+
+The endpoint objective is measured by terminal error $e_T$ and success indicator from Equations~\ref{eq:goal_error_exp} and~\ref{eq:success_metric_exp}. We observe systematic reduction in directional error compared with unguided baselines, but success remains sensitive to rollout length and guidance weight.
+
+\section{Autoregressive Stitching Behavior}
+
+Short-horizon samples are locally coherent, but error accumulates with repeated stitching. Three recurrent effects are observed:
+\begin{itemize}
+	\item boundary discontinuities at segment transitions,
+	\item gradual drift in object and body trajectories,
+	\item amplification of small kinematic artifacts over rollout length.
+\end{itemize}
+
+State in-painting with end-segment constraints improves directional consistency but does not fully remove drift. This motivates blended-overlap stitching and tighter receding-horizon feedback as future upgrades.
+
+The strongest qualitative improvement is obtained by coupling feature-wise masking with state reinjection and resampling. Compared with full-state keyframe constraints, partial group-level masks reduce brittle copying of memorized windows and improve compatibility at stitching boundaries, especially when endpoint constraints conflict with local motion priors.
+
+This result matches the training-time partial-mask formulation (Equation~\ref{eq:partial_mask}): by exposing the denoiser to mixed known/unknown channel patterns, inference-time state in-painting becomes better conditioned and less likely to induce abrupt state incompatibilities near segment boundaries.
+
+\section{Physical-Consistency Findings}
+
+Despite improved plausibility versus unconstrained baselines, generated motions still show physical artifacts:
+\begin{itemize}
+	\item occasional foot sliding and weak contact realism,
+	\item floor penetration in challenging OOD cases,
+	\item sporadic high-frequency jitter in frame-to-frame transitions.
+\end{itemize}
+
+The introduced runtime guards (physics stop/clamp) reduce catastrophic failures but do not guarantee strict feasibility. Therefore, physics-aware post-processing or tracking control remains necessary for deployment.
+
+Auxiliary physical losses improve trajectory quality but mainly as soft regularizers. The smoothness term from Equation~\ref{eq:smoothness_loss_exp} reduces visible jitter, while grasp consistency from Equation~\ref{eq:grasp_loss_exp} stabilizes object--hand relative pose during contact phases. The trade-off is that stronger physical regularization can reduce responsiveness for aggressive OOD targets.
+
+\section{Ablation Trends}
+\label{sec:results_ablations}
+
+We next report quantitative ablations.
+
+\subsection{Goal conditioning and history-length ablations}
+
+Table~\ref{tab:abl_goal_hist} shows that both goal normalization and goal-magnitude clipping are important for OOD goal following. Removing either operation increases terminal error and lowers success under the same tolerance.
+
+\begin{table}[t]
+\centering
+\caption{Ablations for goal preprocessing and history size (12 evaluation goals). Lower $\mathrm{mean\_error}$ and angle error are better; higher success is better.}
+\label{tab:abl_goal_hist}
+\begin{tabular}{lcccc}
+\toprule
+Config & mean\_error [m] & Succ@10cm & Succ@20cm & angle err [deg] \\
+\midrule
+base & 0.0909 & 0.6667 & 1.0000 & 1.7013 \\
+no goal-mag clipping & 0.2059 & 0.3333 & 0.5833 & 1.8448 \\
+no goal normalization & 0.2501 & 0.1667 & 0.3333 & 2.9145 \\
+history size = 1 & 0.9748 & 0.1667 & 0.4167 & 7.4535 \\
+history size = 3 & 0.7863 & 0.2500 & 0.4167 & 3.8446 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+These results are consistent with the observation that normalized-and-clipped goals improve extrapolation to larger displacements by reusing in-distribution turning/walking priors. They also support the use of richer history context: shorter history windows significantly reduce directional accuracy and endpoint success.
+
+\begin{figure}[!h]
+	\centering
+	\includegraphics[width=0.78\linewidth]{ablation_eval/goal_mag_clip_error_comparison.png}
+	\includegraphics[width=0.78\linewidth]{ablation_eval/goal_norm_error_comparison.png}
+	\caption{Goal preprocessing ablations: removing magnitude clipping or goal normalization increases final goal error and variance.}
+	\label{fig:abl_goal_preproc}
+\end{figure}
+
+\begin{figure}[!h]
+	\centering
+	\includegraphics[width=0.78\linewidth]{ablation_eval/history_size_error_comparison.png}
+	\caption{History-size ablation: reduced history degrades long-horizon controllability, while the default history window remains the strongest overall setting in this comparison.}
+	\label{fig:abl_history}
+\end{figure}
+
+\subsection{Displacement-vector evidence for OOD goals}
+
+To directly verify directional transfer under unseen displacements, Figure~\ref{fig:abl_base_disp_vectors} plots desired versus achieved displacement vectors for the base configuration. The close alignment for most goals indicates that OOD targets are followed well at the kinematic-planning level, consistent with the high displacement-ratio and low angular-error values in Table~\ref{tab:abl_goal_hist}.
+
+\begin{figure}[!h]
+	\centering
+	\includegraphics[width=0.82\linewidth]{ablation_eval/base_displacement_vectors.png}
+	\caption{Base-configuration displacement vectors (desired vs achieved). Most vectors remain well aligned, showing strong OOD directional goal achievement.}
+	\label{fig:abl_base_disp_vectors}
+\end{figure}
+
+\begin{figure}[!h]
+	\centering
+	\includegraphics[width=0.78\linewidth]{ablation_eval/goal_mag_clip_displacement_scatter.png}
+	\includegraphics[width=0.78\linewidth]{ablation_eval/goal_mag_clip_cross_ablation_trajectories.png}
+	\caption{Additional goal-magnitude-clipping diagnostics: displacement scatter and cross-ablation trajectory overlays. The clipped-goal setting remains closer to the desired displacement manifold under OOD requests.}
+	\label{fig:abl_goal_clip_extra}
+\end{figure}
+
+\subsection{Auxiliary-loss ablations}
+
+The auxiliary-loss sweep in Table~\ref{tab:abl_aux} confirms that adding physically motivated soft losses improves performance relative to no auxiliary loss. In particular, the no-aux setting has the worst mean error and the largest angular deviation.
+
+\begin{table}[t]
+\centering
+\caption{Auxiliary-loss ablation (12 evaluation goals).}
+\label{tab:abl_aux}
+\begin{tabular}{lccccc}
+\toprule
+Config & mean\_error [m] & Succ@20cm & disp ratio & angle err [deg] & max hand--obj [m] \\
+\midrule
+no auxiliary loss & 1.2582 & 0.2500 & 0.7758 & 14.8051 & 0.3079 \\
+smoothness only & 0.6539 & 0.2500 & 0.8934 & 5.7657 & 0.2963 \\
+grasp only & 0.4447 & 0.5833 & 0.9522 & 6.3410 & 0.2939 \\
+smoothness + grasp & 0.9531 & 0.5000 & 0.8297 & 10.9466 & 0.2962 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+The trend supports two practical observations:
+\begin{itemize}
+	\item smoothness loss reduces visible frame-to-frame jitter;
+	\item grasp consistency helps maintain hand--object relation during manipulation.
+\end{itemize}
+At the same time, combining both terms is not uniformly optimal across all endpoint metrics, indicating a non-trivial weighting trade-off in Equation~\ref{eq:total_loss_exp}.
+
+\begin{figure}[!h]
+	\centering
+	\includegraphics[width=0.78\linewidth]{ablation_eval/aux_losses_error_comparison.png}
+	\includegraphics[width=0.78\linewidth]{ablation_eval/aux_losses_physics_hand_obj.png}
+	\caption{Auxiliary-loss ablations: endpoint-error and hand--object consistency summaries. Soft physical priors improve robustness over the no-aux baseline, with trade-offs across objectives.}
+	\label{fig:abl_aux}
+\end{figure}
+
+\begin{figure}[!h]
+	\centering
+	\includegraphics[width=0.78\linewidth]{ablation_eval/aux_losses_physics_yaw_jump.png}
+	\caption{Auxiliary-loss yaw-jump diagnostics. Smoothness-related regularization reduces abrupt orientation changes, supporting improved temporal kinematic consistency.}
+	\label{fig:abl_aux_yaw}
+\end{figure}
+
+\subsection{Masking-mode ablations}
+
+We additionally evaluate masking strategy variants to quantify the impact of feature-completion training. Table~\ref{tab:abl_masking_modes} compares four masking configurations: full masking (base setup), in-betweening mask only, condition-mask only, and no masking at all.
+
+\begin{table}[t]
+\centering
+\caption{Masking-mode ablation (12 evaluation goals).}
+\label{tab:abl_masking_modes}
+\begin{tabular}{lccccc}
+\toprule
+Config & mean\_error [m] & Succ@10cm & Succ@20cm & angle err [deg] & mean yaw-jump [deg] \\
+\midrule
+base masking setup & 0.1208 & 0.4167 & 0.9167 & 2.1112 & 0.302 \\
+in-betweening mask only & 0.1007 & 0.6667 & 1.0000 & 1.6960 & 0.307 \\
+condition-mask only & 0.4211 & 0.5000 & 0.5000 & 7.8233 & 0.289 \\
+without masking & 0.2537 & 0.4167 & 0.5833 & 5.2491 & 0.287 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+The degradation in endpoint metrics for condition-mask-only or without-masking training indicates that constrained-completion structure (in-betweening masking) is important for stable long-horizon goal following. While yaw-jump remains comparable across all variants, directional and terminal accuracy drop markedly without in-betweening supervision, showing that masking design primarily affects controllability rather than only local smoothness.
+
+\begin{figure}[!h]
+	\centering
+	\includegraphics[width=0.78\linewidth]{ablation_masking_modes/error_comparison.png}
+	\includegraphics[width=0.78\linewidth]{ablation_masking_modes/displacement_scatter.png}
+	\caption{Masking-mode diagnostics: endpoint error comparison and desired-versus-achieved displacement scatter. Condition-mask-only and without-masking exhibit larger spread and weaker endpoint consistency.}
+	\label{fig:abl_masking_modes}
+\end{figure}
+
+\begin{figure}[!h]
+	\centering
+	\includegraphics[width=0.78\linewidth]{ablation_masking_modes/physics_yaw_jump.png}
+	\caption{Masking-mode yaw-jump comparison. Angular smoothness remains in a similar range across variants, indicating that the main gain of proper masking is improved goal-conditioned controllability.}
+	\label{fig:abl_masking_modes_yaw}
+\end{figure}
+
+\subsection{Consolidated interpretation}
+
+Across ablations, the selected default configuration (goal normalization + goal-magnitude clipping + longer history + auxiliary regularization) provides the best overall balance for sparse-demonstration OOD generation. This is consistent with the practical observations that condition dropout/noise and partial masking improve robustness, while excessive constraint strength can reduce kinematic naturalness in hard OOD cases.
+
+\section{Summary of Results}
+
+Overall, the model succeeds as a \emph{probabilistic kinematic planner}: it reconstructs demonstrated behavior well, generalizes directionally to unseen goals, and produces useful trajectory priors for downstream control.
+
+The final design decisions are therefore justified as follows: diffusion transformer backbone, 6D rotation channels, mirror symmetry augmentation, normalized-and-clipped goal conditioning, sufficient history context, moderate CFG with condition dropout, and auxiliary smoothness/grasp losses. These choices jointly improve sparse-data generalization and controllability.
+
+The remaining gap lies in consistent long-horizon precision under strong OOD constraints and in dynamic executability without a downstream tracker. This motivates the RL tracking controller and evolutionary filtering pipeline described in Chapter~\ref{chap:rl_evo}.

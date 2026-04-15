@@ -1,0 +1,31 @@
+This chapter situates the thesis within prior work on humanoid planning, imitation learning, generative trajectory modeling, and data-generation pipelines for whole-body control.
+
+\section{From Classical Planning to Demonstration-Driven Learning}
+
+Whole-body loco-manipulation can be formulated through trajectory optimization, model-predictive control, or sampling-based planning. These methods provide explicit objectives and constraints, but they become difficult to scale in high-dimensional humanoid spaces with contact-rich interactions and long horizons \cite{gu2025humanoidlocomotionmanipulationcurrent}. In practice, this often leads to decomposition assumptions (e.g., partially decoupled locomotion/manipulation) that improve tractability but can reduce behavioral diversity.
+
+Imitation learning addresses part of this difficulty by transferring motion structure from expert demonstrations. However, deterministic regressors are limited in multi-modal settings and tend to average across valid but distinct futures. This limitation is central for object-relocation tasks, where multiple body coordination strategies can satisfy the same goal. A second limitation is data scarcity: large, high-quality whole-body demonstrations are expensive, and available samples only sparsely cover the continuous task space.
+
+\section{Diffusion-Based Generative Planning}
+
+Diffusion models have become a core approach for conditional trajectory generation in robotics and motion synthesis \cite{wolf2025diffusion}. Planning-oriented diffusion formulations demonstrate strong performance in generating diverse futures under task conditioning \cite{janner2022diffuser,carvalho2023motion,chi2023diffusion}. Compared with unimodal prediction, diffusion better captures multi-modality and offers flexible inference-time conditioning and guidance.
+
+Related continuous-time formulations such as flow matching are gaining attention for potential sampling and optimization advantages \cite{rouxel2024flow}. Still, diffusion remains the dominant baseline for controllable trajectory generation due to mature conditioning interfaces and robust denoising-based training recipes.
+
+\section{Controllable Kinematic Motion Generation}
+
+In human and humanoid motion generation, diffusion priors have shown strong controllability from partial constraints \cite{tevet2023human,serifi2024robot,xie2024omnicontrol}. Recent large-scale studies further indicate that increasing motion-data scale substantially improves control fidelity and compositionality \cite{rempe2026kimodo}. Another recurring direction is masked conditional generation, where heterogeneous control signals are represented as partial observations and the model completes the missing motion components \cite{tessler2024maskedmimic}. This perspective directly supports conditioning strategies based on partial feature/frame masks in sparse-data regimes.
+
+At the same time, kinematic generators alone do not guarantee robust physical execution. Recent systems therefore couple generative planners with simulation-time or policy-based tracking modules, combining expressive motion priors with dynamic correction during rollout \cite{kalaria2025dreamcontrol,liao2025beyondmimic,tevet2024closdclosingloopsimulation,wu2025uniphys}.
+
+\section{Data Generation, Retargeting, and Iterative Augmentation}
+
+For humanoid loco-manipulation, demonstration quality strongly depends on retargeting and refinement pipelines. Interaction-preserving retargeting methods produce kinematically consistent references from human demonstrations and support scalable variation generation \cite{omniretarget}. Trajectory-refinement pipelines then improve dynamic consistency through sampling-based optimization before downstream tracking-policy training \cite{dynaretarget}. These works motivate treating dataset construction as a first-class component of planning performance.
+
+Another influential idea is iterative augmentation: a generator proposes motions, a tracker executes/corrects them, and validated rollouts are recycled into future training sets \cite{xu2025parc}. This closes the loop between kinematic generation and dynamic correction, and is especially relevant when initial demonstration coverage is sparse.
+
+\section{Relation to This Thesis}
+
+This thesis targets an underexplored point in this landscape: goal-conditioned whole-body \emph{kinematic} planning for object relocation under sparse demonstration coverage. The focus is on representation and conditioning choices that improve generalization---not on replacing the dynamic tracker.
+
+Concretely, the work combines egocentric trajectory representation, segmented window modeling, masked conditional diffusion, and autoregressive long-horizon rollout. Within the broader planner--tracker pipeline, the thesis evaluates how far diffusion-based kinematic generation can generalize over a continuous displacement space in $\mathbb{R}^{3}$, and how iterative augmentation can further expand effective coverage.

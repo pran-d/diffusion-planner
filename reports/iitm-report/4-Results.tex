@@ -1,0 +1,81 @@
+\section{Results}
+
+To evaluate the model's ability to capture the training distribution, we assess the reconstruction quality on held-out test trajectories using both quantitative metrics and visual inspection.
+
+\begin{enumerate}
+    \item \textbf{Time-Series Comparisons}: By plotting the generated joint positions against the ground truth data, we can verify if high-frequency details and phase alignment are preserved. This is crucial for checking if the diffusion model effectively captures the underlying motion dynamics rather than just the mean pose.
+    \item \textbf{Joint-wise Error Distribution}: Computing the Mean Squared Error (MSE) or Mean Absolute Error (MAE) per joint across the test set helps identify which kinematic chains (e.g., legs vs. arms) are most challenging to model.
+    \item \textbf{End-Effector Cartesian Accuracy}: Since task success often depends on hand positioning (for manipulation) or foot placement (for locomotion), plotting the Euclidean distance error of end-effectors offers a task-centric performance metric.
+    \item \textbf{Kinematic Consistency}: Metrics such as foot skate magnitude (velocity of foot joint when height $\approx 0$) quantify physical violations in the generated motion.
+\end{enumerate}
+
+\subsection{Trajectory Reconstruction (in-distribution)}
+
+These videos (\href{https://drive.google.com/file/d/17o4pxqVq3K5vZjX36HDvpBqWu9Sjc1oi/view?usp=drive_link}{1} and \href{https://drive.google.com/file/d/1hjoH_RV1A7cXiWXgQDl0dq5MiSruXL2f/view?usp=drive_link}{2}) show in-distribution trajectories being reconstructed. Clearly, there are some issues with this still:
+
+\begin{figure}[H]
+    \centering
+    \includegraphics[width=0.95\linewidth]{Figures/task2_model_vs_gt_joints.png}
+    \caption{Trajectory Reconstruction. Comparison between ground truth (blue) and diffusion-generated (orange) joint trajectories for a held-out test sample. The model successfully captures the high-frequency dynamics and phase of the motion, though occasional smoothing is observed.}
+    \label{fig:reconstruction}
+\end{figure}
+
+\begin{itemize}
+    \item Physical inconsistencies, such as sliding, floating and penetrations of the object and robot feet. 
+    \item Jittery motion due to discontinuity in adjacent generated frames. This can be reduced by predicting deltas (difference in state at each timestep, i.e. $\{(s_{t+1}-s_{t}), (s_{t+2}-s_{t+1}), ...,(s_{t+H}-s_{t+H-1})\}$) instead of the absolute values. However, this can increase physical inconsistencies, due to accumulated error from integration.
+\end{itemize}
+
+\subsection{Generalization (unseen goal states)}
+A key requirement of this diffusion-based planner is the ability to "stitch" together learned behaviors to reach novel goals. This has been evaluated by conditioning the model on goal locations $(x, y)$ that were not present in the training set, as shown in the following videos: \href{https://drive.google.com/file/d/1oXjHaKIEOqWq-ADpl78K2Yq1EumMJhS5/view?usp=drive_link}{Video 1}, \href{https://drive.google.com/file/d/1ph7ncYwbOBP-BtqFOZ3tlR6RZJoX1kSC/view?usp=drive_link}{Video 2}, \href{https://drive.google.com/file/d/1b9REnrfD_1e1IXIqMfwa8J2uaATaBF_T/view?usp=drive_link}{Video 3}, \href{https://drive.google.com/file/d/1zEpBrLCwuqjAY3JLyVjL7KCkx6I6WsN6/view?usp=drive_link}{Video 4}, \href{https://drive.google.com/file/d/1FWJe2fe6s1v-x7S4_3Z-g52ZrqZ2eseC/view?usp=drive_link}{Video 5}.
+ 
+While the model successfully biases the trajectory towards the new goal more often than not, it still is not able to stitch together different motions to reach the exact goal target. Instead, it tries to replicate a full trajectory which had a similar goal direction from the dataset. While stitching is observed in some cases, such as \href{https://drive.google.com/file/d/1mXIUAUpzdGMTKqSaHpuOKvJJHws6bYuc/view?usp=drive_link}{Video 6}, it is neither systematic nor repeatable.
+
+\begin{figure}[H]
+    \centering
+    \begin{subfigure}[b]{0.48\textwidth}
+        \includegraphics[width=\linewidth]{Figures/task3_goal_error_clean.png}
+        \caption{Goal Reaching Error (Standard)}
+        \label{fig:error_clean}
+    \end{subfigure}
+    \begin{subfigure}[b]{0.48\textwidth}
+        \includegraphics[width=\linewidth]{Figures/task3_goal_error_swapped.png}
+        \caption{Goal Reaching Error (Swapped)}
+        \label{fig:error_swapped}
+    \end{subfigure}
+    \caption{Goal Reaching Performance. The plots show the Euclidean distance to the goal over the prediction horizon. We observe that in-distribution goals (blue) converge reliably, whereas OOD goals (orange) exhibit higher variance and larger final errors.}
+    \label{fig:goal_error}
+\end{figure}
+
+Moreover, moving out of distribution (OOD) introduces more physical inconsistencies, which amplify with more number of autoregressive calls (as seen towards the end of Video 6). It is observed that the model creates such inconsistencies sometimes to bring the data back into distribution, as witnessed in \href{https://drive.google.com/file/d/1RDNRpqFFUyncRPiDelCEhSQJM5hSpoUY/view?usp=drive_link}{Video 7}.
+
+\subsection{Challenges \& Future Work}\label{challenges-current-limitations-results-i}
+
+\begin{itemize}
+
+\item \textbf{Physical Infeasibility}\label{physical-infeasibility}:
+Since diffusion models learn probability distributions, they do not
+inherently enforce physical constraints. Issues such as foot sliding, object floating
+and kinematic violations (small penetrations/collisions) are prevalent in the generated trajectories.
+Some possible solutions to this, as found in literature, are:
+\begin{itemize}
+    \item projection into dynamically-feasible space of trajectories in the last few denoising steps, using trajectory optimization (\cite{römer2025diffusionpredictivecontrolconstraints}, \cite{bouvier2025ddatdiffusionpoliciesenforcing}) or RL-based tracker rollouts in simulation (\cite{tevet2024closdclosingloopsimulation})
+    \item generating control actions (PD-targets) instead of joint states and then rolling them out, so that kinematic feasibility need not be considered. However, these are more difficult to predict due to higher variance and sensitivity (i.e. a small deviation from the optimal action sequence can \href{https://drive.google.com/file/d/1fwfYz5JiVRfQ1YmwkW9byez4yb4Wdfxv/view?usp=drive_link}{blow up} as it propagates through the states. Moreoever, it reduces flexibility as state guidance is not possible anymore, unless state-action co-diffusion is used (\cite{Huang_2025}).
+\end{itemize}
+
+\item \textbf{Manifold Collapse}\label{manifold-collapse}:
+In early experiments (see \href{https://drive.google.com/file/d/1NDqOBI__rWL8zhXncBfRyKJhDk9QqMrt/view?usp=drive_link}{video}), the model would output the ``average'' behavior
+(standing still or floating), or overfit to the state conditioning, i.e. because it had not seen certain robot configurations with the desired goal vector, it would simply ignore the goal vector and continue with the first selected trajectory based on states. This
+was mitigated by \textbf{condition dropout} and \textbf{goal
+swapping}, which forced stronger dependency on the goal signal. Further, to improve generalisation, each trajectory window is saved with multiple goals with different horizon lengths (i.e. short horizon goals - 0.2 seconds into the future, and long horizon goals - 2 seconds into the future). This way, the data encompasses that windows from different trajectories can be stitched together to achieve an unseen goal, or the full trajectories can achieve the original "in-distribution" goal.
+
+\item \textbf{Drift}\label{drift}:
+Small errors in position and velocity prediction accumulate over long horizons.
+Without closed-loop feedback (re-planning), the robot would drift away
+from the target. The stitching/re-planning loop, along with absolute joint but relative body predictions, effectively solves this by resetting the plan based on the \emph{actual} current state. However, this has its own problems such as lack of constraints (e.g. continuity between consecutive frames) no safety considerations for out-of-distribution generation, etc.
+\end{itemize}
+
+\subsubsection{Classifier-Free Guidance}
+A promising direction for future work is the incorporation of classifier-free guidance (CFG) to explicitly control the trade-off between trajectory diversity and goal adherence at inference time. By training the diffusion model with a null goal vector alongside conditioned trajectories, the model learns both conditional and unconditional score functions. At inference, these can be combined to amplify task-relevant conditioning signals, allowing goal adherence to be tuned without retraining. This approach offers a principled mechanism for mitigating manifold collapse when goal information is weak or ambiguous.
+
+\subsubsection{Physics-Based Polishing}
+To address physical infeasibilities such as foot sliding and self-collisions, diffusion-generated trajectories can be post-processed using physics-aware optimization methods. In particular, the output of the diffusion model may serve as an initial guess for a flexible Model Predictive Control (MPC) or inverse kinematics (IK) solver, which enforces contact constraints, joint limits, and dynamic feasibility. This hybrid generative--optimization pipeline combines the expressiveness of diffusion models with the reliability of classical control, enabling physically consistent long-horizon motion generation.

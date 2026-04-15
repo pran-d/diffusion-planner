@@ -1,0 +1,212 @@
+This chapter specifies how the proposed diffusion planner is instantiated in practice, from sparse-demonstration data preparation to training, inference, and ablation execution.
+
+\section{Experimental Scope}
+
+Experiments are conducted on an NVIDIA RTX3070 workstation and on the Karolina cluster. Training data originates from four motion references that are densified through SBTO-based augmentation to improve coverage of task-parameter space under sparse demonstrations.
+
+All experiments target whole-body object relocation with Unitree G1 state channels (pelvis pose, $29$ joints, object pose). The planner consumes state history and a goal displacement and predicts fixed-length future windows that are stitched for long horizons.
+
+Two regimes are evaluated throughout:
+\begin{itemize}
+    \item \textbf{ID window evaluation:} reconstruction and local plausibility on held-out windows.
+    \item \textbf{OOD rollout evaluation:} long-horizon goal-directed generation under unseen displacements.
+\end{itemize}
+
+\section{Data and Preprocessing Pipeline}
+
+\subsection{Schema harmonization}
+
+The dataset loader class supports multiple raw schemas that can be loaded together and converts them to a unified internal representation with the same keys. Practically, this allows mixing trajectories from different data collection pipelines without any changes in the code, allowing a more versatile model.
+
+\subsection{Windowing, padding, and indexing}
+
+Each trajectory is downsampled (configurable), then segmented into windows of length $H$ with stride $S$. History padding is inserted at the start, and edge padding is inserted at the end so that windows near trajectory boundaries remain valid. Importantly, indexing is constrained to windows that overlap real (non-padding) trajectory content, preventing degenerate all-padding samples.
+
+\subsection{SBTO transformation and task-parameter construction}
+
+For each window, absolute world trajectories are transformed into egocentric SBTO components relative to a reference frame in the history region. If external goals are provided, local task parameters are computed from current robot/object state to the desired world goal; otherwise the final object state of the trajectory provides the target.
+
+Let $p_o^0 \in \mathbb{R}^2$ denote the initial object position in the horizontal plane and $p_o^{\star}$ the desired goal position. The raw displacement is
+\begin{equation}
+g = p_o^{\star} - p_o^0.
+\end{equation}
+To improve OOD extrapolation, the goal magnitude is clipped while preserving direction:
+\begin{equation}
+\bar g = \min(\lVert g \rVert_2, r_{\max})\, \frac{g}{\lVert g \rVert_2 + \varepsilon}.
+\label{eq:goal_clip}
+\end{equation}
+Here, $r_{\max}$ is the configured clipping radius and $\varepsilon$ avoids division by zero. This design reuses in-distribution turning/walking priors for longer requested displacements.
+
+\subsection{Normalization and augmentation}
+
+Global normalization statistics are computed once from the training corpus and reused for all later runs. The reference setup uses min--max normalization. Mirror symmetry augmentation is applied probabilistically in the normalized feature space with explicit permutation/sign tables for both trajectory features and observation-history channels.
+
+Rotational channels use the continuous 6D representation derived from rotation matrices. For a rotation matrix $R=[r_1\;r_2\;r_3]\in SO(3)$ with column vectors $r_i\in\mathbb{R}^3$, the encoded 6D vector is
+\begin{equation}
+\rho_{6D}(R)=\begin{bmatrix}r_1 \\ r_2\end{bmatrix}\in\mathbb{R}^{6}.
+\label{eq:rot6d_exp}
+\end{equation}
+That is, the first two columns of $R$ are concatenated and used as the learning target. This representation avoids discontinuities that arise in Euler-angle parameterizations.
+
+\section{Training Pipeline}
+
+\subsection{Optimizer, scheduling, and stabilization}
+
+Training uses AdamW optimizer, cosine learning-rate annealing, gradient clipping, and mixed-precision scaling. Exponential moving average (EMA) weights are updated each step and exported as separate checkpoints for inference, to reduce the stochasticity of model weight updates.
+
+\subsection{Condition handling during training}
+
+State and task conditioning channels are passed jointly to the denoiser, with independent dropout probabilities for classifier-free guidance compatibility. Optional observation and goal perturbations are applied before conditioning, and optional state in-painting masks are generated online when masked in-betweening mode is enabled.
+
+Feature-group perturbation is modeled as
+\begin{equation}
+\tilde c = c + \eta, \quad \eta \sim \mathcal{N}(0,\Sigma_{grp}),
+\label{eq:cond_noise}
+\end{equation}
+where $\Sigma_{grp}$ is diagonal with group-specific variances (e.g., base, joints, object, goal). During classifier-free guidance training, a Bernoulli mask $z \sim \mathrm{Bernoulli}(1-p_{drop})$ gates the condition:
+\begin{equation}
+c_{train} = z\,\tilde c + (1-z)\,\varnothing.
+\label{eq:cfg_dropout}
+\end{equation}
+
+For state in-painting, partial feature masks are sampled per step. With binary mask $m \in \{0,1\}^d$, masked conditioning is
+\begin{equation}
+c_{mask} = m \odot c + (1-m) \odot c_{unk},
+\label{eq:partial_mask}
+\end{equation}
+where $c_{unk}$ is the learned unknown-token value (or fixed masked value). This exposes the model to constrained generation settings used at inference.
+
+\subsection{Learning Objective}
+
+The primary loss is diffusion reconstruction (with $v$-prediction), with optional auxiliary terms for smoothness and grasp consistency. 
+
+The training objective is
+\begin{equation}
+\mathcal{L} = \mathcal{L}_{diff} + \lambda_{sm}\,\mathcal{L}_{sm} + \lambda_{gr}\,\mathcal{L}_{gr}.
+\label{eq:total_loss_exp}
+\end{equation}
+For trajectory states $x_{1:T}$, temporal smoothness is implemented by matching predicted and reference first-order temporal differences:
+\begin{equation}
+\mathcal{L}_{sm} = \frac{1}{\sum_t \omega_t + \varepsilon}
+\sum_{t=1}^{T-1} \omega_t\,
+\left\| (\hat x_{t+1}-\hat x_t) - (x^{gt}_{t+1}-x^{gt}_t) \right\|_2^2,
+\label{eq:smoothness_loss_exp}
+\end{equation}
+Grasp consistency is applied with a distance-based soft gate so supervision is strongest when the object is close to the hand:
+\begin{equation}
+\mathcal{L}_{gr} = \frac{1}{\sum_t\omega_t\,\bar\gamma_t+\varepsilon}
+\sum_{t=1}^{T-1}\omega_t\,\bar\gamma_t\,
+\left\| (p_{t+1}^{rel}-p_t^{rel})-(p_{t+1}^{rel,gt}-p_t^{rel,gt}) \right\|_2^2,
+\label{eq:grasp_loss_exp}
+\end{equation}
+where $p_t^{rel}$ is object position in the body frame and $\bar\gamma_t = \min(\gamma_t,\gamma_{t+1})$.
+
+Checkpoints store model, optimizer, scheduler, scaler, and EMA states; EMA-only files are exported for lightweight deployment.
+
+\section{Inference and Rollout Pipeline}
+
+\subsection{Initial-condition and goal processing}
+
+Inference starts from world-frame robot/object history. User goals are interpreted as local displacement vectors and converted to world-frame target object positions using initial pelvis yaw and initial object position.
+
+\subsection{Per-window generation}
+
+For each autoregressive step, the pipeline:
+\begin{enumerate}
+    \item computes current task (goal) parameters from current anchor state and target world goal,
+    \item optionally builds in-painting masks/values (including overlap-history constraints),
+    \item samples a normalized trajectory window with DDPM or DDIM, using less denoising steps than what was used for training, and optional classifier-free guidance,
+    \item denormalizes and reconstructs world-frame robot/object trajectories.
+\end{enumerate}
+
+\subsection{Autoregressive stitching and stopping criteria}
+
+Generated windows are concatenated after removing history overlap. Next-step conditioning uses the tail history of the reconstructed world trajectory. Two stopping layers are available:
+\begin{itemize}
+    \item \textbf{goal-stop:} stop and pad once object-goal error falls below threshold and ground-contact criteria are met for a minimum number of frames,
+    \item \textbf{physics-stop/clamp:} detect penetration or frame spikes and either truncate (stop) or project states back into admissible ranges (clamp).
+\end{itemize}
+
+Final rollouts are optionally smoothed and trimmed/padded to target length.
+
+\subsection{Trajectory reconstruction to full robot states}
+
+The diffusion model predicts denormalized SBTO feature windows, not full world-frame robot states directly. Reconstruction therefore proceeds in three stages:
+\begin{enumerate}
+    \item \textbf{Anchor recovery:} recover per-window anchor pose (position and yaw) from the history context.
+    \item \textbf{Cumulative integration:} convert predicted incremental channels (e.g., base $\Delta xy$, $\Delta\psi$) into absolute base motion in world coordinates.
+    \item \textbf{Object and articulation reconstruction:} combine reconstructed base pose, joint trajectories, and object-relative features to obtain full robot-object trajectories in world frame.
+\end{enumerate}
+
+Let the anchor yaw be $\psi_0$ and predicted local base increments be $\Delta p_t^{loc}\in\mathbb{R}^2$. With planar rotation $R(\psi_0)$, world-frame base translation is
+\begin{equation}
+p_t^{w} = p_0^{w} + \sum_{i=1}^{t} R(\psi_0)\,\Delta p_i^{loc},
+\end{equation}
+and yaw is reconstructed by cumulative integration of predicted $\Delta\psi_t$. This reconstruction step is required before downstream simulation, metrics, and visualization.
+
+\subsection{Physics-based clamping and physical meaning}
+
+Before final world-frame rollout assembly, a physics-informed clamp is applied as a safety layer. The clamp uses limits derived from robot kinematics and training-data envelopes:
+\begin{itemize}
+    \item joint position limits from the robot model,
+    \item per-joint velocity limits (data-derived maxima, applied as per-frame $\Delta q$ bounds),
+    \item pelvis height bounds: $z_{body}\in[0.40,\,0.80]$ m,
+    \item base planar speed bound: $\lVert v_{xy}\rVert \le 1.50$ m/s,
+    \item yaw-rate bound: $|\dot\psi| \le 5.0$ rad/s,
+    \item object-relative workspace bounds: $x\in[0.10,0.75]$ m, $y\in[-0.40,0.35]$ m, $z\in[-0.55,0.40]$ m.
+\end{itemize}
+
+The intent is not to enforce full dynamic feasibility, but to suppress clearly non-physical outliers (e.g., implausible one-step jumps) while preserving the learned motion pattern. In this sense, clamping acts as a conservative kinematic safety filter prior to control tracking.
+
+At inference, classifier-free guidance uses
+\begin{equation}
+\hat\epsilon_{cfg} = \hat\epsilon_{uncond} + w_{cfg}\big(\hat\epsilon_{cond}-\hat\epsilon_{uncond}\big),
+\label{eq:cfg_inference_exp}
+\end{equation}
+with guidance weight $w_{cfg}$. Higher $w_{cfg}$ improves goal adherence up to a regime where motion naturalness degrades, which is evaluated in the results chapter.
+
+\section{Evaluation Metrics and Logged Artifacts}
+
+\subsection{Task metrics}
+
+Core task outputs include final goal error, success under tolerance, and desired-versus-achieved displacement vectors.
+
+For ablation tables, the primary scalar error is the final \emph{planar} object-goal distance (XY):
+\begin{equation}
+e_T^{xy} = \left\lVert p_{o,xy}^T - p_{o,xy}^{\star} \right\rVert_2.
+\label{eq:goal_error_exp}
+\end{equation}
+Success is reported at fixed tolerances (0.05, 0.10, 0.15 m):
+\begin{equation}
+\mathrm{Succ}_{\tau} = \mathbb{I}[e_T^{xy} \le \tau].
+\label{eq:success_metric_exp}
+\end{equation}
+In single-run inference logging, desired-versus-achieved displacement vectors and wall-clock timing are additionally stored.
+
+\subsection{Physical-consistency diagnostics}
+
+The codebase currently uses two layers of physical diagnostics.
+
+\paragraph{(A) Logged evaluation diagnostics.}
+Per-sample evaluation logs include:
+\begin{itemize}
+    \item \textbf{Floor-violation count} (threshold test on robot/object height),
+    \item \textbf{Trajectory smoothness proxy} from robot-XY second differences,
+    \item \textbf{Yaw-jump statistics} (mean/max $|\Delta\psi|$ per rollout),
+    \item \textbf{Hand-object distance while lifted} (when MuJoCo FK is available).
+\end{itemize}
+
+Representative forms are:
+\begin{align}
+N_{floor} &= \sum_{t=1}^{T} \mathbb{I}\big[z_{robot}^t < z_{thr} \;\lor\; z_{obj}^t < z_{thr}\big], \\
+\phi_{yaw} &= \frac{1}{T-1}\sum_{t=2}^{T} \left|\mathrm{wrap}(\psi_t-\psi_{t-1})\right|, \\
+\phi_{ho} &= \frac{1}{|\mathcal{T}_{lift}|}\sum_{t\in\mathcal{T}_{lift}} \tfrac{1}{2}\left(\|p_{lw}^t-p_o^t\|_2 + \|p_{rw}^t-p_o^t\|_2\right),
+\end{align}
+where $z_{thr}$ is a fixed floor threshold, and $\phi_{ho}$ is reported only when FK is available.
+
+\paragraph{(B) Runtime safety checks during generation.}
+The autoregressive generator also checks floor penetration and per-frame XY spikes (robot/object) for \emph{physics-stop} truncation. These are used as safety controls during rollout, but are not the primary aggregated ablation metrics unless explicitly exported.
+
+\section{Reproducibility}
+
+Reproducibility is ensured through deterministic seed control, explicit config snapshots, stable checkpoint naming, and centralized inference defaults. Because training and inference share the same normalization statistics and feature definitions, cross-run comparisons remain consistent and auditable.

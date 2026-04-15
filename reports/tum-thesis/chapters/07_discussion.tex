@@ -1,0 +1,476 @@
+This chapter interprets the empirical outcomes from Chapter~5 (experimental protocol) and Chapter~6 (results), and clarifies what they imply for future humanoid planning systems.
+
+\section{Why Diffusion Improves Kinematic Planning}
+
+The strongest benefit observed is representational: diffusion captures multi-modal motion manifolds more effectively than deterministic trajectory regression. In loco-manipulation tasks, this reduces collapse to averaged postures and supports diverse yet plausible local plans. Iterative denoising also provides a natural mechanism for gradual refinement under condition signals (state, goal, and partial feature constraints).
+
+The ablations in Tables~\ref{tab:abl_goal_hist}, \ref{tab:abl_aux}, and \ref{tab:abl_masking_modes} further show that this representational benefit depends on conditioning design. In particular, normalized-and-clipped goal encoding, larger history context, the auxiliary regularizers, and the full masking setup are primary drivers of OOD goal-following quality.
+
+\section{Where the Current Approach Falls Short}
+
+The main weaknesses are structural rather than incidental:
+\begin{itemize}
+	\item \textbf{Dynamic feasibility is not guaranteed.} Learning from kinematic data alone cannot enforce contact-consistent dynamics.
+	\item \textbf{Autoregressive compounding error.} Small local inaccuracies accumulate over many stitched segments.
+	\item \textbf{Conditioning fragility under hard OOD goals.} Directional adaptation appears, but endpoint precision remains inconsistent at long horizons.
+\end{itemize}
+
+The auxiliary-loss study (Table~\ref{tab:abl_aux}) also reveals that objective balancing remains non-trivial: smoothness and grasp-oriented terms improve behavior over a no-aux baseline, but one weighting does not dominate all endpoint and consistency metrics simultaneously. This is consistent with the evaluation protocol in Chapter~5, which reports endpoint error and success in Tables~\ref{tab:abl_goal_hist} and \ref{tab:abl_masking_modes} alongside the consistency diagnostics in Table~\ref{tab:abl_aux}.
+
+\section{Implications for Hierarchical Robot Control}
+
+The results support a two-stage architecture: diffusion for expressive high-level motion synthesis, followed by physically grounded tracking and correction. In such a stack, the diffusion module provides diverse trajectory priors and warm starts, while the low-level layer enforces feasibility and contact stability in closed loop.
+
+This decomposition is also supported by the quantitative gap between planner-level error and execution robustness requirements. Even when planning error is low (Table~\ref{tab:abl_goal_hist}), rollout robustness remains sensitive to smoothness and hand--object consistency indicators (Table~\ref{tab:abl_aux}), as well as masking-mode choices (Table~\ref{tab:abl_masking_modes}), which are naturally handled through a feedback-controlled downstream stack.
+
+In this thesis context, the RL tracking controller and evolutionary selection loop (Chapter~\ref{chap:rl_evo}) make this decomposition operational: the planner proposes diverse kinematic candidates, the tracker converts near-feasible candidates into dynamically consistent executions, and the evolutionary filter retains high-quality rollouts to improve task-space coverage over generations.
+
+\section{Failure Taxonomy}
+
+Observed failures can be grouped into:
+\begin{enumerate}
+	\item \textbf{manifold leakage}: drifting toward unrealistic states under repeated rollout;
+	\item \textbf{constraint mismatch}: generated kinematics that violate contact assumptions;
+	\item \textbf{stitching discontinuity}: temporal artifacts at segment boundaries.
+\end{enumerate}
+
+This taxonomy is useful for designing targeted improvements rather than generic loss tuning.
+
+Based on the findings, the highest-impact directions are:
+\begin{itemize}
+	\item receding-horizon replanning with overlap blending to reduce stitching artifacts;
+	\item broader evaluation across distinct loco-manipulation styles and task families (e.g., pick-carry-place variants, turning-dominant versus walking-dominant transport, and manipulation under varying terrain/context).
+\end{itemize}
+
+\section{Two-Phase Planning Without Separate Models}
+
+A high-impact extension is a \textbf{two-phase motion planner} that separates global and local planning objectives while keeping a \emph{single} diffusion model.
+
+\paragraph{Phase 1: global transport plan.}
+First solve coarse, long-horizon intent (object transport direction, body progression, heading evolution, arrival timing).
+
+\paragraph{Phase 2: local whole-body refinement.}
+Then resolve contact-sensitive details (joint coordination, grasp-maintenance geometry, smooth posture transitions) conditioned on Phase-1 structure.
+
+Instead of training separate models, both phases can be implemented through \textbf{noise-level scheduling} and feature-group scheduling in one denoising process: low-frequency/global channels denoise earlier, while high-frequency/local articulation channels denoise later. This makes the decomposition explicit at inference while preserving shared representations and parameter efficiency.
+
+This direction directly targets a current weakness: heuristic waypoint design. If global structure is generated in Phase 1, local refinement in Phase 2 can condition on that structure, reducing manual waypoint heuristics and making constrained generation more principled and task-adaptive.
+
+\section{Scope Limitations}
+
+This thesis focuses on kinematic planning quality and does not claim direct dynamic executability on hardware. In addition, the experimental regime is bounded by available datasets and does not yet include a full closed-loop benchmark on real robot trials. The conclusions should therefore be interpreted as methodological evidence for a planning prior, not as a complete end-to-end locomotion-manipulation controller.
+
+\endinput
+
+\section{Why Diffusion Improves Kinematic Planning}
+
+The strongest benefit observed is representational: diffusion captures multi-modal motion manifolds more effectively than deterministic trajectory regression. In loco-manipulation tasks, this reduces collapse to averaged postures and supports diverse yet plausible local plans. Iterative denoising also provides a natural mechanism for gradual refinement under condition signals (state, goal, and partial feature constraints).
+
+The ablations in Table~\ref{tab:abl_goal_hist} further show that this representational benefit depends on conditioning design. In particular, normalized-and-clipped goal encoding and larger history context are primary drivers of OOD goal-following quality.
+
+\section{Where the Current Approach Falls Short}
+
+The main weaknesses are structural rather than incidental:
+\begin{itemize}
+	\item \textbf{Dynamic feasibility is not guaranteed.} Learning from kinematic data alone cannot enforce contact-consistent dynamics.
+	\item \textbf{Autoregressive compounding error.} Small local inaccuracies accumulate over many stitched segments.
+	\item \textbf{Conditioning fragility under hard OOD goals.} Directional adaptation appears, but endpoint precision remains inconsistent at long horizons.
+\end{itemize}
+
+The auxiliary-loss study (Table~\ref{tab:abl_aux}) also reveals that objective balancing remains non-trivial: smoothness and grasp-oriented terms improve behavior over a no-aux baseline, but one weighting does not dominate all endpoint and consistency metrics simultaneously.
+
+\section{Implications for Hierarchical Robot Control}
+
+The results support a two-stage architecture: diffusion for expressive high-level motion synthesis, followed by physically grounded tracking and correction. In such a stack, the diffusion module provides diverse trajectory priors and warm starts, while the low-level layer enforces feasibility and contact stability in closed loop.
+
+This decomposition is also supported by the quantitative gap between planner-level error and execution robustness requirements. Even when planning error is low (Table~\ref{tab:abl_goal_hist}), rollout robustness remains sensitive to smoothness and hand--object consistency indicators (Table~\ref{tab:abl_aux}), which are naturally handled in feedback control.
+
+\section{Failure Taxonomy}
+
+Observed failures can be grouped into:
+\begin{enumerate}
+	\item \textbf{manifold leakage}: drifting toward unrealistic states under repeated rollout;
+	\item \textbf{constraint mismatch}: generated kinematics that violate contact assumptions;
+	\item \textbf{stitching discontinuity}: temporal artifacts at segment boundaries.
+\end{enumerate}
+
+This taxonomy is useful for designing targeted improvements rather than generic loss tuning.
+
+\section{Recommended Next Steps}
+
+Based on the findings, the highest-impact directions are:
+\begin{itemize}
+	\item integration with physics-aware post-processing (trajectory optimization or MPC-style projection);
+	\item receding-horizon replanning with overlap blending to reduce stitching artifacts;
+	\item stronger inference-time guidance schedules and adaptive CFG;
+	\item systematic multi-objective tuning of auxiliary-loss weights using planner--tracker composite criteria;
+	\item scene/terrain conditioning and richer task semantics for broader generalization.
+\end{itemize}
+
+\section{Scope Limitations}
+
+This thesis focuses on kinematic planning quality and does not claim direct dynamic executability on hardware. In addition, the experimental regime is bounded by available datasets and does not yet include a full closed-loop benchmark on real robot trials. The conclusions should therefore be interpreted as methodological evidence for a planning prior, not as a complete end-to-end locomotion-manipulation controller.
+
+\endinput
+
+\section{Role of the RL--Evolutionary Stack}
+\label{sec:rl_evo_role}
+
+The diffusion model generates \emph{kinematic} trajectories conditioned on history and task parameters. These trajectories are not guaranteed to be dynamically feasible in simulation or on hardware. Therefore, a separate tracking controller is used to execute generated plans, and an evolutionary loop is used to retain only high-quality rollouts for iterative dataset improvement.
+
+Conceptually, the stack can be written as
+\begin{equation}
+\text{task } a \;\xrightarrow{\;\text{diffusion planner}\;}\; \hat\tau(a)
+\;\xrightarrow{\;\text{RL tracker in simulation}\;}\; \tau^{sim}(a)
+\;\xrightarrow{\;\text{selection}\;}\; \mathcal{E},
+\label{eq:rl_evo_flow}
+\end{equation}
+where $\hat\tau(a)$ is a generated kinematic trajectory, $\tau^{sim}(a)$ is the simulated tracked trajectory, and $\mathcal{E}$ is the elite subset used for archive growth and retraining.
+
+\begin{figure}[t]
+    \centering
+    \includegraphics[width=0.95\linewidth]{rl_evo_overview.png}
+    \caption{High-level evolutionary pipeline with tracking controller. The original midterm motion generator block is replaced in this thesis by the diffusion planner described in Chapter~\ref{chap:methodology}.}
+    \label{fig:rl_evo_overview}
+\end{figure}
+
+\section{RL Tracking Controller}
+\label{sec:rl_tracker}
+
+The controller is a feedback policy that tracks the generated kinematic reference under simulator dynamics. Let $o_t$ denote the controller observation and $u_t$ denote the control action. The stochastic policy is
+\begin{equation}
+\pi_\psi(u_t \mid o_t),
+\end{equation}
+with parameters $\psi$. The policy is optimized to maximize expected discounted return
+\begin{equation}
+J(\psi)=\mathbb{E}_{\pi_\psi}\!\left[\sum_{t=0}^{T-1}\gamma^t r_t\right].
+\label{eq:ppo_obj_generic}
+\end{equation}
+
+A practical reward decomposition for tracking is
+\begin{equation}
+r_t = w_{trk} r_t^{trk} + w_{task} r_t^{task} + w_{reg} r_t^{reg},
+\label{eq:tracker_reward_decomp}
+\end{equation}
+where $r_t^{trk}$ measures reference tracking quality (pose/velocity consistency), $r_t^{task}$ measures task progress, and $r_t^{reg}$ penalizes undesirable control artifacts. The exact term definitions are implementation-specific and follow the controller training setup.
+
+\section{Evolutionary Data Augmentation Pipeline}
+\label{sec:evolutionary_pipeline}
+
+The pipeline iteratively expands the task-space coverage from sparse demonstrations:
+\begin{enumerate}
+    \item sample task parameters $a \sim p(a)$,
+    \item generate candidate trajectories with the diffusion planner,
+    \item roll out each candidate with the RL tracker in simulation,
+    \item score rollouts and select elites,
+    \item append elites to the archive and retrain/update models.
+\end{enumerate}
+
+If $\mathcal{C}_g$ denotes candidates in generation $g$ and $F(\tau)$ denotes rollout fitness, elite selection is
+\begin{equation}
+\mathcal{E}_g = \{\tau \in \mathcal{C}_g \;\mid\; F(\tau) \ge \kappa_g\},
+\label{eq:elite_selection}
+\end{equation}
+where $\kappa_g$ is a generation-dependent threshold (or top-$K$ equivalent). A generic scalarized fitness form is
+\begin{equation}
+F(\tau)=\alpha\,S_{task}(\tau)-\beta\,C_{viol}(\tau)-\delta\,C_{rough}(\tau),
+\label{eq:fitness_scalar}
+\end{equation}
+with task success score $S_{task}$ and penalties for violations and roughness.
+
+\section{Diffusion Model as Motion Generator}
+\label{sec:diffusion_in_evo}
+
+Relative to the midterm setup, the motion generator in the evolutionary loop is replaced by the conditional diffusion planner. Candidate generation is therefore stochastic and multi-modal:
+\begin{equation}
+\hat\tau_i \sim p_\theta(\tau \mid a, h), \qquad i=1,\dots,N,
+\label{eq:candidate_sampling_diffusion}
+\end{equation}
+where $h$ is the history/initial condition. This replacement improves diversity of candidate motions while preserving conditional control through task parameters and masking-based constraints.
+
+The ablation outcomes in Table~\ref{tab:abl_goal_hist} directly motivate this interface design: normalized-and-clipped goal conditioning and longer history produce references that are substantially easier to track (lower endpoint error and directional error before control). Hence, controller training is not treated independently from planner representation choices.
+
+\section{Planner--Tracker Interface Quality}
+\label{sec:planner_tracker_interface}
+
+For downstream control, the relevant quantity is not only task error at the planner level, but a composite reference quality index that predicts tracking difficulty. A practical form is
+\begin{equation}
+Q_{ref}(\hat\tau)=\lambda_1 e_T + \lambda_2 \phi_{jit} + \lambda_3 d_{h\text{-}o}^{max},
+\label{eq:ref_quality_idx}
+\end{equation}
+where $e_T$ is terminal goal error, $\phi_{jit}$ is jitter proxy, and $d_{h\text{-}o}^{max}$ is maximum hand--object deviation. Lower $Q_{ref}$ indicates references that are easier for the RL tracker to execute robustly.
+
+The auxiliary-loss ablations (Table~\ref{tab:abl_aux}) show that this objective is multi-criteria: settings that improve endpoint metrics may not simultaneously minimize all consistency metrics. This is one reason the evolutionary filter is retained, rather than relying on planner scores alone.
+
+\section{Practical Role in This Thesis}
+\label{sec:rl_evo_practical_role}
+
+The RL--evolutionary stack has two practical roles in this thesis:
+\begin{itemize}This chapter describes the downstream control and data-expansion stack used around the diffusion planner: an RL tracking controller and an evolutionary rollout pipeline.
+
+\section{Role of the RL--Evolutionary Stack}
+\label{sec:rl_evo_role}
+
+The diffusion model generates \emph{kinematic} trajectories conditioned on history and task parameters. These trajectories are not guaranteed to be dynamically feasible in simulation or on hardware. Therefore, a separate tracking controller is used to execute generated plans, and an evolutionary loop is used to retain only high-quality rollouts for iterative dataset improvement.
+
+Conceptually, the stack can be written as
+\begin{equation}
+\text{task } a \;\xrightarrow{\;\text{diffusion planner}\;}\; \hat\tau(a)
+\;\xrightarrow{\;\text{RL tracker in simulation}\;}\; \tau^{sim}(a)
+\;\xrightarrow{\;\text{selection}\;}\; \mathcal{E},
+\label{eq:rl_evo_flow}
+\end{equation}
+where $\hat\tau(a)$ is a generated kinematic trajectory, $\tau^{sim}(a)$ is the simulated tracked trajectory, and $\mathcal{E}$ is the elite subset used for archive growth and retraining.
+
+\begin{figure}[t]
+    \centering
+    \includegraphics[width=0.95\linewidth]{rl_evo_overview.png}
+    \caption{High-level evolutionary pipeline with tracking controller. The original midterm motion generator block is replaced in this thesis by the diffusion planner described in Chapter~\ref{chap:methodology}.}
+    \label{fig:rl_evo_overview}
+\end{figure}
+
+\section{RL Tracking ControllThis chapter summarizes the empirical behavior of the diffusion planner on reconstruction and goal-conditioned generation, with emphasis on sparse-demonstration robustness and ablation-driven design choices.
+
+\section{In-Distribution Trajectory Reconstruction}
+
+On held-out windows drawn from the same distribution as training data, the model reproduces global motion phase and major joint dynamics with good fidelity. The generated trajectories capture plausible coordination between lower-body locomotion and upper-body manipulation cues, indicating that the denoiser has learned meaningful local motion priors rather than static averages.
+
+This behavior is consistent with three implementation choices: (i) a diffusion transformer backbone for high-frequency temporal detail, (ii) the continuous 6D rotation representation in Equation~\ref{eq:rot6d_exp} (used in the pipeline to avoid orientation discontinuities), and (iii) SBTO densification of only four reference motions to increase training density without requiring additional demonstrations.
+
+\begin{figure}[t]
+	\centering
+	\includegraphics[width=0.95\linewidth]{task2_model_vs_gt_joints.png}
+	\caption{Joint-trajectory reconstruction on held-out windows (midterm plot reused). The model follows phase trends and dominant amplitudes while retaining stochastic variability expected from diffusion sampling.}
+	\label{fig:tum_recon_joints}
+\end{figure}
+
+Qualitative overlays show that errors are typically concentrated in highly articulated joints and transition frames. Compared with deterministic one-shot regression, diffusion sampling yields less mode collapse and more realistic local variability.
+
+For reporting, reconstruction quality can be summarized as
+\begin{equation}
+\mathrm{MSE}_{rec} = \frac{1}{Td}\sum_{t=1}^{T}\lVert \hat x_t - x_t \rVert_2^2,
+\end{equation}
+where $x_t$ is ground truth and $\hat x_t$ is generated state. In our qualitative analysis, low-frequency phase alignment remains strong, whereas residuals are concentrated in fast transitions.
+
+\section{Goal-Conditioned Generalization to Unseen Targets}
+
+Under OOD goal displacements, the model generally biases trajectories toward the requested direction. However, exact endpoint convergence remains inconsistent, particularly for long horizons requiring multiple stitched windows. The dominant behavior is often \emph{goal-directed but imperfect}: the object moves approximately toward target regions but does not always reach final tolerance.
+
+The clipped-goal parameterization (Equation~\ref{eq:goal_clip}) contributes to better directional transfer beyond the nominal training distance. Without clipping, runs tend to overfit to dataset-scale relocation magnitudes; with clipping, longer-distance requests more often produce coherent progression toward the target, although precise terminal convergence is still limited by accumulated rollout error.
+
+\begin{figure}[t]
+	\centering
+	\includegraphics[width=0.8\linewidth]{task3_goal_error_clean.png}
+	\includegraphics[width=0.8\linewidth]{task3_goal_error_swapped.png}
+	\caption{Goal-distance evolution for nominal and swapped-goal settings. In-distribution conditions converge more reliably; OOD targets show larger terminal error and higher variance across rollout trajectories.}
+	\label{fig:tum_goal_error}
+\end{figure}
+
+This observation supports a key thesis claim: conditional diffusion provides a useful prior for novel goals, yet still requires stronger long-horizon consistency mechanisms for precise task completion.
+
+The endpoint objective is measured by terminal error $e_T$ and success indicator from Equations~\ref{eq:goal_error_exp} and~\ref{eq:success_metric_exp}. We observe systematic reduction in directional error compared with unguided baselines, but success remains sensitive to rollout length and guidance weight.
+
+\section{Autoregressive Stitching Behavior}
+
+Short-horizon samples are locally coherent, but error accumulates with repeated stitching. Three recurrent effects are observed:
+\begin{itemize}
+	\item boundary discontinuities at segment transitions,
+	\item gradual drift in object and body trajectories,
+	\item amplification of small kinematic artifacts over rollout length.
+\end{itemize}
+
+Waypoint-assisted final-frame constraints improve directional consistency but do not fully remove drift. This motivates blended-overlap stitching and tighter receding-horizon feedback as future upgrades.
+
+The strongest qualitative improvement after the midterm comes from coupling feature-wise masking with waypoint reinjection and resampling. Compared with full-state keyframe constraints, partial group-level masks reduce brittle copying of memorized windows and improve compatibility at stitching boundaries, especially when endpoint constraints conflict with local motion priors.
+
+This result matches the training-time partial-mask formulation (Equation~\ref{eq:partial_mask}): by exposing the denoiser to mixed known/unknown channel patterns, inference-time in-betweening with object waypoints becomes better conditioned and less likely to induce abrupt state incompatibilities near segment boundaries.
+
+\section{Physical-Consistency Findings}
+
+Despite improved plausibility versus unconstrained baselines, generated motions still show physical artifacts:
+\begin{itemize}
+	\item occasional foot sliding and weak contact realism,
+	\item floor penetration in challenging OOD cases,
+	\item sporadic high-frequency jitter in frame-to-frame transitions.
+\end{itemize}
+
+The introduced runtime guards (physics stop/clamp) reduce catastrophic failures but do not guarantee strict feasibility. Therefore, physics-aware post-processing or tracking control remains necessary for deployment.
+
+Auxiliary physical losses improve trajectory quality but mainly as soft regularizers. The smoothness term from Equation~\ref{eq:smoothness_loss_exp} reduces visible jitter, while grasp consistency from Equation~\ref{eq:grasp_loss_exp} stabilizes object--hand relative pose during contact phases. The trade-off is that stronger physical regularization can reduce responsiveness for aggressive OOD targets.
+
+\section{Ablation Trends}
+
+We next report quantitative ablations from [reports/ablation_eval](../ablation_eval), and align the interpretation with the implementation observations in [reports/observations.md](../observations.md).
+
+\subsection{Goal conditioning and history-length ablations}
+
+Table~\ref{tab:abl_goal_hist} shows that both goal normalization and goal-magnitude clipping are important for OOD goal following. Removing either operation increases terminal error and lowers success under the same tolerance.
+
+\begin{table}[t]
+\centering
+\caption{Ablations for goal preprocessing and history size (12 evaluation goals). Lower $\mathrm{mean\_error}$ and angle error are better; higher success is better.}
+\label{tab:abl_goal_hist}
+\begin{tabular}{lcccc}
+\toprule
+Config & mean\_error [m] & Succ@10cm & Succ@20cm & angle err [deg] \\
+\midrule
+base & 0.0909 & 0.6667 & 1.0000 & 1.7013 \\
+no goal-mag clipping & 0.2059 & 0.3333 & 0.5833 & 1.8448 \\
+no goal normalization & 0.2501 & 0.1667 & 0.3333 & 2.9145 \\
+history size = 1 & 0.9748 & 0.1667 & 0.4167 & 7.4535 \\
+history size = 3 & 0.7863 & 0.2500 & 0.4167 & 3.8446 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+These results are consistent with the observation that normalized-and-clipped goals improve extrapolation to larger displacements by reusing in-distribution turning/walking priors. They also support the use of richer history context: shorter history windows significantly reduce directional accuracy and endpoint success.
+
+\begin{figure}[t]
+	\centering
+	\includegraphics[width=0.78\linewidth]{ablation_eval/goal_mag_clip_error_comparison.png}
+	\includegraphics[width=0.78\linewidth]{ablation_eval/goal_norm_error_comparison.png}
+	\caption{Goal preprocessing ablations from [reports/ablation_eval](../ablation_eval): removing magnitude clipping or goal normalization increases final goal error and variance.}
+	\label{fig:abl_goal_preproc}
+\end{figure}
+
+\begin{figure}[t]
+	\centering
+	\includegraphics[width=0.78\linewidth]{ablation_eval/history_size_error_comparison.png}
+	\caption{History-size ablation: reduced history degrades long-horizon controllability, consistent with autoregressive error accumulation effects.}
+	\label{fig:abl_history}
+\end{figure}
+
+\subsection{Auxiliary-loss ablations}
+
+The auxiliary-loss sweep in Table~\ref{tab:abl_aux} confirms that adding physically motivated soft losses improves performance relative to no auxiliary loss. In particular, the no-aux setting has the worst mean error and the largest angular deviation.
+
+\begin{table}[t]
+\centering
+\caption{Auxiliary-loss ablation (12 evaluation goals).}
+\label{tab:abl_aux}
+\begin{tabular}{lccccc}
+\toprule
+Config & mean\_error [m] & Succ@20cm & disp ratio & angle err [deg] & max hand--obj [m] \\
+\midrule
+no auxiliary loss & 1.2582 & 0.2500 & 0.7758 & 14.8051 & 0.3079 \\
+smoothness only & 0.6539 & 0.2500 & 0.8934 & 5.7657 & 0.2963 \\
+grasp only & 0.4447 & 0.5833 & 0.9522 & 6.3410 & 0.2939 \\
+smoothness + grasp & 0.9531 & 0.5000 & 0.8297 & 10.9466 & 0.2962 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+The trend supports two observations from [reports/observations.md](../observations.md):
+\begin{itemize}
+	\item smoothness loss reduces visible frame-to-frame jitter;
+	\item grasp consistency helps maintain hand--object relation during manipulation.
+\end{itemize}
+At the same time, combining both terms is not uniformly optimal across all endpoint metrics, indicating a non-trivial weighting trade-off in Equation~\ref{eq:total_loss_exp}.
+
+\begin{figure}[t]
+	\centering
+	\includegraphics[width=0.78\linewidth]{ablation_eval/aux_losses_error_comparison.png}
+	\includegraphics[width=0.78\linewidth]{ablation_eval/aux_losses_physics_hand_obj.png}
+	\caption{Auxiliary-loss ablations: endpoint-error and hand--object consistency summaries. Soft physical priors improve robustness over the no-aux baseline, with trade-offs across objectives.}
+	\label{fig:abl_aux}
+\end{figure}
+
+\subsection{Consolidated interpretation}
+
+Across ablations, the selected default configuration (goal normalization + goal-magnitude clipping + longer history + auxiliary regularization) provides the best overall balance for sparse-demonstration OOD generation. This is consistent with the practical observations that condition dropout/noise and partial masking improve robustness, while excessive constraint strength can reduce kinematic naturalness in hard OOD cases.
+
+\section{Summary of Results}
+
+Overall, the model succeeds as a \emph{probabilistic kinematic planner}: it reconstructs demonstrated behavior well, generalizes directionally to unseen goals, and produces useful trajectory priors for downstream control.
+
+The final design decisions are therefore justified as follows: diffusion transformer backbone, 6D rotation channels, mirror symmetry augmentation, normalized-and-clipped goal conditioning, sufficient history context, moderate CFG with condition dropout, and auxiliary smoothness/grasp losses. These choices jointly improve sparse-data generalization and controllability.
+
+The remaining gap lies in consistent long-horizon precision under strong OOD constraints and in dynamic executability without a downstream tracker. This motivates the RL tracking controller and evolutionary filtering pipeline described in the next chapter.
+er}
+\label{sec:rl_tracker}
+
+The controller is a feedback policy that tracks the generated kinematic reference under simulator dynamics. Let $o_t$ denote the controller observation and $u_t$ denote the control action. The stochastic policy is
+\begin{equation}
+\pi_\psi(u_t \mid o_t),
+\end{equation}
+with parameters $\psi$. The policy is optimized to maximize expected discounted return
+\begin{equation}
+J(\psi)=\mathbb{E}_{\pi_\psi}\!\left[\sum_{t=0}^{T-1}\gamma^t r_t\right].
+\label{eq:ppo_obj_generic}
+\end{equation}
+
+A practical reward decomposition for tracking is
+\begin{equation}
+r_t = w_{trk} r_t^{trk} + w_{task} r_t^{task} + w_{reg} r_t^{reg},
+\label{eq:tracker_reward_decomp}
+\end{equation}
+where $r_t^{trk}$ measures reference tracking quality (pose/velocity consistency), $r_t^{task}$ measures task progress, and $r_t^{reg}$ penalizes undesirable control artifacts. The exact term definitions are implementation-specific and follow the controller training setup.
+
+\section{Evolutionary Data Augmentation Pipeline}
+\label{sec:evolutionary_pipeline}
+
+The pipeline iteratively expands the task-space coverage from sparse demonstrations:
+\begin{enumerate}
+    \item sample task parameters $a \sim p(a)$,
+    \item generate candidate trajectories with the diffusion planner,
+    \item roll out each candidate with the RL tracker in simulation,
+    \item score rollouts and select elites,
+    \item append elites to the archive and retrain/update models.
+\end{enumerate}
+
+If $\mathcal{C}_g$ denotes candidates in generation $g$ and $F(\tau)$ denotes rollout fitness, elite selection is
+\begin{equation}
+\mathcal{E}_g = \{\tau \in \mathcal{C}_g \;\mid\; F(\tau) \ge \kappa_g\},
+\label{eq:elite_selection}
+\end{equation}
+where $\kappa_g$ is a generation-dependent threshold (or top-$K$ equivalent). A generic scalarized fitness form is
+\begin{equation}
+F(\tau)=\alpha\,S_{task}(\tau)-\beta\,C_{viol}(\tau)-\delta\,C_{rough}(\tau),
+\label{eq:fitness_scalar}
+\end{equation}
+with task success score $S_{task}$ and penalties for violations and roughness.
+
+\section{Diffusion Model as Motion Generator}
+\label{sec:diffusion_in_evo}
+
+Relative to the midterm setup, the motion generator in the evolutionary loop is replaced by the conditional diffusion planner. Candidate generation is therefore stochastic and multi-modal:
+\begin{equation}
+\hat\tau_i \sim p_\theta(\tau \mid a, h), \qquad i=1,\dots,N,
+\label{eq:candidate_sampling_diffusion}
+\end{equation}
+where $h$ is the history/initial condition. This replacement improves diversity of candidate motions while preserving conditional control through task parameters and masking-based constraints.
+
+The ablation outcomes in Table~\ref{tab:abl_goal_hist} directly motivate this interface design: normalized-and-clipped goal conditioning and longer history produce references that are substantially easier to track (lower endpoint error and directional error before control). Hence, controller training is not treated independently from planner representation choices.
+
+\section{Planner--Tracker Interface Quality}
+\label{sec:planner_tracker_interface}
+
+For downstream control, the relevant quantity is not only task error at the planner level, but a composite reference quality index that predicts tracking difficulty. A practical form is
+\begin{equation}
+Q_{ref}(\hat\tau)=\lambda_1 e_T + \lambda_2 \phi_{jit} + \lambda_3 d_{h\text{-}o}^{max},
+\label{eq:ref_quality_idx}
+\end{equation}
+where $e_T$ is terminal goal error, $\phi_{jit}$ is jitter proxy, and $d_{h\text{-}o}^{max}$ is maximum hand--object deviation. Lower $Q_{ref}$ indicates references that are easier for the RL tracker to execute robustly.
+
+The auxiliary-loss ablations (Table~\ref{tab:abl_aux}) show that this objective is multi-criteria: settings that improve endpoint metrics may not simultaneously minimize all consistency metrics. This is one reason the evolutionary filter is retained, rather than relying on planner scores alone.
+
+\section{Practical Role in This Thesis}
+\label{sec:rl_evo_practical_role}
+
+The RL--evolutionary stack has two practical roles in this thesis:
+\begin{itemize}
+    \item \textbf{Execution role:} convert kinematic plans into tracked dynamic rollouts.
+    \item \textbf{Data role:} filter and recycle high-quality rollouts to improve task-space coverage under sparse initial demonstrations.
+\end{itemize}
+
+Accordingly, the diffusion model is evaluated as a kinematic planner within a broader system, rather than as a standalone dynamically-feasible controller.
+
+In this broader system view, Table~\ref{tab:abl_goal_hist} and Table~\ref{tab:abl_aux} provide the planner-side evidence used to select the reference generator configuration, while the RL/evolutionary loop provides execution-side robustness and selection under dynamics.
+
+    \item \textbf{Execution role:} convert kinematic plans into tracked dynamic rollouts.
+    \item \textbf{Data role:} filter and recycle high-quality rollouts to improve task-space coverage under sparse initial demonstrations.
+\end{itemize}
+
+Accordingly, the diffusion model is evaluated as a kinematic planner within a broader system, rather than as a standalone dynamically-feasible controller.
+
+In this broader system view, Table~\ref{tab:abl_goal_hist} and Table~\ref{tab:abl_aux} provide the planner-side evidence used to select the reference generator configuration, while the RL/evolutionary loop provides execution-side robustness and selection under dynamics.

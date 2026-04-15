@@ -1,0 +1,52 @@
+\section{Extended Metric Definitions}
+
+For completeness, the final manuscript reports metric implementations for:
+\begin{itemize}
+	\item frame-wise trajectory reconstruction error,
+	\item final object-goal Euclidean distance,
+	\item goal convergence over horizon,
+	\item floor penetration and displacement spike diagnostics,
+	\item rollout continuity at stitching boundaries.
+\end{itemize}
+
+\section{Configuration and Reproducibility Notes}
+
+The experimental protocol includes fixed random seeds, explicit checkpoint snapshots, and logging of both regular and EMA weights. Every reported run is associated with explicit model, training, and inference settings for reproducible comparison.
+
+\section{Additional Qualitative Analysis}
+
+Supplementary visualizations include:
+\begin{itemize}
+	\item in-distribution reconstruction overlays,
+	\item out-of-distribution goal rollouts,
+	\item failure examples illustrating drift, penetration, and discontinuity.
+\end{itemize}
+
+\section{Supplementary Videos}
+
+\url{https://drive.google.com/drive/folders/1udeQtdb7EbBkuFUra2f_syUCJkVkCF0A}
+
+\section{Implementation Notes}
+
+The software stack supports modular experimentation with:
+\begin{itemize}
+	\item interchangeable diffusion backbones,
+	\item configurable conditioning dropout and in-betweening masks,
+	\item autoregressive rollout controls (goal stop, physics stop/clamp),
+	\item checkpoint-based ablation workflows.
+\end{itemize}
+
+\section{Method Coverage Map}
+
+For completeness, the following method components are covered in the manuscript:
+\begin{itemize}
+\item data acquisition, SBTO processing, and trajectory windowing;
+\item egocentric transforms and yaw-invariant representation;
+\item discrete diffusion formulation and DiT-1D denoiser architecture;
+\item in-distribution reconstruction and OOD goal-reaching evaluation;
+\item stitching-related drift and kinematic-consistency limitations;
+\item feature-wise partial masking for decorrelation and compositional generalization;
+\item group-wise input embedding for heterogeneous feature channels;
+\item masked in-betweening with RePaint-style resampling;
+\item left-right mirror symmetry augmentation in the dataset pipeline.
+\end{itemize}

@@ -1,0 +1,334 @@
+\section{Methodology}
+
+\subsection{Problem Formulation}\label{problem-formulation}
+
+The task of kinematic trajectory generation is formulated as a
+conditional generative modeling problem. Let
+\(\mathcal{S} \subseteq \mathbb{R}^{d}\) denote the state space of the
+robot. The kinematic state vector \(s_t\) (89-dimension) comprises:
+\begin{itemize}
+    \item Absolute joint positions \& velocities
+    \item Robot body position $x, y, z$ (relative to robot body at $t=0$)
+    \item Robot body rotation (yaw-removed)
+    \item Robot body velocities (robot body frame)
+    \item Object position / rotation (robot body frame)
+    \item Object velocities (robot body frame)
+    \item Goal vector (relative to robot body at $t=0$)
+\end{itemize}
+
+Given a finite history of observations \(h_t = \{s_{t-k}, \dots, s_t\}\)
+and a task specification \(g\) (e.g., target object pose), the objective
+is to synthesize a future trajectory
+\(\tau = \{s_{t+1}, s_{t+2}, \dots, s_{t+H}\}\) of horizon \(H\).
+
+Mathematically, this seeks to approximate the conditional distribution
+\(p(\tau | h_t, g)\) induced by an expert policy \(\pi_{expert}\) (in this case, implicitly by the dataset). The generative model learns to satisfy the following implicit optimization
+objective:
+
+\[
+\tau^* \sim p_\theta(\tau | h_t, g)
+\]
+
+where the optimal trajectory \(\tau^*\) implicitly satisfies: 
+\begin{enumerate}
+    \item \textbf{Task Fulfillment}: The final state \(s_{t+H}\) achieves the goal
+    condition defined by \(g\) (e.g.,
+    \(\| \phi(s_{t+H}) - g \| \le \epsilon\)). 
+    \item \textbf{Kinematic
+    Feasibility}: Each transition \((s_i, s_{i+1})\) respects the robot's
+    kinematic limits (joint limits, velocity bounds):
+    \[ s_{min} \le s_i \le s_{max}, \quad \| s_{i+1} - s_i \| \le \dot{s}_{max} \Delta t \]
+    \item \textbf{Manifold Consistency}: The trajectory lies on the manifold of
+    valid motions demonstrated in the dataset \(\mathcal{D}\).
+\end{enumerate}
+
+Since the solution space for whole-body loco-manipulation is highly multi-modal (there
+are many valid ways to pick up an object), the problem is not treated as
+deterministic regression (finding a single mean \(\tau\)), but as
+\textbf{distribution matching}. The goal is to learn parameters
+\(\theta\) that minimize the divergence between the learned distribution
+\(p_\theta\) and the data distribution \(p_{data}\):
+
+\[
+\min_\theta D_{KL}(p_{data}(\tau | h_t, g) \| p_\theta(\tau | h_t, g))
+\]
+
+In diffusion models, this minimization is made tractable through a variational formulation based on the evidence lower bound (ELBO). Under commonly used parameterizations, optimizing the ELBO leads to a simplified training objective that corresponds to predicting the injected noise, as described further in Section \ref{basics-of-diffusion-implementation}.
+
+\subsection{Data Acquisition and
+Processing}\label{data-acquisition-and-processing}
+
+The training data for this diffusion framework is derived from a specialized
+pipeline providing both diversity and feasibility:
+
+\begin{enumerate}
+\def\labelenumi{\arabic{enumi}.}
+\item
+  \textbf{Motion Retargeting}: The dataset was obtained from the OmniRetarget
+  pipeline, which adapts human motion capture data to the G1 humanoid robot's
+  kinematic structure. It contains motion trajectories of the robot interacting with objects and complex terrains (Figure \ref{fig:dataset_xy}). As shown in the figure, object x-y trajectories are plotted (above) alongside goal guidance vectors from initial to final object position (below). It is observed that the density of goal guidance vectors and thus number of learnable movement primitives is higher as a result of windowing and yaw rotation.
+\item
+  \textbf{Sampling-Based Trajectory Optimization}: The data from kinematic retargeting has some artifacts such as penetrations and floating. To bridge the gap between kinematic retargeting and physical reality, as well as to increase the variance of the existing data, the ATARI lab's SBTO framework is employed. This process cleans the data, computing dynamically consistent
+  state-action trajectories. This ensures the diffusion model learns from physically valid trajectories.
+\end{enumerate}
+
+\begin{figure}[H]
+    \centering
+    \includegraphics[width=1.0\linewidth]{Figures/combined_dataset_trajectories.png}
+    \caption{Distribution of Object Goals with respect to initial Object Pose. The scatter plot illustrates the spatial distribution of target objects in the x-y plane in the absolute frame (for full-length trajectories) and in the first robot frame yaw-rotated gravity-aligned referece
+    , highlighting the coverage of the workspace provided by the training data.}
+    \label{fig:dataset_xy}
+\end{figure}
+
+\subsubsection{Trajectory Windowing and Segmentation}
+
+Continuous, full-horizon (500 timeframes or ~5 seconds) expert demonstrations are segmented into fixed-length (20 timeframes or 0.2 seconds) context windows for training. A sliding window approach with a defined stride $S$ is utilized to extract overlapping segments from the full-horizon trajectories. Each training sample typically comprises a short observation history, and a longer prediction horizon (representing the planned trajectory).
+
+The reasoning for this segmentation strategy is two-fold:
+\begin{enumerate}
+    \item  \textbf{Data augmentation:} Sliding a window over limited expert demonstrations significantly amplifies the dataset size. This ensures that the model learns local kinematic feasibility for shorter segments of the motion, rather than the full trajectories themselves, as depicted in Figure \ref{fig:dataset_xy}. This is done in an attempt to facilitate auto-regressive stitching of windows from different trajectories, in order to reach unseen goal positions.
+    \item  \textbf{Fixed Input Structure:} Fixed-size windows provide uniform tensor shapes, which are required for efficient batch processing and compatibility with standard diffusion model architectures (U-Nets, transformers).
+\end{enumerate}
+
+\begin{figure}[H]
+    \centering
+    \includegraphics[width=0.6\linewidth]{Figures/trajectory_segmentation.png}
+    \caption{Trajectory Segmentation Pipeline. Full-horizon expert demonstrations are sliced into overlapping windows to create a dense dataset of local motion primitives, which are then batch-processed for training.}
+    \label{fig:trajectory_segmentation}
+\end{figure}
+
+\begin{figure}[H]
+    \centering
+    \includegraphics[width=0.6\linewidth]{Figures/autoregressive-stitching.png}
+    \caption{Autoregressive Stitching. The model learns to stitch together short kinematic segments to form long-horizon trajectories that reach novel goals.}
+    \label{fig:autoregressive_stitching}
+\end{figure}
+
+
+\subsection{Egocentric Coordinate Transforms}
+
+To achieve robust generalization, the data has to be pre-processed in such a way that various situations lie in-distribution for the trained diffusion model. In order to make the planner agnostic of the absolute (world-frame) coordinates of the robot and object, an egocentric representation is used. Instead of learning in global world coordinates, all data is transformed relative to the robot's current base frame.
+
+\begin{figure}[H]
+    \centering
+    \includegraphics[width=0.8\linewidth]{Figures/egocentric-frames.png}
+    \caption{Overview of the Egocentric Coordinate Transform. All state and goal variables are transformed into the robot's local base frame (defined by its position and yaw at $t_0$) to ensure the learned policy is invariant to global position and heading, but remains gravity-aligned.}
+    \label{fig:egocentric_transform}
+\end{figure}
+
+Let \(T_{world} = \{R_{world}, p_{world}\}\) be the state in the world
+frame at time \(t\), and \(T_{ref} = \{R_{ref}, p_{ref}\}\) be the
+reference frame defined by the robot's base at the current planning
+timestep \(t_0\).
+
+The egocentric transformation \(\Phi(s)\) applies the following
+operations to normalize the state space:
+
+\begin{enumerate}
+\def\labelenumi{\arabic{enumi}.}
+\item
+  \textbf{Reference Frame Definition}: The reference rotation
+  \(R_{ref}\) is defined as the pure yaw rotation of the robot's base at
+  \(t_0\). This creates a 'gravity-aligned' frame that points in the
+  robot's current heading direction. The yaw angle is obtained from the robot base quaternion at any timestep $q_{base}(t) = (w,x,y,z)$ as follows:
+    \[
+    \psi_{base}(t) = \operatorname{atan2}\!\left(2\,(w z + x y),\; 1 - 2\,(y^2 + z^2)\right)
+    \]
+    Thus, the yaw rotation matrix can be obtained as:
+  \[ R_{ref\_yaw} = R_z(\psi_{base}(t_0)) \]
+\item
+  \textbf{Translation Invariance}: The future frames of the
+  trajectory are expressed relative to the current base position, rotated
+  into the reference frame. This ensures the policy is invariant to the
+  robot's global location and yaw orientation (as seen \href{https://drive.google.com/file/d/1xwKxAsxEd1kz2fY9F2qfcvE9ySefHotP/view?usp=drive_link}{here}).
+  \[ p_{local}(t) = R_{ref\_yaw}^T (p_{base}(t) - p_{base}(t_0)) \]
+\item
+  \textbf{Rotational Decomposition (Yaw Invariance)}: The robot's
+  rotation is decoupled into a relative heading (yaw) and an absolute
+  attitude (roll/pitch).
+
+  \begin{itemize}
+  \tightlist
+  \item
+    Relative Yaw: \(\Delta \psi(t) = \psi(t) - \psi(t_0)\)
+  \item
+    Body Attitude: The global yaw is removed from the full
+    rotation matrix to capture the robot's tilt relative to gravity.
+    \[ R_{attitude}(t) =  R_z(\psi_{base}(t))^T R_{base}(t) \]
+    This ensures that execution is identical regardless of the direction that the
+    robot is facing (for example, in \href{https://drive.google.com/file/d/1q8S_4mlN16iR3t-ojmh-bAc-uoTlF6xV/view?usp=drive_link}{this video}).    
+    \begin{figure}[H]
+        \centering
+        \includegraphics[width=0.8\linewidth]{Figures/yaw_invariance.png}
+        \caption{Visual representation of Yaw Invariance decoupling. The policy is agnostic to the robot world frame yaw by design of the data representation.}
+        \label{fig:yaw_invariance}
+    \end{figure}
+  \end{itemize}
+\item
+  \textbf{Velocity Transformation}: Unlike positions, linear and angular
+  velocities are transformed into the \emph{instantaneous} body frame at
+  time \(t\), consistent with standard robotic control interfaces.
+  \[ v_{body}(t) = R_{base}(t)^T v_{world}(t) \]
+\item
+  \textbf{Object-Centric Features}: To facilitate object manipulation, the
+  object's pose and velocity is computed relative to the robot base frame at every
+  timestep.
+  \[ p_{obj\_rel}(t) = R_{base}(t)^T (p_{obj}(t) - p_{base}(t)) \]
+  \[ R_{obj\_rel}(t) = R_{base}(t)^T R_{obj}(t) \]
+  \[ v_{obj\_rel}(t) = R_{base}(t)^T v_{obj\_world}(t) \]
+\item
+  \textbf{Goal Guidance Vector}: The goal condition is represented as a
+  normalized vector pointing from the current object position to the target object
+  position, expressed in the robot's yaw frame. This informs the
+  robot which direction the goal for the current trajectory is relative to where the robot is facing.
+  \[ g_{vec} = R_{ref\_yaw}^T (p_{target} - p_{obj}(t_0)) \]
+\end{enumerate}
+
+By performing these egocentric data transformations, the model is essentially agnostic to the world-frame coordinates ${R_world, p_world}$ of the robot as well as object as seen in the history and future frames, helping it generalize planning to more tasks than without the transformations. For example, in \href{https://drive.google.com/file/d/1LD0b8sl4B3S7o3zwYrSocAW8aZmmrQBD/view?usp=drive_link}{this video}, we see two trajectories that would be different in the world frame, but very similar in the egocentric frame. 
+
+\subsection{Diffusion Framework}\label{basics-of-diffusion-implementation}
+
+A discrete diffusion framework is employed, utilizing a
+standard Gaussian diffusion process (DDPM/DDIM formulation):
+
+\begin{figure}[H]
+    \centering
+    \includegraphics[width=0.7\linewidth]{Figures/Denoising-Steps.png}
+    \caption{Visualization of the diffusion denoising process. The model starts from pure Gaussian noise (red, transparent lines) and iteratively denoises it into a coherent motion plan (thick black line), conditioned on the robot's current state and the goal vector. The blue line in the plots show the future trajectories from the dataset.}
+    \label{fig:denoising_steps}
+\end{figure}
+
+\begin{itemize}
+\item \textbf{Forward Process (Noising):} The forward process progressively
+adds Gaussian noise to the clean trajectory \(x_0\) according to a
+variance schedule \(\beta_t\). The distribution \(q(x_k | x_0)\) at any
+arbitrary noising step \(k\) can be expressed in closed form:
+\[ q(x_k | x_0) = \mathcal{N}(x_k; \sqrt{\bar{\alpha}_t} x_0, (1 - \bar{\alpha}_k) I) \]
+where \(\alpha_k = 1 - \beta_k\) and
+\(\bar{\alpha}_k = \prod_{s=1}^k \alpha_s\).
+
+The choice of schedule \(\beta_k\) determines the signal-to-noise ratio
+over time: 
+\begin{enumerate}
+\item 
+\textbf{Linear Schedule}: The variance increases linearly,
+which can lead to rapid information destruction in the early steps of
+the process.
+\[ \beta_k = \beta_{start} + \frac{k}{K}(\beta_{end} - \beta_{start}) \]
+\item
+\textbf{Cosine Schedule}: Designed to preserve information for a
+longer duration by modulating the noise fall-off more gradually. This is
+particularly effective for images and continuous signals.
+\[ \bar{\alpha}_k = \frac{f(k)}{f(0)}, \quad \text{where } f(k) = \cos^2\left(\frac{k/K + s}{1+s} \cdot \frac{\pi}{2}\right) \]
+\end{enumerate}
+
+In the current implementation, a \texttt{squaredcos\_cap\_v2} schedule
+(a robust variation of the cosine schedule) is utilized to prevent
+abrupt signal destruction.
+
+\item 
+\textbf{Reverse Process (Denoising):} The reverse process aims to
+approximate the intractable posterior \(q(x_{k-1} | x_k)\) using a
+neural network \(\epsilon_\theta\). The network predicts the noise
+\(\epsilon\) (or velocity \(v\)) added to \(x_0\), parameterized as:
+\[ p_\theta(x_{k-1} | x_k) = \mathcal{N}(x_{k-1}; \mu_\theta(x_k, k), \Sigma_\theta(x_k, k)) \]
+
+Effectively, the model learns to map a noisy trajectory \(x_t\),
+timestep \(t\), and condition \(c\) to the clean signal. The training
+objective minimizes the mean squared error between the added noise and
+the predicted noise:
+\[ \mathcal{L} = \mathbb{E}_{x_0, \epsilon, k, c} \left[ \| \epsilon - \epsilon_\theta(x_k, k, c) \|^2 \right] \]
+
+\end{itemize}
+
+During inference, the diffusion model is used to iteratively denoise random Gaussian noise into a data sample, conditioned on the current state of the robot and the desired goal direction.
+
+\subsection{Network Architecture}\label{network-architecture-dit-1d}
+
+\begin{figure}[H]
+    \centering
+    \includegraphics[width=0.8\linewidth]{Figures/diffusion-architecture.png}
+    \caption{Overview of the Diffusion Transformer Architecture, adapted from the network architecture in \cite{song2025historyguidedvideodiffusion} for video diffusion}
+    \label{fig:egocentric_transform}
+\end{figure}
+
+A specialized \textbf{Diffusion Transformer (DiT-1D)} architecture
+tailored for temporal sequence modeling is implemented. The network is
+constructed to process trajectory tokens directly, leveraging attention
+mechanisms to capture long-range temporal dependencies.
+
+\paragraph{1. Input Processing}\label{input-processing}
+
+\begin{itemize}
+\tightlist
+\item
+  \textbf{Trajectory Tokenization}: The input trajectory
+  \(X \in \mathbb{R}^{T \times C}\) (where \(T\) is the horizon and
+  \(C\) is the feature dimension) is linearly projected into a latent
+  dimension \(D\).
+\item
+  \textbf{Positional Encoding}: To preserve temporal order,
+  \textbf{learnable sinusoidal positional embeddings} are added to the
+  latent tokens. This allows the model to differentiate between early
+  (start) and late (goal) phases of the motion.
+\end{itemize}
+
+\paragraph{2. Transformer Backbone}\label{transformer-backbone}
+
+The core backbone consists of a stack of DiT blocks, each containing standard multi-head self-attention to model dependencies between different timesteps (\(t_i \leftrightarrow t_j\)). It also contains a AdaLN-zero layer, which modulates the effect of the conditions (denoising timestep $k$, state and goal conditions $c$) on the block output.
+
+\paragraph{3. Conditioning Mechanism}\label{conditioning-mechanism-adaln-zero} 
+
+Crucially, standard cross-attention is replaced for conditioning by Adaptive Layer Norm Zero \textbf{(AdaLN-Zero)}. This mechanism modulates the entire feature map based on the conditioning vector \(c\),
+which aggregates: 
+\begin{itemize}
+    \item \textbf{Diffusion noise level}: Embeddings of the current denoising timestep \(k\)
+    \item \textbf{External Conditions}: 
+    \begin{enumerate}
+        \item State History (processed via a dedicated history attention block)
+        \item Current State + Goal Vector (encoded via an MLP).
+    \end{enumerate}  
+\end{itemize}
+Inside each transformer block, the conditioning vector \(c\) is fed into
+an MLP to regress scale (\(\gamma\)), shift (\(\beta\)), and gating
+(\(\alpha\)) parameters:
+\[ \text{AdaLN}(x, c) = (1 + \gamma(c)) \cdot \alpha \cdot \text{LayerNorm}(x)  + \beta(c) \]
+This effectively 'steers' the intermediate features to align with diverse conditions, allowing the model to learn beneficial modulations of the features to ensure stronger conditioning in all transformer blocks. The scale and shift parameters are initialized to one and zero respectively, making the block an identity function at the start of training, which stabilizes convergence. This dual modulation enables the network to dynamically adapt the relative importance of input modalities (conditions) as a function of control signals (e.g., denoising timesteps), allowing for context-sensitive fusion.
+
+
+\paragraph{4. Final Projection}\label{final-projection}
+
+The output features are passed through a final \textbf{AdaLN} layer
+(without gating) and linearly projected back to the original feature
+dimension \(C\) to predict the denoised trajectory (or velocity field).
+
+
+\subsection{Robustness \& Generalization
+Tricks}\label{robustness-generalization-tricks}
+
+\begin{itemize}
+\item
+  \textbf{Condition Dropout (Classifier-Free Guidance)}: Conditioning
+  information (goals, states) is randomly dropped with probability
+  \(p_{drop}\) during training. This enables Classifier-Free Guidance
+  (CFG) at inference time, where the conditional estimate is
+  extrapolated away from the unconditional estimate:
+  \[ \hat{\epsilon} = (1 + w) \cdot \epsilon_\theta(x_t, c) - w \cdot \epsilon_\theta(x_t, \emptyset) \]
+  where \(w\) is the guidance scale. A higher \(w\) forces the generated
+  trajectory to adhere more strictly to the provided goal \(c\).
+\item
+  \textbf{Noise Injection}: Gaussian noise is injected into the
+  conditioning inputs (\texttt{state\_condition}) to simulate sensor
+  noise and imperfect state estimation, making the policy robust to
+  minor deviations.
+  \[ s_{cond}' = s_{cond} + \mathcal{N}(0, \sigma_{noise}^2) \]
+\item
+  \textbf{Goal Swapping}: Implemented in
+  \texttt{apply\_trajectory\_swapping}, this technique prevents the
+  model from overfitting to specific state-goal correlations. For a
+  batch item \(i\), with probability \(p_{swap}\), its goal \(g_i\) is
+  replaced with a random goal \(g_j\) from the batch (or random noise).
+  \[ g_{train} = \begin{cases} g_{rand} & \text{if } u < p_{swap} \\ g_{true} & \text{otherwise} \end{cases} \]
+  This breaks the spurious correlation between the initial state and the
+  goal, forcing the network to attend explicitly to the goal vector, regularizing the model against overfitting to the data based on only the initial state.
+\end{itemize}

@@ -1,0 +1,326 @@
+\section{Background}\label{background}
+
+\subsection{Concepts}\label{theory-concepts}
+
+\subsubsection{Motion Planning}\label{motion-planning}
+Motion planning is the computational framework for determining a
+sequence of valid configurations that move a robot from a start state to
+a goal state while interacting with the environment (e.g., avoiding
+obstacles). 
+\begin{itemize}
+    \item \textbf{Configuration Space (C-Space)}: The set of all
+mathematically possible robot generalized coordinates \(\mathcal{C}\) (e.g. robot base pose and joint angles). A configuration \(q \in \mathcal{C}\) describes the position and
+orientation. The physically (kinematically) feasible configuration space free of collisions is denoted $\mathcal{C}_{free}$.
+    \item \textbf{Problem Formulation}: Finding a continuous path
+\(\tau: [0, 1] \rightarrow \mathcal{C}_{free}\) such that
+\(\tau(0) = q_{start}\) and \(\tau(1) \in \mathcal{C}_{goal}\). If we define an objective function $J$, the task is to find a trajectory $\tau$ such that:
+\[
+J(\tau^*) = max\{J(\tau): \tau \in \mathcal{C}_{free}\}
+\]
+Taking the start and goal states into account, this can also be written as:
+\[
+\tau^* = \operatorname{argmax} \left\{ J(\tau) \;\middle|\; 
+\begin{aligned} 
+&\tau(0) = q_{\text{start}}, \tau(1) \in \mathcal{C}_{\text{goal}}, \\ 
+&\forall t \in [0,1], \tau(t) \in \mathcal{C}_{\text{free}} 
+\end{aligned} 
+\right\}
+\]
+\end{itemize}
+
+\subsubsection{Motion Planning as Probabilistic Inference}
+Typically, a trajectory \(\tau\) is optimized to minimize a cost \(J(\tau)\). In the
+inference perspective (as discussed in \cite{carvalho2023motion}), this is reframed as sampling from a posterior
+distribution. An optimality variable \(\mathcal{O}\) (a binary event
+behaving like a likelihood) is introduced where
+\(p(\mathcal{O}=1|\tau) \propto \exp(-J(\tau))\). The planning problem
+is then formulated as sampling suitable trajectories from the posterior:
+\[ p(\tau | \mathcal{O}=1) \propto p(\mathcal{O}=1 | \tau) p(\tau) \]
+where the prior \(p(\tau)\) enforces smoothness or kinematics (learned
+from data), and the likelihood enforces task constraints (collisions,
+goals). Diffusion models naturally fit this framework by learning the
+gradient of this log-density (score matching). The score of the
+posterior can be decomposed:
+\[ \nabla_\tau \log p(\tau | \mathcal{O}=1) = \nabla_\tau \log p(\tau) + \nabla_\tau \log p(\mathcal{O}=1 | \tau) \]
+The first term is provided by the unconditional diffusion model
+(gradient of the data prior), and the second term acts as a
+\emph{guidance} signal (gradient of the cost function).
+
+
+\subsubsection{Generative Models}\label{generative-models}
+\begin{itemize}
+\item
+  \textbf{Variational Autoencoders (VAEs)}: These models learn a
+  low-dimensional latent space representation of the data. While fast,
+  ``posterior collapse'' or blurry data generation is often observed.
+\item
+  \textbf{Diffusion Models}\label{basics-of-diffusion-implementation}: A class of likelihood-based models that
+  learn to reverse a gradual noising process. Following the notation
+  from the survey \cite{wolf2025diffusion}:
+
+  \begin{itemize}
+  \tightlist
+  \item
+    \textbf{Forward Process}: A Markov chain is defined that
+    progressively destroys data structure by adding Gaussian noise
+    according to a variance schedule \(\beta_k\):
+    \[ q(x_{k+1} | x_k) = \mathcal{N}(x_{k+1}; \sqrt{1 - \beta_k} x_k, \beta_k I) \]
+  \item
+    \textbf{Reverse Process}: The model attempts to approximate the
+    intractable posterior \(q(x_{k-1} | x_k)\) using a learned Gaussian
+    transition:
+    \[ p_\theta(x_{k-1} | x_k) \approx \mathcal{N}(x_{k-1}; \mu_\theta(x_k, k), \Sigma_\theta(x_k, k)) \]
+  \item
+    \textbf{Training Objective}: In the DDPM formulation, this reduces
+    to training a noise prediction network \(\epsilon_\theta\) to
+    predict the noise \(\epsilon\) added to \(x_0\), minimizing the
+    simplified MSE loss:
+    \[ \mathcal{L} = \mathbb{E}_{k, x_0, \epsilon} \left[ || \epsilon - \epsilon_\theta(x_k, k) ||^2 \right] \]
+  \item
+    \textbf{Sampling}: By chaining these learned transitions, clean
+    samples \(x_0\) can be generated starting from pure noise
+    \(x_K \sim \mathcal{N}(0, I)\). Optimized samplers like
+    \textbf{DDIM} formulate this as a deterministic ODE, allowing for
+    fewer steps.
+  \end{itemize}
+\item
+  \textbf{Flow Matching}: A continuous vector field \(v_t(x)\) is
+  learned that pushes a probability density path \(p_t\) from noise to
+  data. A regression loss on the vector field is minimized:
+  \[ \mathcal{L}_{FM} = \mathbb{E}_{t, x_0, x_1} \left[ || v_t(x_t) - (x_1 - x_0) ||^2 \right] \]
+  This often results in straighter trajectories in the probability space
+  compared to diffusion, enabling faster inference.
+\end{itemize}
+
+\subsection{Related Work}\label{related-work}
+
+\subsubsection{Trajectory Optimization}
+Trajectory optimization serves as the foundation for modern motion planning, aiming to find optimal paths that respect kinematic and dynamic constraints.
+\begin{enumerate}
+    \item \textbf{Gradient-based Trajectory Optimization}: Methods such as CHOMP, TrajOpt, and MPC-based solvers formulate planning as a non-convex optimization problem. As noted in \cite{gu2025humanoidlocomotionmanipulationcurrent}, these approaches typically separate the planning of locomotion (base movement) and manipulation (arm movement). A critical limitation is their reliance on high-quality warm starts; without a good initial guess, these optimizers frequently become trapped in local minima due to the complex, non-convex nature of collision avoidance and kinematic constraints.
+    \item \textbf{Sampling-based Trajectory Optimization}: Algorithms like RRT* and PRM offer probabilistic completeness but often struggle with the high dimensionality of humanoid robots. Performing whole-body loco-manipulation in real-time is challenging due to sample inefficiency. To mitigate this, search is often performed on a task-dependent subset of degrees of freedom (DoF), keeping other joints fixed, which limits the robot's versatility.
+    \item \textbf{Limitations}: Some methods address these challenges by simplifying the problem formulation, for example by fixing the lower body, restricting motion to quasi-static states, or decomposing control into separate upper- and lower-body subsystems. While these strategies reduce computational and modeling complexity, they also increase inaccuracies, limit the robot's range of achievable behaviors, and constrain adaptability in dynamic or unstructured environments.
+\end{enumerate}
+
+\subsubsection{Imitation Learning}
+Imitation learning (IL) seeks to learn policies directly from expert demonstrations, bypassing the need for explicit cost function engineering.
+\begin{itemize}
+    \item \textbf{Paradigms}: Common approaches include Behaviour Cloning (BC), Inverse Reinforcement Learning (IRL), Adversarial Motion Priors (AMP), and Gaussian Mixture Models (GMMs). A particularly successful application in fine-grained bimanual manipulation is presented in \cite{zhao2023learningfinegrainedbimanualmanipulation} (ALOHA), which utilizes simple behavior cloning on high-quality teleoperated data.
+    \item \textbf{Data Bottleneck}: A major hurdle for humanoid IL is the scarcity of high-quality training data. Kinematic retargeting of human motion capture data is a standard solution, but often introduces artifacts or physical inconsistencies that require further processing.
+\end{itemize}
+
+\subsubsection{Generative Models in Robotics}
+Generative modeling has emerged as a powerful tool for synthesis across various domains:
+\begin{itemize}
+    \item \textbf{Variational Autoencoders (VAEs)}: VAEs have been used to learn latent action spaces. The Action Chunking Transformer (ACT) \cite{zhao2023learningfinegrainedbimanualmanipulation} employs a CVAE-based architecture to predict sequences of actions (chunks), effectively modeling temporal dependencies.
+    \item \textbf{Character Animation}: In graphics, models like Motion Diffusion Model (MDM) and Diffuse-Cloc generate realistic human motion from text or sparse signals.
+    \item \textbf{Robotics and Computer Vision}: Latent diffusion models are increasingly used in computer vision to generate synthetic training data. In robotics, approaches like Diffuser \cite{janner2022planningdiffusionflexiblebehavior}, Diffusion Policy \cite{chi2023diffusion}, and Motion Planning Diffusion (MPD) \cite{carvalho2023motion} treat planning as a generative process, learning to denoise trajectories from random noise.
+\end{itemize}
+
+\subsubsection{Model-Based Diffusion Approaches}
+Recent advancements have focused on scaling these models to generalist robots.
+\begin{itemize}
+    \item \textbf{Generalist Robots}: Projects such as Nvidia GR00T, Pi-zero, and BeyondMimic represent the state-of-the-art in applying large-scale generative models to humanoid control, aiming to create "foundation models" for robot motion that can generalize across tasks and embodiments.
+\end{itemize}
+
+\subsubsection{Why Learning-Based Planners?}
+To overcome the sensitivity
+    to initialization and the computational cost of online search,
+    learning-based planners leverage large datasets of expert
+    trajectories to learn priors. Earlier methods used Gaussian Mixture
+    Models (GMMs) or VAEs, but these often struggle to capture the
+    complex, multi-modal distributions of valid motions in
+    high-dimensional robot state spaces (e.g., a 7-DoF arm or humanoid).
+    \textbf{Diffusion models} have emerged as a superior alternative
+    because they:
+
+    \begin{enumerate}
+    \def\labelenumi{\arabic{enumi}.}
+    \tightlist
+    \item
+      Effectively model \textbf{multi-modal distributions} (capturing
+      distinct valid paths, such as going left vs.~right around an
+      obstacle) without mode collapse.
+    \item
+      Can serve as a \textbf{global trajectory prior} for
+      optimization-based planners, providing high-quality
+      initializations that avoid local minima.
+    \item
+      Allow for flexible \textbf{conditional sampling} (e.g.,
+      conditioning on obstacles or goals) via gradients of the learned
+      score function, effectively performing ``planning as inference''
+      rather than just playback.
+    \end{enumerate}
+
+\subsubsection{Physics-based Animation and Control}
+The synthesis of
+dynamically realistic motions that are both reactive to the environment
+and responsive to user inputs has been a longstanding objective in
+physics-based character animation. These capabilities are increasingly
+vital for humanoid robotics. The core challenge lies in reconciling
+high-level semantic goals---such as interacting with specific
+objects---with the stringent low-level physical constraints of balance,
+contact dynamics, and actuation limits.
+
+\subsubsection{Kinematic Priors vs.~End-to-End Learning}
+Recent advancements
+in kinematic motion diffusion models have demonstrated remarkable
+capabilities in motion synthesis, conditioned effectively on partial
+states, textual descriptions, or even musical rhythms. A key advantage
+of these kinematic models is their distinct modularity; they can be
+repurposed for unseen downstream tasks through inference-time techniques
+such as classifier guidance or inpainting without the need for
+retraining.
+
+However, purely kinematic generation often lacks physical fidelity,
+leading to artifacts such as foot sliding, floating, or self-collision.
+To address this, a hierarchical strategy is adopted in this work: a
+tracking policy is employed to follow the generated kinematic plans.
+This contrasts with end-to-end approaches that directly predict control
+actions to ensure physical realism. While action-prediction models
+inherently satisfy dynamic constraints, a lack of versatility is often
+observed. Unlike kinematic diffusion models, adaptation to new tasks or
+constraints is difficult without expensive retraining, as learned
+representations are tightly coupled to specific dynamic contexts and
+lack a varying inference-time interface.
+
+% \item
+%   \textbf{Reinforcement Learning (RL)}: Note, most RL methods
+%   integrating diffusion are offline.
+
+%   \begin{itemize}
+%   \tightlist
+%   \item
+%     \textbf{Limitations of Standard RL}: Learning long-horizon
+%     manipulation directly with end-to-end RL is plagued by sample
+%     inefficiency and exploration challenges, especially in sparse-reward
+%     settings.
+%   \item
+%     \textbf{Offline RL with Diffusion}: To address data inefficiency,
+%     Offline RL leverages static datasets. However, standard methods
+%     suffer from distribution shift when the learned policy deviates from
+%     the dataset. Diffusion models are now employed in Offline RL (e.g.,
+%     \emph{Diffusion-QL}) to better model the behavior policy's
+%     distribution, allowing for more stable policy improvement. It has
+%     been noted (Wolf et al.~2025) that utilizing the reward signal
+%     during training (unlike decoupling it as in \emph{Diffuser}) can
+%     improve sample efficiency and policy alignment.
+%   \item
+%     \textbf{Skill Composition}: A growing trend (Ajay et al.~2023)
+%     combines diffusion-based skill learning (lower-level) with
+%     high-level RL policies, enabling long-horizon task solving by
+%     chaining diffusion-generated motion primitives.
+%   \end{itemize}
+\item
+  \textbf{Imitation Learning (IL)}:
+
+  \begin{itemize}
+  \tightlist
+  \item
+    \textbf{Behavior Cloning (BC)}: Traditionally, control is treated as
+    a supervised learning problem (mapping states to actions). Standard
+    BC models (like MLPs or Transformers in \emph{ACT}) suffer from the
+    ``covariate shift'' problem: small errors accumulate, driving the
+    robot away from the training distribution where the policy is
+    undefined.
+  \item
+    \textbf{Diffusion as Expressive Policies}: Diffusion models address
+    the multi-modality inherent in expert demonstrations (e.g., an
+    expert might go left or right around an obstacle, whereas a unimodal
+    BC policy would average them and crash). As discussed in the survey
+    \cite{wolf2025diffusion}, diffusion models effectively learn complex
+    action distributions and generate smooth trajectories.
+  \item
+    \textbf{Trajectory vs.~Action Space}: While some methods predict
+    single actions, others (\cite{chi2023diffusion}) predict
+    sequences (Receding Horizon Control) or entire trajectories (\cite{carvalho2023motion}). Predicting sequences significantly mitigates the error
+    accumulation seen in standard BC.
+  \item
+    \textbf{Flow Matching}: More recently, Flow Matching has emerged as
+    a stable alternative to Diffusion for imitation learning (\cite{rouxel2024flow}), offering faster convergence and straighter probability
+    flow paths, as noted in the survey.
+  \end{itemize}
+\item
+  \textbf{Diffusion in Robotics}: Diffusion models in robotics primarily
+  focus on \textbf{Trajectory Planning and Control}.
+
+  \begin{itemize}
+  \item
+    \textbf{Trajectory Planning and Control}:
+
+    \begin{itemize}
+    \tightlist
+    \item
+      \emph{Imitation Learning}: \cite{chi2023diffusion} demonstrated stable manipulation by modeling the action
+      distribution as a diffusion process, utilizing \emph{receding
+      horizon control} where a sequence of actions is predicted but only
+      the first few are executed. \cite{carvalho2023motion} explicitly generates collision-free
+      trajectories in configuration space between start and goal states,
+      operating as a neural motion planner.
+    \item
+      \emph{Reinforcement Learning / Offline RL}: \cite{janner2022diffuser} proposed a trajectory-level planning framework that
+      generates both states and actions. Constraints and goals are
+      integrated via ``inpainting'' during the reverse process or
+      classifier guidance. Extensions like
+      \cite{ajay2023decision} and \cite{wang2023diffusionql}
+      incorporate reward maximization directly into the generation
+      process, either by conditional sampling on high returns or by using the diffusion model as a policy within a
+      Q-learning framework.
+    \end{itemize}
+
+  \item
+    \textbf{Robotic Grasp Generation}: Methods apply diffusion to learn distributions of valid SE(3) grasp poses \cite{urain2023se3diff} or latent grasp representations \cite{barad2024graspldm}, enabling the generation of diverse and stable grasps.
+
+  \item
+    \textbf{Visual Data Augmentation}: Pretrained image-generation models are leveraged to address data scarcity. Techniques include altering backgrounds or rearranging objects to improve the robustness of downstream policies to visual domain shifts.
+
+  \item
+    \textbf{Guidance Mechanisms}:
+    \begin{itemize}
+    \tightlist
+    \item
+      \emph{Inpainting}: Constraints (e.g., passing through a waypoint)
+      are enforced by hard-replacing parts of the trajectory during
+      sampling. Instability is sometimes observed (``off-manifold''
+      samples).
+    \item
+      \emph{Classifier Guidance}: A separate learned cost function is
+      used to steer generation.
+    \item
+      \emph{Classifier-Free Guidance (CFG)}: The model is trained with
+      and without conditioning labels, and the difference is checked
+      during sampling to steer towards the condition. This provides
+      robustness but requires retraining for new constraint types.
+    \end{itemize}
+  \end{itemize}
+\item
+  \textbf{Kinematic Motion Diffusion and Guidance}: Recent developments
+  in the field frame motion synthesis as a conditional diffusion process
+  on the kinematic state space.
+
+  \begin{itemize}
+  \tightlist
+  \item
+    \textbf{Manifold Learning}: The manifold of valid poses is
+    approximated by the model (e.g., \cite{tevet2023human} for humans,
+    \cite{serifi2024robot} for manipulators). Diverse, naturalistic motions
+    (e.g., \cite{kalaria2025dreamcontrol}, \cite{zhao2024dartcontrol}) are generated without being strictly
+    constrained by dynamics during generation.
+  \item
+    \textbf{Inference-Time Guidance}: A critical feature is the ability
+    to apply guidance (e.g., \cite{xie2024omnicontrol} for spatial constraints)
+    during inference. By modifying the denoising step with a gradient
+    term \(\nabla_{x_t} J(x_t)\) or through classifier-free guidance,
+    the trajectory is steered towards fulfilling constraints (e.g.,
+    ``right hand at position \(p\)'') that were not explicitly optimized
+    for during training. This adaptability underscores the reasoning for
+    choosing a kinematic diffusion planner. \cite{liao2025beyondmimic}, \cite{tevet2024closdclosingloopsimulation}, and \cite{wu2025uniphys} further
+    extend this by coupling kinematic priors with robust tracking
+    policies or simulation loops for versatile humanoid control. This offers benefits over a
+    rigid end-to-end policy---a single foundation model is provided to
+    serve multiple downstream tasks.
+  \end{itemize}
+\item
+  \textbf{Sequence Modeling Paradigms}:
+    Diffusion Forcing \cite{chen2024diffusion, wu2025uniphys}: A different approach is used in diffusion forcing for time-series modelling, with per-token noise levels. The stability of sequence modeling is combined with the flexibility of diffusion, allowing for ``variable context'' lengths---future states can be forecasted or missing intermediate states between start and goal can be imputed.
+\end{itemize}

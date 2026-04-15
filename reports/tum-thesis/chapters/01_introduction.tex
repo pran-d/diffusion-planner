@@ -1,0 +1,68 @@
+Humanoid robots are a natural platform for general-purpose physical intelligence because they combine locomotion and manipulation in human-centric environments. However, whole-body loco-manipulation is difficult to plan: robot base motion, posture, arm-object interaction, and temporal coordination must be solved jointly in a high-dimensional and strongly coupled state space.
+
+\begin{figure}[!h]
+    \centering
+    \includegraphics[width=0.82\linewidth]{humanoid_applications.png}
+    \caption{Humanoid robot applications motivating unified loco-manipulation planning.}
+    \label{fig:intro_humanoid_applications}
+\end{figure}
+
+Classical optimization-based planning and end-to-end reinforcement learning each provide useful tools, but both face practical limitations for this setting. Optimization pipelines can become brittle in long-horizon, multi-modal tasks, while pure RL often requires large interaction budgets and task-specific reward design. This motivates imitation learning from demonstrations as a data-driven alternative for obtaining natural whole-body motion priors.
+
+\begin{figure}[!h]
+    \centering
+    \includegraphics[width=0.95\linewidth]{humanoid_planning_challenges.png}
+    \caption{Challenges in humanoid whole-body planning}
+    \label{fig:intro_humanoid_challenges}
+\end{figure}
+
+At the same time, imitation learning for humanoids is fundamentally data-limited. Demonstrations are expensive to collect and cannot densely cover the continuous task space of object displacements and interaction strategies. Learning from \emph{sparse} demonstrations is therefore a central problem: the planner must infer plausible behavior in regions that are weakly represented in the dataset.
+
+Recent diffusion-based approaches are well suited to this regime because they model conditional distributions over trajectories instead of single deterministic outputs \cite{janner2022diffuser,chi2023diffusion,carvalho2023motion,wolf2025diffusion,tevet2023human}. This thesis studies conditional diffusion for high-level kinematic planning in humanoid object relocation.
+
+\section{Motivation and Scope}
+
+The work adopts a hierarchical control architecture:
+\begin{itemize}
+    \item a \textbf{high-level kinematic planner} generates short-horizon, goal-conditioned trajectory references;
+    \item a \textbf{low-level dynamic tracker} (RL-based in the broader pipeline) follows these references in real time.
+\end{itemize}
+
+This separation is motivated by computational timescales. Large generative models are expressive but comparatively slow at inference when used as direct torque-level controllers. Using them as high-level planners decouples heavy generative inference from fast feedback control, enabling practical deployment with real-time tracking.
+
+A second motivation is representation efficiency under sparse data. Invariant feature spaces can substantially reduce apparent sparsity by collapsing equivalent behaviors. Accordingly, this thesis emphasizes egocentric, yaw-normalized trajectory encoding and fixed-window segmentation, so local motion primitives become reusable across global orientations and positions.
+
+A third motivation is robustness against spurious feature correlations. In sparse datasets, models can overfit coupled feature patterns (for example, memorizing full-state co-occurrences) rather than learning compositional structure. The training design therefore includes masked conditioning over selected frame-feature subsets, forcing completion from partial information and improving compositional generalization in autoregressive rollout.
+
+Beyond one-shot imitation, this planner--tracker decomposition also enables iterative data augmentation. Generated kinematic plans can be executed by the RL tracker, filtered by task and plausibility checks, and recycled as additional supervision for subsequent planner updates. This creates an evolutionary improvement loop in which the diffusion planner replaces earlier lightweight motion generators while preserving the same high-level recipe: generate, track, validate, and retrain, in the spirit of iterative generator--tracker pipelines \cite{xu2025parc}.
+
+\section{Problem Statement and Research Questions}
+
+The thesis addresses the following questions:
+\begin{itemize}
+    \item Which data representation choices most effectively improve data efficiency and goal-space generalization?
+    \item What are the dominant failure modes during long-horizon kinematic motion generation and how to mitigate them?
+\end{itemize}
+
+To answer these questions, we construct a complete pipeline spanning data transformation, conditional diffusion training, autoregressive generation, and downstream evaluation.
+
+\section{Contributions}
+
+The main contributions of this thesis are:
+\begin{enumerate}
+    \item A conditional diffusion formulation for humanoid kinematic planning from sparse demonstrations in object-relocation tasks.
+    \item A representation pipeline centered on egocentric yaw-invariant features and segmented trajectory windows to improve effective coverage of the task space.
+    \item A masked partial-conditioning strategy that reduces reliance on rigid feature correlations and improves conditional completion behavior for long-horizon rollout.
+    \item A hierarchical planning perspective that explicitly couples a diffusion-based kinematic planner with a real-time dynamic tracking controller in the broader system.
+\end{enumerate}
+
+\begin{figure}[!h]
+    \centering
+    \includegraphics[width=0.78\linewidth]{egocentric-frames.png}
+    \caption{Egocentric (yaw-invariant) feature frames used in this work to reduce data sparsity}
+    \label{fig:intro_egocentric_frame}
+\end{figure}
+
+\section{Thesis Outline}
+
+The remainder of the thesis is organized as follows. Chapter 2 formalizes the problem and foundational concepts. Chapter 3 reviews related work in planning, imitation learning, and diffusion-based motion generation. Chapter 4 presents methodological design choices and model formulation. Chapter 5 describes the implementation and experimental protocol, including ablation design. Chapter 6 reports empirical results. Chapter 7 presents the RL tracking controller and evolutionary pipeline. Chapter 8 discusses limitations and practical implications. Chapter 9 concludes the thesis.
