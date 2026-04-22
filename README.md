@@ -232,3 +232,171 @@ python visualize_trajectory_npz.py --npz_path results/inference_mg.npz
 **MuJoCo viewer controls**: `SPACE` pause/play · `→` step forward · `←` step back · `ESC` exit
 
 Requires `mj_model.xml` in the project root.
+
+## Advanced Features
+
+### 1. Style-Conditioned Motion Planning
+
+The diffusion model can now handle **mixed-task training** by automatically detecting and conditioning on motion style: **pick**, **push**, or **kick**. A single unified model learns to generate appropriate trajectories for all three styles without per-style fine-tuning.
+
+#### Style Detection
+
+Style is automatically inferred from trajectory dynamics during training:
+- **Pick**: Object lift > 0.08 m detected → high-confidence pick trajectory
+- **Push**: Low lift + high object XY velocity → push trajectory
+- **Kick**: High foot-contact speed (lower-body joint velocity > 0.9 rad/s) → kick trajectory
+- **Text Fallback**: If motion-based detection is ambiguous, task description from `tasks.yml` is used
+
+#### Configuration
+
+Enable style conditioning in `config/config.yaml`:
+
+```yaml
+data:
+  style_conditioning:
+    enabled: true
+    detection_mode: motion_then_text  # text_only | motion_only | text_then_motion | motion_then_text
+    num_styles: 3                      # pick=0, push=1, kick=2
+    seed: 42
+    tasks_file: ./test_datasets/tasks.yml
+model:
+  style_condition: true
+  # ... other model settings
+training:
+  condition_dropout_prob:
+    style: 0.05  # 5% dropout for classifier-free guidance
+```
+
+#### Training & Inference with Styles
+
+**Training**: Automatically detects style for each trajectory during data loading. Style one-hot encoding is concatenated with state/task conditions.
+
+```bash
+# Train with mixed tasks (pick, push, kick)
+python train.py
+```
+
+**Inference**: Either auto-detect (defaults to push) or specify style via CLI:
+
+```bash
+# Default: push style
+python inference_mg.py --epoch 500 --ema
+
+# Override to pick or kick
+python inference_mg.py --epoch 500 --ema --style pick
+python inference_mg.py --epoch 500 --ema --style kick
+
+# Python API
+mg.generate_trajectory(
+    initial_condition=ic,
+    goal_condition=goal,
+    style_condition="pick",  # or np.array([1,0,0]) one-hot
+)
+```
+
+#### Architecture Integration
+
+Style conditioning flows through the model:
+1. **Dataset**: Per-trajectory one-hot style vector (B, 3) computed during pre-load
+2. **Model**: Style embedding MLP (3 → hidden_size) concatenated with state/task embeddings
+3. **Training**: Style dropout (default 5%) for classifier-free guidance
+4. **Inference**: Optional CLI override; defaults to push if disabled
+
+### 2. Hierarchical Two-Phase Trajectory Generation
+
+The model uses **per-feature noise scheduling** to decompose trajectory generation into two phases:
+
+- **Phase 1 (Root & Object Planning)**: Lower noise levels for root position (delta_xy, delta_yaw), object displacement (obj_delta_xy, obj_z, obj_rel_pos, obj_rel_rot6d)
+  - Goal: Plan where the robot moves and how the object moves
+  - Finishes at ~50% of diffusion steps
+
+- **Phase 2 (Joint & Body Pose)**: Higher noise levels for joints, body pose (body_z, body_rot6d)
+  - Goal: Plan body posture conditioned on the fixed root/object trajectory
+  - Finishes at 100% of diffusion steps
+
+This two-phase approach improves both sample quality and efficiency:
+- **Structured generation**: Root/object moves first, body follows → physically plausible trajectories
+- **Interpretability**: Can inspect intermediate outputs at the 50% mark to see high-level plan before pose details
+- **Robustness**: Phase 1 errors (e.g., unreachable goals) propagate with lower noise, allowing phase 2 to adapt
+
+#### Configuration
+
+Enable hierarchical scheduling in `config/config.yaml`:
+
+```yaml
+noise_scheduler:
+  noise_level: random_uniform
+  scheduling_matrix: hierarchical_two_phase  # full_sequence | autoregressive | hierarchical_two_phase
+  hierarchical_noise:
+    enabled: true
+    phase1_feature_keys:
+      - delta_xy          # Robot XY displacement
+      - delta_yaw         # Robot yaw change
+      - obj_delta_xy      # Object XY displacement
+      - obj_z             # Object height
+      - obj_rel_pos       # Object pos relative to robot
+      - obj_rel_rot6d     # Object orientation relative to robot
+    phase2_feature_keys:
+      - joints            # Joint angles
+      - body_z            # Robot pelvis height
+      - body_rot6d        # Robot orientation (6D)
+    phase1_max_ratio: 0.5  # Phase 1 finishes at 50% of steps
+    phase2_min_ratio: 0.0  # Phase 2 starts from step 0
+
+  hierarchical_schedule:
+    enabled: true
+    phase1_end_ratio: 0.5  # Schedule: phase 1 clean by step K/2, phase 2 clean by step K
+```
+
+#### Training with Hierarchical Noise
+
+During training, phase 1 features receive lower random noise levels than phase 2:
+
+```python
+# Example noise sampling (automatic in forward()):
+# Phase 1: noise ~ U(0, 0.5 * T)  (cleaner)
+# Phase 2: noise ~ U(0, T)         (noisier, but constrained by phase 1)
+```
+
+The loss is weighted per timestep/feature using min-SNR reweighting, treating (B, T, D) shaped noise naturally without reshaping.
+
+#### Inference with Hierarchical Scheduling
+
+During sampling, the noise scheduler generates a 3D matrix `(steps, tokens, features)`:
+
+```
+Step 0: Phase 1 @ high noise, Phase 2 @ high noise
+Step 1: Phase 1 @ medium noise, Phase 2 @ high noise
+...
+Step K/2: Phase 1 @ 0 (clean), Phase 2 @ medium noise
+...
+Step K: Phase 1 @ 0, Phase 2 @ 0 (fully clean)
+```
+
+This ensures phase 1 features (root/object) are denoised early and held steady while phase 2 (joints/pose) refines over the remaining steps.
+
+#### Benefits in Practice
+
+- **Pick Tasks**: Root reaches goal early, then joints adjust to grasp configuration
+- **Push Tasks**: Robot trajectory stabilizes first, joints then optimize for object control
+- **Kick Tasks**: Root/stance established, then legs execute kick motion
+- **Generalization**: Single model handles all three styles with coherent two-phase generation
+
+## Combining Style Conditioning + Hierarchical Noise
+
+The most powerful configuration uses both features together:
+
+```bash
+# Train on mixed tasks with hierarchical two-phase generation
+python train.py
+
+# Inference: specify task style, get phase-aware trajectory
+python inference_mg.py --epoch 500 --ema --style kick \
+    --save_path results/kick_traj.npz
+```
+
+This yields a **unified generalist model** that:
+1. Detects or accepts motion style (pick/push/kick)
+2. Generates root/object trajectory first (phase 1)
+3. Refines body/joint posture second (phase 2)
+4. Produces physically feasible, task-appropriate motion

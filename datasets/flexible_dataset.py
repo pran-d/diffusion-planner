@@ -11,6 +11,12 @@ from utils.math.sbto_utils import compute_sbto_components, yaw_to_rot_matrix, ya
 from utils.math.rotation_conversions import ( 
     axis_angle_to_quaternion, 
 )
+from utils.data.style_conditioning import (
+    classify_style_from_motion,
+    classify_style_from_task_text,
+    load_task_text_map,
+    one_hot_style,
+)
 
 class FlexibleWindowDataset(Dataset):
     """
@@ -26,6 +32,7 @@ class FlexibleWindowDataset(Dataset):
         calculate_stats=False,
         training_cfg=None,  
     ):
+        training_cfg = training_cfg or {}
         
         self.noise_cfg = training_cfg.get("state_conditioning_noise_level", {})
         self.num_observations = config.get("num_observations", 45)
@@ -47,10 +54,21 @@ class FlexibleWindowDataset(Dataset):
         )
 
         self.key_mapping = config.get("key_mapping", {})
+        style_cfg = config.get("style_conditioning", {})
+        self.style_condition = bool(style_cfg.get("enabled", False))
+        self.num_styles = int(style_cfg.get("num_styles", 3))
+        self.style_detection_mode = str(style_cfg.get("detection_mode", "motion_then_text"))
+        self._style_rng = np.random.default_rng(int(style_cfg.get("seed", 42)))
+        self._task_text_by_folder = load_task_text_map(style_cfg.get("tasks_file", None))
         
         print(f"Using feature order: {self.feature_order}")
         print(f"Using normalization type: {self.normalization_type}")
         print(f"Using key mapping: {self.key_mapping}")
+        if self.style_condition:
+            print(
+                f"Style conditioning enabled (num_styles={self.num_styles}, "
+                f"mode={self.style_detection_mode})"
+            )
 
         self.add_noise = training_cfg.get("add_obs_noise", False)
         self.add_goal_noise = training_cfg.get("add_goal_noise", False)
@@ -287,13 +305,61 @@ class FlexibleWindowDataset(Dataset):
                 processed['goal_obj_world'] = goal_world  # (N_i, 3)
                 tp_offset += N_i
 
+            if self.style_condition:
+                style_ids = np.zeros((N_i,), dtype=np.int64)
+                style_onehot = np.zeros((N_i, self.num_styles), dtype=np.float32)
+                for j in range(N_i):
+                    sid = self._infer_style_for_trajectory(processed, j)
+                    style_ids[j] = sid
+                    style_onehot[j] = one_hot_style(sid, num_styles=self.num_styles)
+                processed['style_id'] = style_ids
+                processed['style_onehot'] = style_onehot
+
             self.ram_cache.append(processed)
             total_trajs += N_i
 
         print(f"Loaded {len(self.ram_cache)} files ({total_trajs} total trajectories) into RAM cache.")
 
     # Keys that are non-temporal (no time dimension to pad)
-    _NON_TEMPORAL_KEYS = {'goal_obj_world', 'fps', 'source_file_path', 'source_folder_name'}
+    _NON_TEMPORAL_KEYS = {
+        'goal_obj_world',
+        'fps',
+        'source_file_path',
+        'source_folder_name',
+        'style_id',
+        'style_onehot',
+    }
+
+    def _infer_style_for_trajectory(self, processed: dict, traj_idx: int) -> int:
+        base = processed['base'][traj_idx]
+        joints = processed['joints'][traj_idx]
+        obj = processed['obj'][traj_idx]
+
+        motion_style_id, motion_info = classify_style_from_motion(base, joints, obj)
+
+        folder = processed.get('source_folder_name', None)
+        if isinstance(folder, np.ndarray):
+            folder = folder.item() if folder.ndim == 0 else folder[traj_idx]
+        folder = str(folder) if folder is not None else None
+
+        task_text = self._task_text_by_folder.get(folder, "") if folder else ""
+        text_style_id = classify_style_from_task_text(task_text, rng=self._style_rng)
+
+        # Keep explicit mixed kick+pick random rule from task text when available.
+        task_text_l = str(task_text).lower()
+        if ("kick" in task_text_l) and any(k in task_text_l for k in ["pick", "hold", "place", "carry"]) and (text_style_id is not None):
+            return int(text_style_id)
+
+        mode = self.style_detection_mode
+        if mode == "motion_only":
+            style_id = motion_style_id
+        elif mode in ("text_only", "text_then_motion"):
+            style_id = text_style_id if text_style_id is not None else motion_style_id
+        else:
+            # motion_then_text
+            confidence = float(motion_info.get("confidence", 0.0)) if isinstance(motion_info, dict) else 0.0
+            style_id = text_style_id if (confidence < 0.6 and text_style_id is not None) else motion_style_id
+        return int(style_id)
 
     def _get_single_traj(self, file_idx, batch_idx):
         """Get padded (T, D) dict for a specific trajectory.
@@ -959,7 +1025,12 @@ class FlexibleWindowDataset(Dataset):
         if self.add_goal_noise:
             task_params = self._add_obs_noise(task_params, "task_params")
 
+        style_cond = None
+        if self.style_condition and "style_onehot" in raw_traj:
+            style_cond = torch.from_numpy(np.asarray(raw_traj["style_onehot"]).astype(np.float32))
 
+        if style_cond is not None:
+            return future_states, current_state, task_params, style_cond, anchor
         return future_states, current_state, task_params, anchor
 
 

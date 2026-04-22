@@ -585,7 +585,9 @@ def main():
         stitch_steps_list = []
         
         for idx in tqdm(selected, desc="Prep Dataset Tasks"):
-            _, curr_state, _, anchor = dataset[idx]
+            sample = dataset[idx]
+            curr_state = sample[1]
+            anchor = sample[-1]
             
             # Find GT Final
             file_idx, batch_idx, _ = dataset.indices[idx]
@@ -695,7 +697,9 @@ def main():
         stitch_steps_list_ood = []
 
         for i, idx in enumerate(tqdm(selected, desc="Prep OOD Tasks")):
-            _, curr_state, _, anchor = dataset[idx]
+            sample = dataset[idx]
+            curr_state = sample[1]
+            anchor = sample[-1]
             
             # Construct Target
             start_pos = anchor['ref_obj_pos'][:data_cfg["num_task_params"]]
@@ -783,7 +787,9 @@ def main():
         base_stitch_list = []
 
         for idx in tqdm(selected, desc="Prep Multiplier Base"):
-            _, curr_state, _, anchor = dataset[idx]
+            sample = dataset[idx]
+            curr_state = sample[1]
+            anchor = sample[-1]
             file_idx, batch_idx, _ = dataset.indices[idx]
             traj_data = dataset._get_single_traj(file_idx, batch_idx)
             final_pos = traj_data['obj'][-1, :3] if 'obj' in traj_data else anchor['ref_obj_pos'][:3]

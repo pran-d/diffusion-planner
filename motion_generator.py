@@ -1,4 +1,5 @@
 import gc
+import copy
 import torch
 import numpy as np
 import yaml
@@ -19,9 +20,15 @@ from models.model import RobotDiffuser
 from datasets.flexible_dataset import FlexibleWindowDataset
 from utils.math.sbto_utils import reconstruct_sbto_trajectory, compute_task_params
 from utils.math.math_tools import yaw_from_quat, yaw_to_rot_matrix
+from utils.data.style_conditioning import one_hot_style, style_name_to_id
 from utils.physics_limits import apply_physics_clamp
 from utils.inference_utils import build_inference_waypoints
 from diffusers import EMAModel
+from utils.two_phase import (
+    resolve_two_phase_cfg,
+    apply_phase_to_configs,
+    build_feature_slices,
+)
 
 
 class TimingContext:
@@ -138,10 +145,20 @@ class MotionGenerator:
         # Load Config
         with open(config_path, 'r') as file:
             raw_config = yaml.safe_load(file)
+
+        self.two_phase_cfg = resolve_two_phase_cfg(raw_config.get("two_phase", {}))
+        self.two_phase_enabled = bool(self.two_phase_cfg.get("enabled", False))
+        self.phase1_diffuser = None
+        self.phase2_diffuser = None
+        self.phase1_data_cfg = None
+        self.phase2_data_cfg = None
+        self.phase1_slices = None
+        self.phase2_slices = None
         
         self.model_cfg, self.data_cfg, self.training_cfg, self.noise_cfg = load_config(
             config_path, raw_config.get("auto_conf", False)
         )
+        self.full_feature_slices = build_feature_slices(self.data_cfg.get("feature_order", []))
         
         self.device = torch.device(device if device else ("cuda" if torch.cuda.is_available() else "cpu"))
         
@@ -154,11 +171,118 @@ class MotionGenerator:
             mode='inference', # Default to inference, but 'train' or 'inference' just sets up scheduler mainly
             device=self.device
         )
+
+        if self.two_phase_enabled:
+            self._setup_two_phase_models()
         
         self.dataset = None # To be initialized in fit or loaded
 
         # Try to load existing stats if available to be ready for inference
         self._setup_dataset_structure(load_stats=True)
+
+    def _setup_two_phase_models(self):
+        p1_model, p1_data, p1_train, p1_noise = apply_phase_to_configs(
+            self.model_cfg, self.data_cfg, self.training_cfg, self.noise_cfg,
+            phase="phase1", two_phase_cfg=self.two_phase_cfg,
+        )
+        p2_model, p2_data, p2_train, p2_noise = apply_phase_to_configs(
+            self.model_cfg, self.data_cfg, self.training_cfg, self.noise_cfg,
+            phase="phase2", two_phase_cfg=self.two_phase_cfg,
+        )
+
+        self.phase1_data_cfg = p1_data
+        self.phase2_data_cfg = p2_data
+        # IMPORTANT: these slices must index into the *full* feature tensor.
+        # Using phase-local slices here would write phase outputs into wrong columns.
+        p1_order = p1_data.get("feature_order", [])
+        p2_order = p2_data.get("feature_order", [])
+        self.phase1_slices = {
+            k: self.full_feature_slices[k]
+            for k in p1_order
+            if k in self.full_feature_slices
+        }
+        self.phase2_slices = {
+            k: self.full_feature_slices[k]
+            for k in p2_order
+            if k in self.full_feature_slices
+        }
+
+        self.phase1_diffuser = RobotDiffuser(
+            model_config=p1_model,
+            data_config=p1_data,
+            training_config=p1_train,
+            noise_scheduler_config=p1_noise,
+            mode='inference',
+            device=self.device,
+        )
+        self.phase2_diffuser = RobotDiffuser(
+            model_config=p2_model,
+            data_config=p2_data,
+            training_config=p2_train,
+            noise_scheduler_config=p2_noise,
+            mode='inference',
+            device=self.device,
+        )
+
+    def load_two_phase_weights(self, phase1_checkpoint: str, phase2_checkpoint: str):
+        if not self.two_phase_enabled:
+            raise RuntimeError("Two-phase mode is not enabled in config.")
+        if phase1_checkpoint:
+            self.phase1_diffuser.load_weights_from_file(phase1_checkpoint)
+        if phase2_checkpoint:
+            self.phase2_diffuser.load_weights_from_file(phase2_checkpoint)
+
+    def _extract_phase_tensor(self, full_tensor: torch.Tensor, slices: Dict[str, slice], feature_order: List[str]) -> torch.Tensor:
+        parts = [full_tensor[..., slices[k]] for k in feature_order if k in slices]
+        return torch.cat(parts, dim=-1)
+
+    def _scatter_phase_into_full(self, target_full: torch.Tensor, phase_tensor: torch.Tensor, slices: Dict[str, slice], feature_order: List[str]):
+        cursor = 0
+        for key in feature_order:
+            sl = slices.get(key)
+            if sl is None:
+                continue
+            width = sl.stop - sl.start
+            if cursor + width > phase_tensor.shape[-1]:
+                raise ValueError(
+                    f"Phase tensor too small while scattering '{key}': "
+                    f"need {cursor + width}, got {phase_tensor.shape[-1]}"
+                )
+            target_full[..., sl] = phase_tensor[..., cursor:cursor + width]
+            cursor += width
+        if cursor != phase_tensor.shape[-1]:
+            raise ValueError(
+                f"Phase tensor has trailing dims not consumed during scatter: "
+                f"consumed={cursor}, tensor_dim={phase_tensor.shape[-1]}"
+            )
+
+    def _extract_phase_state_cond(self, full_state_cond: torch.Tensor, phase_feature_order: List[str]) -> torch.Tensor:
+        """Map full observation state (trailing full features) to phase-specific observation state."""
+        full_num_features = int(self.data_cfg.get("num_features", full_state_cond.shape[-1]))
+        full_num_obs = int(self.data_cfg.get("num_observations", full_state_cond.shape[-1]))
+        obs_start = max(0, full_num_features - full_num_obs)
+
+        local_parts = []
+        for key in phase_feature_order:
+            sl = self.full_feature_slices.get(key)
+            if sl is None:
+                continue
+            inter_start = max(sl.start, obs_start)
+            inter_stop = min(sl.stop, full_num_features)
+            if inter_stop <= inter_start:
+                continue
+            local_start = inter_start - obs_start
+            local_stop = inter_stop - obs_start
+            local_parts.append(full_state_cond[..., local_start:local_stop])
+
+        if not local_parts:
+            return full_state_cond[..., :0]
+        return torch.cat(local_parts, dim=-1)
+
+    def _build_phase1_context(self, phase1_sample: torch.Tensor) -> torch.Tensor:
+        """Build a compact phase1 context vector for phase2 conditioning."""
+        # phase1_sample: (B, T, D_phase1) in normalized space
+        return phase1_sample[:, -1, :]
 
 
     def _setup_dataset_structure(self, load_stats=True):
@@ -294,6 +418,8 @@ class MotionGenerator:
         
         state_condition = self.model_cfg.get("state_condition", False)
         task_condition = self.model_cfg.get("task_condition", False)
+        style_condition = self.model_cfg.get("style_condition", False)
+        phase1_condition = self.model_cfg.get("phase1_condition", False)
         dropout_probs = self.training_cfg.get("condition_dropout_prob", {})
         
         print(f"Starting training for {epochs} epochs...")
@@ -325,6 +451,8 @@ class MotionGenerator:
 
                 state_cond = None
                 task_cond = None
+                style_cond = None
+                phase1_cond = None
             
                 batch_data = list(batch)
                 prediction_target = batch_data[0].to(self.device)
@@ -337,11 +465,23 @@ class MotionGenerator:
                 if task_condition:
                     task_cond = batch_data[idx].to(self.device)
                     idx += 1
+
+                if style_condition:
+                    if idx < len(batch_data) and isinstance(batch_data[idx], torch.Tensor):
+                        style_cond = batch_data[idx].to(self.device)
+                        idx += 1
+
+                if phase1_condition:
+                    if idx < len(batch_data) and isinstance(batch_data[idx], torch.Tensor):
+                        phase1_cond = batch_data[idx].to(self.device)
+                        idx += 1
                 
                 # Construct cond (matches train.py)
                 cond = []
                 if state_cond is not None: cond.append(state_cond)
                 if task_cond is not None: cond.append(task_cond)
+                if style_cond is not None: cond.append(style_cond)
+                if phase1_cond is not None: cond.append(phase1_cond)
                 
                 model_cond = tuple(cond) if len(cond) > 0 else None
                 if len(cond) == 1: model_cond = cond[0]
@@ -577,6 +717,7 @@ class MotionGenerator:
     def generate_trajectory(self, 
                             initial_condition: Dict, 
                             goal_condition: Union[Dict, np.ndarray],
+                            style_condition: Optional[Union[str, np.ndarray, list]] = None,
                             target_traj_length: int = None,
                             stitch_steps: int = None, 
                             num_samples: int = 1,
@@ -654,10 +795,15 @@ class MotionGenerator:
         if self.dataset is None:
              raise RuntimeError("Dataset not initialized. Call fit() or setup.")
 
-        self.diffuser.model.eval()
-
-        # Runtime speedup toggles used by ablation runner
-        self.diffuser.set_inference_speedups(use_fp16=use_fp16, compile_model=compile_model)
+        if self.two_phase_enabled:
+            self.phase1_diffuser.model.eval()
+            self.phase2_diffuser.model.eval()
+            self.phase1_diffuser.set_inference_speedups(use_fp16=use_fp16, compile_model=compile_model)
+            self.phase2_diffuser.set_inference_speedups(use_fp16=use_fp16, compile_model=compile_model)
+        else:
+            self.diffuser.model.eval()
+            # Runtime speedup toggles used by ablation runner
+            self.diffuser.set_inference_speedups(use_fp16=use_fp16, compile_model=compile_model)
         
         window_size = self.dataset.window_size  # model output length per segment
         history_size = self.dataset.history_size
@@ -724,6 +870,26 @@ class MotionGenerator:
         curr_state_tens = curr_state_tens.to(self.device)
         effective_batch = curr_state_tens.shape[0]
 
+        style_cond_tens = None
+        if self.model_cfg.get("style_condition", False):
+            num_styles = int(self.data_cfg.get("num_styles", 3))
+            if style_condition is None:
+                style_cond_np = np.tile(one_hot_style(style_name_to_id("push"), num_styles=num_styles), (effective_batch, 1))
+            elif isinstance(style_condition, str):
+                sid = style_name_to_id(style_condition)
+                style_cond_np = np.tile(one_hot_style(sid, num_styles=num_styles), (effective_batch, 1))
+            else:
+                sc = np.asarray(style_condition)
+                if sc.ndim == 1 and sc.shape[0] == effective_batch:
+                    style_cond_np = np.stack([one_hot_style(int(v), num_styles=num_styles) for v in sc], axis=0)
+                elif sc.ndim == 2 and sc.shape[1] == num_styles:
+                    style_cond_np = sc.astype(np.float32)
+                    if style_cond_np.shape[0] == 1 and effective_batch > 1:
+                        style_cond_np = np.repeat(style_cond_np, effective_batch, axis=0)
+                else:
+                    raise ValueError(f"Unsupported style_condition shape={sc.shape}")
+            style_cond_tens = torch.from_numpy(style_cond_np.astype(np.float32)).to(self.device)
+
         # Physics-check thresholds
         _FLOOR_Z        = -0.1   # m — pelvis/object z below this → ground penetration
         _MAX_ROBOT_STEP =  0.1   # m/frame — robot pelvis XY spike threshold
@@ -788,7 +954,7 @@ class MotionGenerator:
 
                 # B. Build waypoints (full keyframe at t=0 + optional last-frame partial wp)
                 wv, wm = None, None
-                if getattr(self.diffuser.model, 'inbetweening_enabled', False):
+                if (not self.two_phase_enabled) and getattr(self.diffuser.model, 'inbetweening_enabled', False):
                     model_feature_dim = int(getattr(self.diffuser.model, 'x_shape', torch.Size([self.data_cfg['num_features']]))[0])
                     remaining = max(stitch_steps - step, 1)
                     _current_obj_z = torch.from_numpy(
@@ -814,15 +980,53 @@ class MotionGenerator:
 
                 # C. Generate normalized sample
                 _t_forward_start = time.perf_counter()
-                normalized_sample = self.diffuser.getSample(
-                    num_trajectories=effective_batch,
-                    state_cond=curr_state_tens,
-                    goal_cond=task_cond,
-                    deterministic=self.noise_cfg.get("deterministic_inference", False),
-                    cfg_w=cfg_w,
-                    waypoint_values=wv,
-                    waypoint_mask=wm,
-                )  # (B, T, D_out)
+                if self.two_phase_enabled:
+                    p1_order = self.phase1_data_cfg.get("feature_order", [])
+                    p2_order = self.phase2_data_cfg.get("feature_order", [])
+
+                    state_cond_p1 = self._extract_phase_state_cond(curr_state_tens, p1_order)
+                    state_cond_p2 = self._extract_phase_state_cond(curr_state_tens, p2_order)
+
+                    sample_p1 = self.phase1_diffuser.getSample(
+                        num_trajectories=effective_batch,
+                        state_cond=state_cond_p1,
+                        goal_cond=task_cond,
+                        style_cond=style_cond_tens,
+                        deterministic=self.noise_cfg.get("deterministic_inference", False),
+                        cfg_w=cfg_w,
+                        waypoint_values=None,
+                        waypoint_mask=None,
+                    )
+                    sample_p2 = self.phase2_diffuser.getSample(
+                        num_trajectories=effective_batch,
+                        state_cond=state_cond_p2,
+                        goal_cond=task_cond,
+                        style_cond=style_cond_tens,
+                        phase1_cond=self._build_phase1_context(sample_p1),
+                        deterministic=self.noise_cfg.get("deterministic_inference", False),
+                        cfg_w=cfg_w,
+                        waypoint_values=None,
+                        waypoint_mask=None,
+                    )
+
+                    full_dim = int(self.data_cfg["num_features"])
+                    normalized_sample = torch.zeros(
+                        sample_p1.shape[0], sample_p1.shape[1], full_dim,
+                        device=sample_p1.device, dtype=sample_p1.dtype,
+                    )
+                    self._scatter_phase_into_full(normalized_sample, sample_p1, self.phase1_slices, p1_order)
+                    self._scatter_phase_into_full(normalized_sample, sample_p2, self.phase2_slices, p2_order)
+                else:
+                    normalized_sample = self.diffuser.getSample(
+                        num_trajectories=effective_batch,
+                        state_cond=curr_state_tens,
+                        goal_cond=task_cond,
+                        style_cond=style_cond_tens,
+                        deterministic=self.noise_cfg.get("deterministic_inference", False),
+                        cfg_w=cfg_w,
+                        waypoint_values=wv,
+                        waypoint_mask=wm,
+                    )  # (B, T, D_out)
                 timing_stats["forward_time_s"] += (time.perf_counter() - _t_forward_start)
                 
                 # D. Denormalize

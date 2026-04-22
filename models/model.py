@@ -97,7 +97,7 @@ class RobotDiffuser():
         if unexpected:
             print(f"  [Warning] Unexpected keys (ignored): {unexpected}")
 
-    def getSample(self, num_trajectories=1, state_cond=None, goal_cond=None, deterministic=False, cfg_w=1.0, guidance_wt=0.0, guidance_goal=None, no_state_cond=False, waypoint_values=None, waypoint_mask=None):
+    def getSample(self, num_trajectories=1, state_cond=None, goal_cond=None, style_cond=None, phase1_cond=None, deterministic=False, cfg_w=1.0, guidance_wt=0.0, guidance_goal=None, no_state_cond=False, waypoint_values=None, waypoint_mask=None):
         """
         Run reverse diffusion to generate trajectories.
         """
@@ -113,6 +113,16 @@ class RobotDiffuser():
             if isinstance(goal_cond, np.ndarray):
                 goal_cond = torch.from_numpy(goal_cond).to(self.device).to(sample.dtype)
             cond_list.append(goal_cond)
+
+        if style_cond is not None:
+            if isinstance(style_cond, np.ndarray):
+                style_cond = torch.from_numpy(style_cond).to(self.device).to(sample.dtype)
+            cond_list.append(style_cond)
+
+        if phase1_cond is not None:
+            if isinstance(phase1_cond, np.ndarray):
+                phase1_cond = torch.from_numpy(phase1_cond).to(self.device).to(sample.dtype)
+            cond_list.append(phase1_cond)
 
         # tuple containing state cond, goal cond    
         model_cond = tuple(cond_list) if len(cond_list) > 0 else None

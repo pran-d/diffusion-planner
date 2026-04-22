@@ -262,7 +262,11 @@ def main():
                 break
 
             try:
-                future, clean_state, task, anchor = dataset[current_idx] 
+                sample = dataset[current_idx]
+                future = sample[0]
+                clean_state = sample[1]
+                task = sample[2]
+                anchor = sample[-1]
                 
                 # We only visualize the 'history' part which is usually the last observed state
                 # If history=1, clean_state is (1, D). If history>1, (H, D).

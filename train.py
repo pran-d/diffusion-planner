@@ -19,6 +19,7 @@ from datasets import BufferDataset, ConditionalStateDataset
 from models.model import RobotDiffuser
 from config.configure import load_config, get_data_path, get_save_path, get_log_path, get_norm_path, get_mj_xml_paths
 from utils.data.load_dataset import preload_dataset
+from utils.two_phase import resolve_two_phase_cfg, apply_phase_to_configs
 
 
 # ===============================
@@ -207,16 +208,30 @@ parser.add_argument("--resume", type=int, default=None, help="Resume from checkp
 parser.add_argument("--save_every", type=int, default=None, help="Save checkpoint every N epochs")
 parser.add_argument("--seed", type=int, default=42, help="Random seed for reproducibility")
 parser.add_argument("--no_tensorboard", action="store_true", help="Disable TensorBoard logging")
+parser.add_argument("--config", type=str, default="config/config.yaml", help="Path to training config YAML")
+parser.add_argument("--phase", type=str, default="all", choices=["all", "phase1", "phase2"], help="Train full model (all) or a specific two-phase model")
 
 args = parser.parse_args()
 
 # Seed everything for reproducibility
 seed_everything(args.seed)
 
-with open("config/config.yaml", 'r') as file:
+with open(args.config, 'r') as file:
     config = yaml.safe_load(file)
 
-model_cfg, data_cfg, training_cfg, noise_schedule_cfg = load_config("config/config.yaml", config.get("auto_conf", False))
+model_cfg, data_cfg, training_cfg, noise_schedule_cfg = load_config(args.config, config.get("auto_conf", False))
+
+two_phase_cfg = resolve_two_phase_cfg(config.get("two_phase", {}))
+if args.phase in ("phase1", "phase2"):
+    model_cfg, data_cfg, training_cfg, noise_schedule_cfg = apply_phase_to_configs(
+        model_cfg=model_cfg,
+        data_cfg=data_cfg,
+        training_cfg=training_cfg,
+        noise_cfg=noise_schedule_cfg,
+        phase=args.phase,
+        two_phase_cfg=two_phase_cfg,
+    )
+    print(f"Two-phase training override: phase={args.phase}, features={data_cfg.get('feature_order', [])}")
 
 save_dir = get_save_path(model_cfg, data_cfg, training_cfg)
 os.makedirs(save_dir, exist_ok=True)
@@ -245,6 +260,8 @@ else:
 
 state_condition = model_cfg.get("state_condition", False)
 task_condition = model_cfg.get("task_condition", False)
+style_condition = model_cfg.get("style_condition", False)
+phase1_condition = model_cfg.get("phase1_condition", False)
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
@@ -403,7 +420,9 @@ for epoch in range(starting_epoch, num_epochs):
             batch = new_batch
 
         state_cond = None
-        task_cond = None    
+        task_cond = None
+        style_cond = None
+        phase1_cond = None
 
         # Unpack batch
         batch_data = list(batch)
@@ -418,11 +437,23 @@ for epoch in range(starting_epoch, num_epochs):
         if task_condition:
             task_cond = batch_data[idx].to(device)
             idx += 1
+
+        if style_condition:
+            if idx < len(batch_data) and isinstance(batch_data[idx], torch.Tensor):
+                style_cond = batch_data[idx].to(device)
+                idx += 1
+
+        if phase1_condition:
+            if idx < len(batch_data) and isinstance(batch_data[idx], torch.Tensor):
+                phase1_cond = batch_data[idx].to(device)
+                idx += 1
             
         # Construct cond for model
         cond = []
         if state_cond is not None: cond.append(state_cond)
         if task_cond is not None: cond.append(task_cond)
+        if style_cond is not None: cond.append(style_cond)
+        if phase1_cond is not None: cond.append(phase1_cond)
     
         model_cond = tuple(cond) if len(cond) > 0 else None
         if len(cond) == 1: model_cond = cond[0]

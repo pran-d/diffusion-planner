@@ -13,6 +13,8 @@ common:
 
 inference_mg:
   epoch: null
+  phase1_checkpoint: null
+  phase2_checkpoint: null
   ema: true
   num_samples: 1
   stitch_steps: null
@@ -20,6 +22,7 @@ inference_mg:
   save_path: results/inference_mg.npz
   metrics_log_path: results/inference_metrics.jsonl
   task_params: null
+  style: null
   end_error_threshold: 0.1
   end_ground_num_frames: 5
   end_ground_z_tol: 0.05
@@ -42,6 +45,8 @@ inference_mg:
 batch_goal_sweep:
   epoch: null
   ema: true
+  style: null
+  random_styles: false
   num_goals: 12
   goal_spread: 5
   goal_z_offset: 0.0

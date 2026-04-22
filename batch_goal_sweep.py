@@ -35,6 +35,7 @@ from utils.visualize.visualize import MjVisualizer, DiffusionOverlayVisualizer
 from motion_generator import MotionGenerator
 from utils.inference_config import load_inference_defaults
 from utils.inference_utils import DEFAULT_LIFT_HEIGHT
+from utils.data.style_conditioning import style_name_to_id
 from inference_mg import extract_initial_condition
 
 
@@ -89,6 +90,10 @@ def parse_args(argv=None):
     parser.add_argument("--goal_stop_threshold", type=float, default=0.1)
     parser.add_argument("--enable_physics_stop", action="store_true")
     parser.add_argument("--enable_phys_clamp",   action="store_true")
+    parser.add_argument("--style", type=str, default=None, choices=["pick", "push", "kick"],
+                        help="Use one fixed style for all goals")
+    parser.add_argument("--random_styles", action="store_true",
+                        help="Randomly allocate style per goal (pick/push/kick)")
 
     # Waypoint / z-profile
     parser.add_argument("--last_frame_waypoint", action="store_true")
@@ -122,6 +127,8 @@ def parse_args(argv=None):
     args = parser.parse_args(argv)
     if args.epoch is None:
         parser.error("Missing `--epoch`. Set it via CLI or config/inference.yaml::batch_goal_sweep.epoch")
+    if args.style is not None and args.random_styles:
+        parser.error("Use either --style or --random_styles, not both")
     return args
 
 
@@ -562,6 +569,19 @@ def run_goal_sweep(mg, dataset, args):
 
     N = len(goals_world)
 
+    # -- Optional style allocation ----------------------------------------
+    style_id_to_name = {0: "pick", 1: "push", 2: "kick"}
+    goal_style_ids = None
+    goal_style_names = None
+    if getattr(args, 'random_styles', False):
+        rng = np.random.default_rng(getattr(args, 'seed', 42))
+        goal_style_ids = rng.integers(0, 3, size=N, dtype=np.int64)
+        goal_style_names = np.array([style_id_to_name[int(s)] for s in goal_style_ids], dtype=object)
+    elif getattr(args, 'style', None) is not None:
+        sid = int(style_name_to_id(args.style))
+        goal_style_ids = np.full((N,), sid, dtype=np.int64)
+        goal_style_names = np.array([style_id_to_name[sid]] * N, dtype=object)
+
     # Convert to local displacements
     goals_local = np.zeros((N, local_goal_dim), dtype=np.float64)
     for i in range(N):
@@ -611,6 +631,7 @@ def run_goal_sweep(mg, dataset, args):
         traj, rl = mg.generate_trajectory(
             initial_condition=ic_batch,
             goal_condition=goals_local[b_start:b_end],  # (bs, D)
+            style_condition=(goal_style_ids[b_start:b_end] if goal_style_ids is not None else None),
             stitch_steps=stitch_steps,
             num_samples=1,
             cfg_w=getattr(args, 'cfg_w', 1.0),
@@ -663,6 +684,8 @@ def run_goal_sweep(mg, dataset, args):
         "ref_obj_pos": ref_obj_pos,
         "desired_displacements": np.array(desired_displacements),
         "achieved_displacements": np.array(achieved_displacements),
+        "goal_style_ids": goal_style_ids,
+        "goal_style_names": goal_style_names,
         "stitch_steps": stitch_steps,
         "planning_horizon_s": planning_horizon_s,
     }
@@ -707,6 +730,8 @@ def main():
     ref_obj_pos = result["ref_obj_pos"]
     N = len(goals_world)
     per_goal_time_s = np.asarray(result.get("per_goal_time_s", np.zeros(N, dtype=np.float64)), dtype=np.float64)
+    goal_style_ids = result.get("goal_style_ids", None)
+    goal_style_names = result.get("goal_style_names", None)
     stitch_steps = int(max(1, result.get("stitch_steps", 1)))
     planning_horizon_s = float(result.get("planning_horizon_s", 0.0))
     avg_window_generation_time_s = float(np.mean(per_goal_time_s) / stitch_steps) if len(per_goal_time_s) else 0.0
@@ -718,10 +743,13 @@ def main():
     for i in range(N):
         dd = result["desired_displacements"][i]
         ad = result["achieved_displacements"][i]
+        style_suffix = ""
+        if goal_style_names is not None:
+            style_suffix = f"  style={goal_style_names[i]}"
         print(f"  [{i:2d}]  err={errors[i]:.4f}m  "
               f"desired=({dd[0]:+.3f},{dd[1]:+.3f},{dd[2]:+.3f})  "
               f"achieved=({ad[0]:+.3f},{ad[1]:+.3f},{ad[2]:+.3f})  "
-              f"T_real={real_lengths[i]}")
+              f"T_real={real_lengths[i]}{style_suffix}")
     print(f"\n  Mean error: {np.mean(errors):.4f}m  "
           f"Median: {np.median(errors):.4f}m  Max: {np.max(errors):.4f}m")
     print(f"  Avg window generation time: {avg_window_generation_time_s:.4f}s/window")
@@ -750,6 +778,8 @@ def main():
         avg_window_generation_time_s=np.array([avg_window_generation_time_s], dtype=np.float64),
         planning_horizon_s=np.array([planning_horizon_s], dtype=np.float64),
         ref_obj_pos=ref_obj_pos,
+        goal_style_ids=goal_style_ids if goal_style_ids is not None else np.array([], dtype=np.int64),
+        goal_style_names=(goal_style_names.astype(str) if goal_style_names is not None else np.array([], dtype=str)),
     )
 
     summary_json = os.path.join(args.save_dir, "summary_metrics.json")
@@ -761,6 +791,8 @@ def main():
                 "avg_trajectory_generation_time_s": float(np.mean(per_goal_time_s)) if len(per_goal_time_s) else 0.0,
                 "stitch_steps": stitch_steps,
                 "num_goals": int(N),
+                "random_styles": bool(getattr(args, 'random_styles', False)),
+                "fixed_style": getattr(args, 'style', None),
                 "mean_error_m": float(np.mean(errors)),
                 "median_error_m": float(np.median(errors)),
                 "max_error_m": float(np.max(errors)),
@@ -782,6 +814,8 @@ def main():
             achieved_displacement=result["achieved_displacements"][i],
             error=np.array([result["errors"][i]], dtype=np.float64),
             generation_time_s=np.array([result.get("per_goal_time_s", np.zeros(N))[i]], dtype=np.float64),
+            style_id=np.array([int(goal_style_ids[i])], dtype=np.int64) if goal_style_ids is not None else np.array([], dtype=np.int64),
+            style_name=np.array([str(goal_style_names[i])], dtype=str) if goal_style_names is not None else np.array([], dtype=str),
         )
 
     # Per-goal metrics log (JSONL append).
@@ -804,6 +838,8 @@ def main():
             "goal_local": result["goals_local"][i].tolist(),
             "goal_direction_xyz": direction,
             "goal_magnitude_xyz": mag,
+            "style_id": int(goal_style_ids[i]) if goal_style_ids is not None else None,
+            "style_name": str(goal_style_names[i]) if goal_style_names is not None else None,
             "error": float(result["errors"][i]),
             "generation_time_s": float(per_goal_time_s[i]),
             "time_per_inference_step_s": float(per_goal_time_s[i]) / stitch_steps,

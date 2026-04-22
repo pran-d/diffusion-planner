@@ -14,7 +14,10 @@ import argparse
 import os
 import math
 import json
+import sys
 import time
+import subprocess
+import tempfile
 from datetime import datetime, timezone
 
 import numpy as np
@@ -33,6 +36,197 @@ def _append_jsonl(path, record):
     os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
     with open(path, "a", encoding="utf-8") as f:
         f.write(json.dumps(record) + "\n")
+
+
+def _save_single_video_headless(
+    trajectory,
+    real_length,
+    goal_world,
+    out_path,
+    xml_path,
+    fps=100,
+    width=1280,
+    height=720,
+):
+    """Save one trajectory video in a subprocess using offscreen MuJoCo rendering.
+
+    This avoids GLFW initialization in headless environments.
+    """
+    x = np.asarray(trajectory)
+    rl = int(real_length)
+    gw = np.asarray(goal_world, dtype=np.float64)
+    if x.ndim != 2:
+        raise ValueError(f"Expected trajectory shape (T, D), got {x.shape}")
+    if gw.shape[0] < 3:
+        raise ValueError(f"Expected goal_world with at least 3 dims, got {gw.shape}")
+
+    with tempfile.TemporaryDirectory(prefix="infer_mg_render_") as td:
+        payload = os.path.join(td, "payload.npz")
+        np.savez_compressed(
+            payload,
+            trajectory=x,
+            real_length=np.array([rl], dtype=np.int64),
+            goal_world=gw[:3],
+        )
+
+        render_code = r'''
+import os, sys
+import numpy as np
+import imageio
+import mujoco
+
+payload, out_path, xml_path, fps, width, height = sys.argv[1:]
+fps = int(fps); width = int(width); height = int(height)
+arr = np.load(payload)
+x = arr["trajectory"]
+real_length = int(arr["real_length"][0])
+goal_world = arr["goal_world"]
+
+if x.ndim != 2:
+    raise ValueError(f"Expected trajectory shape (T, D), got {x.shape}")
+if real_length <= 0:
+    raise ValueError(f"real_length must be > 0, got {real_length}")
+
+model = mujoco.MjModel.from_xml_path(xml_path)
+data = mujoco.MjData(model)
+model.vis.global_.offwidth = max(model.vis.global_.offwidth, width)
+model.vis.global_.offheight = max(model.vis.global_.offheight, height)
+
+def quat_from_z_to_vec(v):
+    # Return wxyz quaternion rotating +Z axis to vector v.
+    z = np.array([0.0, 0.0, 1.0], dtype=np.float64)
+    n = float(np.linalg.norm(v))
+    if n < 1e-9:
+        return np.array([1.0, 0.0, 0.0, 0.0], dtype=np.float64)
+    t = v / n
+    cross = np.cross(z, t)
+    dot = float(np.dot(z, t))
+    cn = float(np.linalg.norm(cross))
+    if cn < 1e-9:
+        if dot > 0.0:
+            return np.array([1.0, 0.0, 0.0, 0.0], dtype=np.float64)
+        return np.array([0.0, 1.0, 0.0, 0.0], dtype=np.float64)
+    axis = cross / cn
+    angle = float(np.arccos(np.clip(dot, -1.0, 1.0)))
+    half = 0.5 * angle
+    s = float(np.sin(half))
+    return np.array([np.cos(half), axis[0] * s, axis[1] * s, axis[2] * s], dtype=np.float64)
+
+renderer = None
+try:
+    renderer = mujoco.Renderer(model, height=height, width=width)
+    try:
+        renderer.scene.flags[mujoco.mjtRndFlag.mjRND_SHADOW] = 0
+    except Exception:
+        pass
+    try:
+        renderer.scene.flags[mujoco.mjtRndFlag.mjRND_REFLECTION] = 0
+    except Exception:
+        pass
+    try:
+        renderer.scene.flags[mujoco.mjtRndFlag.mjRND_FOG] = 0
+    except Exception:
+        pass
+
+    cam = mujoco.MjvCamera()
+    mujoco.mjv_defaultFreeCamera(model, cam)
+    # Zoomed out camera framing around goal/final object area.
+    obj0 = x[0, 36:39]
+    objf = x[min(max(0, real_length - 1), x.shape[0] - 1), 36:39]
+    center = (goal_world[:3] + obj0 + objf) / 3.0
+    r_xy = max(
+        float(np.linalg.norm(goal_world[:2] - center[:2])),
+        float(np.linalg.norm(obj0[:2] - center[:2])),
+        float(np.linalg.norm(objf[:2] - center[:2])),
+    )
+    cam.lookat[:] = [float(center[0]), float(center[1]), float(center[2] + 0.8)]
+    cam.distance = max(2.2, 1.4 + 2.2 * r_xy)
+    cam.azimuth = 135.0
+    cam.elevation = -16.0
+
+    # Optional mocap markers/arrows if present in XML.
+    goal_mocap_id = -1
+    for name in ("goal_marker", "goal_marker_0"):
+        bid_g = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_BODY, name)
+        if bid_g >= 0:
+            goal_mocap_id = model.body_mocapid[bid_g]
+            break
+
+    arrow_mocap_id = -1
+    for name in ("guidance_arrow", "guidance_arrow_0"):
+        bid_a = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_BODY, name)
+        if bid_a >= 0:
+            arrow_mocap_id = model.body_mocapid[bid_a]
+            break
+
+    T_total = x.shape[0]
+    T_render = min(T_total, max(1, real_length))
+
+    os.makedirs(os.path.dirname(out_path) or ".", exist_ok=True)
+    with imageio.get_writer(out_path, fps=fps) as writer:
+        for t in range(T_render):
+            data.qpos[:] = x[t, :model.nq]
+
+            # Goal marker (fixed world position)
+            if goal_mocap_id >= 0:
+                data.mocap_pos[goal_mocap_id] = goal_world[:3]
+                data.mocap_quat[goal_mocap_id] = np.array([1.0, 0.0, 0.0, 0.0], dtype=np.float64)
+
+            # Guidance arrow from current object toward goal
+            if arrow_mocap_id >= 0:
+                obj = x[t, 36:39]
+                d = goal_world[:3] - obj
+                q = quat_from_z_to_vec(d)
+                data.mocap_pos[arrow_mocap_id] = obj
+                data.mocap_quat[arrow_mocap_id] = q
+
+            mujoco.mj_kinematics(model, data)
+            mujoco.mj_comPos(model, data)
+            renderer.update_scene(data, camera=cam)
+            frame = renderer.render()
+            if frame.dtype != np.uint8:
+                frame = (np.clip(frame, 0.0, 1.0) * 255.0).astype(np.uint8)
+            writer.append_data(frame)
+finally:
+    try:
+        if renderer is not None:
+            renderer.close()
+    except Exception:
+        pass
+'''
+
+        errors = []
+        for backend, pyopengl in (("egl", "egl"), ("osmesa", "osmesa")):
+            env = os.environ.copy()
+            env["MUJOCO_GL"] = backend
+            env["PYOPENGL_PLATFORM"] = pyopengl
+            env["OMP_NUM_THREADS"] = env.get("OMP_NUM_THREADS", "1")
+            env["MKL_NUM_THREADS"] = env.get("MKL_NUM_THREADS", "1")
+            env.pop("DISPLAY", None)
+
+            proc = subprocess.run(
+                [
+                    sys.executable,
+                    "-c",
+                    render_code,
+                    payload,
+                    out_path,
+                    xml_path,
+                    str(int(fps)),
+                    str(int(width)),
+                    str(int(height)),
+                ],
+                env=env,
+                capture_output=True,
+                text=True,
+            )
+            if proc.returncode == 0:
+                return
+            errors.append(
+                f"backend={backend}\nstdout:\n{proc.stdout}\nstderr:\n{proc.stderr}"
+            )
+
+        raise RuntimeError("Headless video render failed for EGL and OSMesa backends.\n" + "\n---\n".join(errors))
 
 
 def extract_initial_condition(dataset, sample_idx, local_goal_dim=3):
@@ -69,7 +263,9 @@ def extract_initial_condition(dataset, sample_idx, local_goal_dim=3):
     }
 
     # Task params: dataset already computes the anchor with final_obj_pos
-    _, _, task_params_norm, anchor = dataset[sample_idx]
+    sample = dataset[sample_idx]
+    task_params_norm = sample[2]
+    anchor = sample[-1]
 
     # Recover the object displacement in the yaw-rotated initial robot frame.
     # We rotate (final_obj_pos - init_obj_pos) from world frame into the frame
@@ -96,6 +292,10 @@ def parse_args(argv=None):
                         help="Path to inference defaults YAML")
     parser.add_argument("--epoch", type=str, default=None,
                         help="Checkpoint epoch number or path to .pth file")
+    parser.add_argument("--phase1_checkpoint", type=str, default=None,
+                        help="Two-phase mode: path to phase1 checkpoint")
+    parser.add_argument("--phase2_checkpoint", type=str, default=None,
+                        help="Two-phase mode: path to phase2 checkpoint")
     parser.add_argument("--ema", action="store_true",
                         help="Use EMA weights (only for numeric epoch)")
     parser.add_argument("--num_samples", type=int, default=1)
@@ -117,6 +317,8 @@ def parse_args(argv=None):
                         help="Classifier-free guidance weight")
     parser.add_argument("--task_params", nargs="+", type=float, default=None,
                         help="Override goal as local-frame displacement (e.g. --task_params 0.5 -0.2)")
+    parser.add_argument("--style", type=str, default=None, choices=["pick", "push", "kick"],
+                        help="Optional style command for style-conditioned model")
     parser.add_argument("--end_error_threshold", type=float, default=0.1,
                         help="XY-plane radius (m) for goal-reached check")
     parser.add_argument("--end_ground_num_frames", type=int, default=5,
@@ -161,8 +363,6 @@ def parse_args(argv=None):
         parser.set_defaults(**cfg_defaults)
 
     args = parser.parse_args(argv)
-    if args.epoch is None:
-        parser.error("Missing `--epoch`. Set it via CLI or config/inference.yaml::inference_mg.epoch")
     return args
 
 
@@ -179,7 +379,18 @@ def main():
     data_cfg = mg.data_cfg
 
     # ─── 2. Load weights ──────────────────────────────────────────────────────
-    if os.path.exists(args.epoch):
+    if mg.two_phase_enabled:
+        p1 = args.phase1_checkpoint or mg.two_phase_cfg.get("phase1_checkpoint")
+        p2 = args.phase2_checkpoint or mg.two_phase_cfg.get("phase2_checkpoint")
+        if not p1 or not p2:
+            raise ValueError(
+                "Two-phase mode is enabled but phase checkpoints are missing. "
+                "Provide --phase1_checkpoint and --phase2_checkpoint, or set two_phase.phase1_checkpoint/phase2_checkpoint in config/config.yaml"
+            )
+        mg.load_two_phase_weights(p1, p2)
+    elif args.epoch is None:
+        raise ValueError("Missing checkpoint: provide --epoch for single-model inference.")
+    elif os.path.exists(args.epoch):
         mg.diffuser.load_weights_from_file(args.epoch)
     else:
         mg.diffuser.loadWeights(int(args.epoch), ema=args.ema)
@@ -278,6 +489,7 @@ def main():
     result, real_lengths = mg.generate_trajectory(
         initial_condition=initial_condition,
         goal_condition=goal_local,
+        style_condition=args.style,
         target_traj_length=args.target_traj_length,
         stitch_steps=args.stitch_steps,
         num_samples=args.num_samples,
@@ -388,22 +600,32 @@ def main():
     # ─── 10. Visualize ────────────────────────────────────────────────────────
     if not args.no_visualize:
         try:
-            from utils.visualize.visualize import MjVisualizer
             xml_path, _ = get_mj_xml_paths()
             if os.path.exists(xml_path):
-                vis = MjVisualizer(xml_path, close_on_enter=False)
                 t = np.arange(T_total) * 0.01
                 if args.video:
                     video_path = args.video_path or "results/inference_mg_video.mp4"
                     os.makedirs(os.path.dirname(video_path) or ".", exist_ok=True)
-                    vis.render_trajectory_to_video(t=t, x_traj=traj_0, save_path=video_path)
+                    _save_single_video_headless(
+                        trajectory=traj_0,
+                        real_length=int(real_lengths[0]) if len(real_lengths) > 0 else int(T_total),
+                        goal_world=goal_world,
+                        out_path=video_path,
+                        xml_path=xml_path,
+                        fps=100,
+                        width=1280,
+                        height=720,
+                    )
+                    print(f"Saved video to {video_path}")
                 else:
+                    from utils.visualize.visualize import MjVisualizer
+                    vis = MjVisualizer(xml_path, close_on_enter=False)
                     vis.visualize_trajectory(
                         t=t, x_traj=traj_0, repeat=True,
                         guidance_vec=guidance_vec,
                         goal_pos=goal_world,
                     )
-                vis.close()
+                    vis.close()
             else:
                 print(f"MuJoCo model not found at {xml_path}; skipping visualisation.")
         except Exception as e:

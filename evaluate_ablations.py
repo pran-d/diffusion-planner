@@ -26,8 +26,8 @@ import glob
 import math
 import os
 import re
-import shutil
 import sys
+import tempfile
 import time
 from types import SimpleNamespace
 
@@ -64,7 +64,11 @@ from batch_goal_sweep import run_goal_sweep, _save_overlay_video
 # Helpers (same suffix logic as run_ablations.py)
 # ──────────────────────────────────────────────────────────────────────────────
 
+# Legacy main configuration path (kept for compatibility only).
 MAIN_CONFIG_FILE = "config/config.yaml"
+
+# Stable base config used for merge (same convention as run_ablations.py).
+BASE_CONFIG_FILE = "config/config.yaml.bak"
 
 
 def derive_suffix_from_filename(cfg_path: str) -> str | None:
@@ -72,7 +76,8 @@ def derive_suffix_from_filename(cfg_path: str) -> str | None:
     m = re.fullmatch(r"config(_.*)?", stem)
     if m is None:
         return None
-    return m.group(1) or ""
+    suffix = m.group(1) or ""
+    return re.sub(r"\s+", "", suffix)
 
 
 def deep_merge(base: dict, override: dict) -> dict:
@@ -85,7 +90,12 @@ def deep_merge(base: dict, override: dict) -> dict:
     return out
 
 
-def build_merged_temp_config(base_cfg: dict, override_cfg_path: str, suffix: str | None) -> str:
+def build_merged_temp_config(
+    base_cfg: dict,
+    override_cfg_path: str,
+    suffix: str | None,
+    tmp_dir: str | None = None,
+) -> str:
     """Return path to a temp YAML that is base+override, with optional suffix override."""
     with open(override_cfg_path, "r", encoding="utf-8") as f:
         override = yaml.safe_load(f) or {}
@@ -96,7 +106,8 @@ def build_merged_temp_config(base_cfg: dict, override_cfg_path: str, suffix: str
     if suffix is not None:
         data.setdefault("training", {})["suffix"] = suffix
 
-    tmp_path = override_cfg_path + ".eval_patched.yaml"
+    fd, tmp_path = tempfile.mkstemp(prefix="abl_train_cfg_", suffix=".yaml", dir=tmp_dir)
+    os.close(fd)
     with open(tmp_path, "w", encoding="utf-8") as f:
         yaml.dump(data, f, default_flow_style=False, allow_unicode=True)
     return tmp_path
@@ -125,7 +136,7 @@ def find_latest_checkpoint(save_dir: str, ema: bool = False) -> tuple[str | None
 def safe_ablation_name(cfg_path: str, ablations_folder: str) -> str:
     """Derive a filesystem-safe name for the ablation."""
     rel = os.path.relpath(cfg_path, ablations_folder)
-    name = os.path.splitext(rel)[0].replace(os.sep, "__")
+    name = re.sub(r"\s+", "", os.path.splitext(rel)[0]).replace(os.sep, "__")
     return name
 
 
@@ -763,25 +774,48 @@ def main():
     for pattern in patterns:
         cfg_files.extend(glob.glob(pattern, recursive=True))
     cfg_files = sorted(set(cfg_files))
-    cfg_files = [f for f in cfg_files
-                 if not f.endswith(".patched.yaml")
-                 and not f.endswith(".eval_patched.yaml")]
+
+    # Deduplicate accidental whitespace variants in filenames/paths.
+    deduped = []
+    seen_keys = set()
+    for f in cfg_files:
+        rel = os.path.relpath(f, ablations_folder)
+        key = re.sub(r"\s+", "", rel)
+        if key in seen_keys:
+            print(f"[skip] Duplicate-by-whitespace config ignored: {rel}")
+            continue
+        seen_keys.add(key)
+        deduped.append(f)
+    cfg_files = deduped
+
+    # Filter out the main config file if it accidentally lives under ablations.
+    cfg_files = [f for f in cfg_files if os.path.abspath(f) != os.path.abspath(MAIN_CONFIG_FILE)]
+
+    # Skip patched and runner temp files.
+    cfg_files = [
+        f
+        for f in cfg_files
+        if not f.endswith(".patched.yaml")
+        and not os.path.basename(f).startswith("abl_train_cfg_")
+    ]
     if not cfg_files:
         print(f"No YAML files found in {ablations_folder}")
         sys.exit(0)
 
     print(f"Found {len(cfg_files)} ablation configs.\n")
 
-    # ── Backup main config ───────────────────────────────────────────────────
-    backup = MAIN_CONFIG_FILE + ".eval_bak"
-    if os.path.exists(MAIN_CONFIG_FILE):
-        shutil.copy(MAIN_CONFIG_FILE, backup)
+    if not os.path.exists(BASE_CONFIG_FILE):
+        print(f"ERROR: Base config '{BASE_CONFIG_FILE}' does not exist.")
+        sys.exit(1)
 
-    with open(MAIN_CONFIG_FILE, "r", encoding="utf-8") as f:
+    with open(BASE_CONFIG_FILE, "r", encoding="utf-8") as f:
         base_main_cfg = yaml.safe_load(f) or {}
     if not isinstance(base_main_cfg, dict):
-        print(f"ERROR: Base config '{MAIN_CONFIG_FILE}' is not a YAML mapping.")
+        print(f"ERROR: Base config '{BASE_CONFIG_FILE}' is not a YAML mapping.")
         sys.exit(1)
+
+    # Keep temporary merged configs close to config files for relative includes.
+    tmp_cfg_dir = os.path.dirname(os.path.abspath(BASE_CONFIG_FILE))
 
     os.makedirs(args.output_root, exist_ok=True)
 
@@ -798,15 +832,12 @@ def main():
             # Derive suffix & patch
             suffix = derive_suffix_from_filename(cfg_path)
             patched_path = None
-            patched_path = build_merged_temp_config(base_main_cfg, cfg_path, suffix)
+            patched_path = build_merged_temp_config(base_main_cfg, cfg_path, suffix, tmp_dir=tmp_cfg_dir)
             active_cfg = patched_path
 
             try:
-                # ── Install config as the main config ────────────────────────
-                shutil.copy(active_cfg, MAIN_CONFIG_FILE)
-
                 # ── Load the ablation config to find checkpoint ──────────────
-                model_cfg, data_cfg, training_cfg, noise_cfg = load_config(MAIN_CONFIG_FILE)
+                model_cfg, data_cfg, training_cfg, noise_cfg = load_config(active_cfg)
 
                 save_dir = get_save_path(model_cfg, data_cfg, training_cfg)
                 print(f"  Save dir: {save_dir}")
@@ -827,7 +858,7 @@ def main():
                         continue
 
                 # ── Build MotionGenerator ────────────────────────────────────
-                mg = MotionGenerator(config_path=MAIN_CONFIG_FILE, device=device)
+                mg = MotionGenerator(config_path=active_cfg, device=device)
                 mg.diffuser.load_weights_from_file(ckpt_path)
 
                 # ── Build full dataset (for initial conditions) ──────────────
@@ -970,12 +1001,6 @@ def main():
 
     except KeyboardInterrupt:
         print("\n[STOPPED] Interrupted by user.")
-
-    finally:
-        # Restore original config
-        if os.path.exists(backup):
-            shutil.copy(backup, MAIN_CONFIG_FILE)
-            os.remove(backup)
 
     # ── Global comparison plots ──────────────────────────────────────────────
     if all_results:

@@ -2,7 +2,7 @@
 #SBATCH --job-name diffusion-train
 #SBATCH --account eu-26-32
 #SBATCH --partition qgpu
-#SBATCH --time 03:00:00
+#SBATCH --time 12:00:00
 #SBATCH --gpus 1
 #SBATCH --output logs/train_%j.out
 #SBATCH --error logs/train_%j.out
