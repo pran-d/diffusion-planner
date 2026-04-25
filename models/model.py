@@ -104,22 +104,22 @@ class RobotDiffuser():
         sample = torch.randn(num_trajectories, self.num_channels, self.input_size).to(self.device)
         
         cond_list = []
-        if state_cond is not None:
+        if getattr(self.model, 'state_condition', False) and state_cond is not None:
             if isinstance(state_cond, np.ndarray):
                 state_cond = torch.from_numpy(state_cond).to(self.device).to(sample.dtype)
             cond_list.append(state_cond)
 
-        if goal_cond is not None:
+        if getattr(self.model, 'task_condition', False) and goal_cond is not None:
             if isinstance(goal_cond, np.ndarray):
                 goal_cond = torch.from_numpy(goal_cond).to(self.device).to(sample.dtype)
             cond_list.append(goal_cond)
 
-        if style_cond is not None:
+        if getattr(self.model, 'style_condition', False) and style_cond is not None:
             if isinstance(style_cond, np.ndarray):
                 style_cond = torch.from_numpy(style_cond).to(self.device).to(sample.dtype)
             cond_list.append(style_cond)
 
-        if phase1_cond is not None:
+        if getattr(self.model, 'phase1_condition', False) and phase1_cond is not None:
             if isinstance(phase1_cond, np.ndarray):
                 phase1_cond = torch.from_numpy(phase1_cond).to(self.device).to(sample.dtype)
             cond_list.append(phase1_cond)

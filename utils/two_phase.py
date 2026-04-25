@@ -95,11 +95,25 @@ def apply_phase_to_configs(
     out_data["two_phase_phase"] = phase
     out_data["phase1_context_features"] = list(two_phase_cfg["phase1_features"])
     out_data["phase1_context_mode"] = "last"
+    
+    out_data["full_feature_order"] = full_feature_order
+    out_data["full_num_features"] = full_num_features
+    out_data["full_num_observations"] = full_num_obs
 
     phase1_ctx_dim = feature_dims(two_phase_cfg["phase1_features"])
     out_data["phase1_context_dim"] = int(phase1_ctx_dim)
     out_model["phase1_condition"] = bool(phase == "phase2")
+    out_data["phase1_condition"] = bool(phase == "phase2")
     out_model["phase1_context_dim"] = int(phase1_ctx_dim)
+    
+    if phase == "phase2":
+        out_model["state_condition"] = True
+        out_model["task_condition"] = False
+        out_model["num_observations"] = full_num_obs
+        
+        out_data["state_condition"] = True
+        out_data["task_condition"] = False
+        out_data["num_observations"] = full_num_obs
 
     old_suffix = str(out_train.get("suffix", "")).strip()
     phase_suffix = f"{phase}"
