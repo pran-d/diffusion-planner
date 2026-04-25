@@ -1,5 +1,28 @@
 import yaml
-import os 
+import os
+
+# Resolved path to the config/ directory (so helpers work regardless of cwd)
+_CONFIG_DIR = os.path.dirname(os.path.abspath(__file__))
+_PATHS_FILE = os.path.join(_CONFIG_DIR, "paths.yaml")
+
+
+def load_paths() -> dict:
+    """Load machine-local paths from config/paths.yaml.
+
+    Returns the ``paths`` sub-dict so callers can do::
+
+        paths = load_paths()
+        save_dir = paths["save_dir"]
+
+    Falls back to an empty dict if the file is missing so that explicit
+    config values still work without a paths.yaml.
+    """
+    if not os.path.exists(_PATHS_FILE):
+        return {}
+    with open(_PATHS_FILE, "r") as f:
+        data = yaml.safe_load(f) or {}
+    return data.get("paths", {})
+
 
 def recursive_merge(d1, d2):
     """
@@ -56,13 +79,10 @@ def load_config(config_path: str, auto_conf: bool = False) -> dict:
     """Load configuration from a YAML file.
     Args:
         config_path (str): Path to the YAML configuration file.
-    
     Returns:
-        tuple: (model_cfg, data_cfg, training_cfg)
+        tuple: (model_cfg, data_cfg, training_cfg, noise_sched_cfg)
     """
-    
     config = load_yaml_with_includes(config_path)
-    
     model_cfg = config.get('model', {})
     data_cfg = config.get('data', {})
     training_cfg = config.get('training', {})
@@ -74,6 +94,7 @@ def load_config(config_path: str, auto_conf: bool = False) -> dict:
     data_cfg.setdefault("dir_path", paths.get("data_dir", "./"))
     data_cfg.setdefault("train_path", paths.get("train_path", ""))
     data_cfg.setdefault("task_list_path", paths.get("task_list_path", ""))
+    data_cfg.setdefault("file_names", paths.get("file_names", None))
     # Training / run paths
     training_cfg.setdefault("save_dir", paths.get("save_dir", "./runs/"))
     training_cfg.setdefault("log_dir", paths.get("log_dir", "./logs/"))
@@ -85,7 +106,6 @@ def load_config(config_path: str, auto_conf: bool = False) -> dict:
 
     save_dir = get_save_path(model_cfg, data_cfg, training_cfg)
     saved_config_path = os.path.join(save_dir, "config.yaml")
-    
     # Check for saved config in the run directory
     if auto_conf and os.path.exists(saved_config_path):
         print(f"Loading configuration from {saved_config_path}...\n")
@@ -94,10 +114,47 @@ def load_config(config_path: str, auto_conf: bool = False) -> dict:
     return model_cfg, data_cfg, training_cfg, noise_sched_cfg
 
 def get_run_path(model_cfg: dict, data_cfg: dict, training_cfg: dict) -> str:
-    input_size = data_cfg.get('num_timesteps', 'unknown') // data_cfg.get('downsample', 1)
-    num_channels = data_cfg.get('num_features', 'unknown')
+    # Some ablation configs are partial overrides (e.g. training-only), so
+    # model/data keys may be missing. Fill missing run-name fields from the
+    # base config/config.yaml when available.
+    model_type = model_cfg.get('type', None)
+    num_timesteps = data_cfg.get('num_timesteps', None)
+    downsample = data_cfg.get('downsample', None)
+    num_channels = data_cfg.get('num_features', None)
+
+    if model_type is None or num_timesteps is None or downsample is None or num_channels is None:
+        base_cfg_path = os.path.join(_CONFIG_DIR, "config.yaml")
+        if os.path.exists(base_cfg_path):
+            try:
+                base = load_yaml_with_includes(base_cfg_path) or {}
+                base_model = base.get("model", {}) if isinstance(base.get("model", {}), dict) else {}
+                base_data = base.get("data", {}) if isinstance(base.get("data", {}), dict) else {}
+                if model_type is None:
+                    model_type = base_model.get("type", None)
+                if num_timesteps is None:
+                    num_timesteps = base_data.get("num_timesteps", None)
+                if downsample is None:
+                    downsample = base_data.get("downsample", None)
+                if num_channels is None:
+                    num_channels = base_data.get("num_features", None)
+            except Exception:
+                pass
+
+    try:
+        num_timesteps_i = int(num_timesteps)
+        downsample_i = max(1, int(downsample))
+        input_size = num_timesteps_i // downsample_i
+    except (TypeError, ValueError):
+        input_size = 'unknown'
+
+    try:
+        num_channels = int(num_channels)
+    except (TypeError, ValueError):
+        num_channels = 'unknown'
+
+    model_type = model_type if isinstance(model_type, str) and model_type else 'model'
     suffix = training_cfg.get('suffix', '')
-    save_dir = f"{model_cfg.get('type', 'model')}_ts{input_size}_f{num_channels}"
+    save_dir = f"{model_type}_ts{input_size}_f{num_channels}"
     save_dir += f"{suffix}/"
     return save_dir
 
@@ -140,10 +197,22 @@ def get_data_path(data_cfg: dict) -> str:
     print(f"Getting data from {data_path}...\n")
     return data_path
 
-def get_norm_path(model_cfg: dict, training_cfg: dict, data_cfg: dict, num_training_calls = None) -> str:    
+def get_norm_path(model_cfg: dict, training_cfg: dict, data_cfg: dict, num_training_calls=None) -> str:
     run_path = get_run_path(model_cfg=model_cfg, data_cfg=data_cfg, training_cfg=training_cfg)
     save_dir = training_cfg.get('save_dir', './runs') + run_path
     norm_file_name = f"norm_stats.npz" if num_training_calls is None else f"norm_stats_{num_training_calls}.npz"
     norm_path = os.path.join(save_dir, norm_file_name)
     
     return norm_path
+
+
+def get_mj_xml_paths() -> tuple[str, str]:
+    """Return the (mj_model_xml, mj_model_repeated_xml) paths from paths.yaml.
+
+    Falls back to the filenames that previously existed in the repo root so
+    existing code is unaffected if paths.yaml is not present.
+    """
+    paths = load_paths()
+    xml = paths.get('mj_model_xml', 'mj_model.xml')
+    repeated_xml = paths.get('mj_model_repeated_xml', 'mj_model_repeated.xml')
+    return xml, repeated_xml

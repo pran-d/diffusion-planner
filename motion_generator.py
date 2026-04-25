@@ -1,4 +1,5 @@
 import gc
+import copy
 import torch
 import numpy as np
 import yaml
@@ -9,7 +10,6 @@ from typing import List, Dict, Union, Optional
 from torch.utils.data import DataLoader, WeightedRandomSampler
 from torch.amp import GradScaler
 from torch import nn, optim
-from tqdm import tqdm
 from scipy.interpolate import interp1d
 from scipy.spatial.transform import Rotation as R
 from scipy.spatial.transform import Slerp
@@ -20,9 +20,28 @@ from models.model import RobotDiffuser
 from datasets.flexible_dataset import FlexibleWindowDataset
 from utils.math.sbto_utils import reconstruct_sbto_trajectory, compute_task_params
 from utils.math.math_tools import yaw_from_quat, yaw_to_rot_matrix
+from utils.data.style_conditioning import one_hot_style, style_name_to_id
 from utils.physics_limits import apply_physics_clamp
-from inference import build_inference_waypoints
+from utils.inference_utils import build_inference_waypoints
 from diffusers import EMAModel
+from utils.two_phase import (
+    resolve_two_phase_cfg,
+    apply_phase_to_configs,
+    build_feature_slices,
+)
+
+
+class TimingContext:
+    """Small helper for accumulating named wall-clock timings."""
+
+    def __init__(self):
+        self.stats = {}
+
+    def add(self, key: str, dt: float):
+        self.stats[key] = self.stats.get(key, 0.0) + float(dt)
+
+    def get(self, key: str, default: float = 0.0) -> float:
+        return float(self.stats.get(key, default))
 
 
 def compute_dataset_weights(dataset, sigma=0.2):
@@ -55,7 +74,7 @@ def compute_dataset_weights(dataset, sigma=0.2):
     # Pre-fetch if possible to avoid redundant file reads
     # But _get_single_traj uses ram_cache so it's fast
     
-    for f, b in tqdm(unique_traj_keys, desc="Extracting Task Params"):
+    for f, b in unique_traj_keys:
         raw = dataset._get_single_traj(f, b)
         
         # FlexibleWindowDataset: if 'obj' is missing
@@ -126,10 +145,20 @@ class MotionGenerator:
         # Load Config
         with open(config_path, 'r') as file:
             raw_config = yaml.safe_load(file)
+
+        self.two_phase_cfg = resolve_two_phase_cfg(raw_config.get("two_phase", {}))
+        self.two_phase_enabled = bool(self.two_phase_cfg.get("enabled", False))
+        self.phase1_diffuser = None
+        self.phase2_diffuser = None
+        self.phase1_data_cfg = None
+        self.phase2_data_cfg = None
+        self.phase1_slices = None
+        self.phase2_slices = None
         
         self.model_cfg, self.data_cfg, self.training_cfg, self.noise_cfg = load_config(
             config_path, raw_config.get("auto_conf", False)
         )
+        self.full_feature_slices = build_feature_slices(self.data_cfg.get("feature_order", []))
         
         self.device = torch.device(device if device else ("cuda" if torch.cuda.is_available() else "cpu"))
         
@@ -142,11 +171,118 @@ class MotionGenerator:
             mode='inference', # Default to inference, but 'train' or 'inference' just sets up scheduler mainly
             device=self.device
         )
+
+        if self.two_phase_enabled:
+            self._setup_two_phase_models()
         
         self.dataset = None # To be initialized in fit or loaded
 
         # Try to load existing stats if available to be ready for inference
         self._setup_dataset_structure(load_stats=True)
+
+    def _setup_two_phase_models(self):
+        p1_model, p1_data, p1_train, p1_noise = apply_phase_to_configs(
+            self.model_cfg, self.data_cfg, self.training_cfg, self.noise_cfg,
+            phase="phase1", two_phase_cfg=self.two_phase_cfg,
+        )
+        p2_model, p2_data, p2_train, p2_noise = apply_phase_to_configs(
+            self.model_cfg, self.data_cfg, self.training_cfg, self.noise_cfg,
+            phase="phase2", two_phase_cfg=self.two_phase_cfg,
+        )
+
+        self.phase1_data_cfg = p1_data
+        self.phase2_data_cfg = p2_data
+        # IMPORTANT: these slices must index into the *full* feature tensor.
+        # Using phase-local slices here would write phase outputs into wrong columns.
+        p1_order = p1_data.get("feature_order", [])
+        p2_order = p2_data.get("feature_order", [])
+        self.phase1_slices = {
+            k: self.full_feature_slices[k]
+            for k in p1_order
+            if k in self.full_feature_slices
+        }
+        self.phase2_slices = {
+            k: self.full_feature_slices[k]
+            for k in p2_order
+            if k in self.full_feature_slices
+        }
+
+        self.phase1_diffuser = RobotDiffuser(
+            model_config=p1_model,
+            data_config=p1_data,
+            training_config=p1_train,
+            noise_scheduler_config=p1_noise,
+            mode='inference',
+            device=self.device,
+        )
+        self.phase2_diffuser = RobotDiffuser(
+            model_config=p2_model,
+            data_config=p2_data,
+            training_config=p2_train,
+            noise_scheduler_config=p2_noise,
+            mode='inference',
+            device=self.device,
+        )
+
+    def load_two_phase_weights(self, phase1_checkpoint: str, phase2_checkpoint: str):
+        if not self.two_phase_enabled:
+            raise RuntimeError("Two-phase mode is not enabled in config.")
+        if phase1_checkpoint:
+            self.phase1_diffuser.load_weights_from_file(phase1_checkpoint)
+        if phase2_checkpoint:
+            self.phase2_diffuser.load_weights_from_file(phase2_checkpoint)
+
+    def _extract_phase_tensor(self, full_tensor: torch.Tensor, slices: Dict[str, slice], feature_order: List[str]) -> torch.Tensor:
+        parts = [full_tensor[..., slices[k]] for k in feature_order if k in slices]
+        return torch.cat(parts, dim=-1)
+
+    def _scatter_phase_into_full(self, target_full: torch.Tensor, phase_tensor: torch.Tensor, slices: Dict[str, slice], feature_order: List[str]):
+        cursor = 0
+        for key in feature_order:
+            sl = slices.get(key)
+            if sl is None:
+                continue
+            width = sl.stop - sl.start
+            if cursor + width > phase_tensor.shape[-1]:
+                raise ValueError(
+                    f"Phase tensor too small while scattering '{key}': "
+                    f"need {cursor + width}, got {phase_tensor.shape[-1]}"
+                )
+            target_full[..., sl] = phase_tensor[..., cursor:cursor + width]
+            cursor += width
+        if cursor != phase_tensor.shape[-1]:
+            raise ValueError(
+                f"Phase tensor has trailing dims not consumed during scatter: "
+                f"consumed={cursor}, tensor_dim={phase_tensor.shape[-1]}"
+            )
+
+    def _extract_phase_state_cond(self, full_state_cond: torch.Tensor, phase_feature_order: List[str]) -> torch.Tensor:
+        """Map full observation state (trailing full features) to phase-specific observation state."""
+        full_num_features = int(self.data_cfg.get("num_features", full_state_cond.shape[-1]))
+        full_num_obs = int(self.data_cfg.get("num_observations", full_state_cond.shape[-1]))
+        obs_start = max(0, full_num_features - full_num_obs)
+
+        local_parts = []
+        for key in phase_feature_order:
+            sl = self.full_feature_slices.get(key)
+            if sl is None:
+                continue
+            inter_start = max(sl.start, obs_start)
+            inter_stop = min(sl.stop, full_num_features)
+            if inter_stop <= inter_start:
+                continue
+            local_start = inter_start - obs_start
+            local_stop = inter_stop - obs_start
+            local_parts.append(full_state_cond[..., local_start:local_stop])
+
+        if not local_parts:
+            return full_state_cond[..., :0]
+        return torch.cat(local_parts, dim=-1)
+
+    def _build_phase1_context(self, phase1_sample: torch.Tensor) -> torch.Tensor:
+        """Build a compact phase1 context vector for phase2 conditioning."""
+        # phase1_sample: (B, T, D_phase1) in normalized space
+        return phase1_sample[:, -1, :]
 
 
     def _setup_dataset_structure(self, load_stats=True):
@@ -282,18 +418,21 @@ class MotionGenerator:
         
         state_condition = self.model_cfg.get("state_condition", False)
         task_condition = self.model_cfg.get("task_condition", False)
+        style_condition = self.model_cfg.get("style_condition", False)
+        phase1_condition = self.model_cfg.get("phase1_condition", False)
         dropout_probs = self.training_cfg.get("condition_dropout_prob", {})
         
         print(f"Starting training for {epochs} epochs...")
         
+        max_batches = self.training_cfg.get("batches_per_epoch", None)
+
         for epoch in range(epochs):
             epoch_losses = []
-            pbar = tqdm(train_dataloader, desc=f"Epoch {epoch+1}/{epochs}")
-            
-            for step, batch in enumerate(pbar):
+            total_steps = min(max_batches, len(train_dataloader)) if max_batches else len(train_dataloader)
+            for step, batch in enumerate(train_dataloader):
 
-                # if self.training_cfg.get("batches_per_epoch") and step >= self.training_cfg["batches_per_epoch"]:
-                #     break
+                if max_batches and step >= max_batches:
+                    break
                 
                 if batch[0].shape[0] < self.data_cfg["batch_size"]:
                     current_bs = batch[0].shape[0]
@@ -312,6 +451,8 @@ class MotionGenerator:
 
                 state_cond = None
                 task_cond = None
+                style_cond = None
+                phase1_cond = None
             
                 batch_data = list(batch)
                 prediction_target = batch_data[0].to(self.device)
@@ -324,11 +465,23 @@ class MotionGenerator:
                 if task_condition:
                     task_cond = batch_data[idx].to(self.device)
                     idx += 1
+
+                if style_condition:
+                    if idx < len(batch_data) and isinstance(batch_data[idx], torch.Tensor):
+                        style_cond = batch_data[idx].to(self.device)
+                        idx += 1
+
+                if phase1_condition:
+                    if idx < len(batch_data) and isinstance(batch_data[idx], torch.Tensor):
+                        phase1_cond = batch_data[idx].to(self.device)
+                        idx += 1
                 
                 # Construct cond (matches train.py)
                 cond = []
                 if state_cond is not None: cond.append(state_cond)
                 if task_cond is not None: cond.append(task_cond)
+                if style_cond is not None: cond.append(style_cond)
+                if phase1_cond is not None: cond.append(phase1_cond)
                 
                 model_cond = tuple(cond) if len(cond) > 0 else None
                 if len(cond) == 1: model_cond = cond[0]
@@ -355,7 +508,6 @@ class MotionGenerator:
                 ema.step(self.diffuser.model.parameters())
 
                 epoch_losses.append(loss.item())
-                pbar.set_postfix({"loss": f"{loss.item():.4f}"})
             
             scheduler.step()
             mean_loss = np.mean(epoch_losses)
@@ -565,6 +717,7 @@ class MotionGenerator:
     def generate_trajectory(self, 
                             initial_condition: Dict, 
                             goal_condition: Union[Dict, np.ndarray],
+                            style_condition: Optional[Union[str, np.ndarray, list]] = None,
                             target_traj_length: int = None,
                             stitch_steps: int = None, 
                             num_samples: int = 1,
@@ -582,15 +735,28 @@ class MotionGenerator:
                             lift_start: float = 0.0,
                             lift_end: float = 0.20,
                             verbose: bool = False,
-                            walk_start_z: float = 0.80,):
+                            walk_start_z: float = 0.80,
+                            verbose_timing: bool = False,
+                            return_timing_stats: bool = False,
+                            use_fp16: Optional[bool] = None,
+                            compile_model: Optional[bool] = None,):
         """
-        Generate trajectory via autoregressive diffusion (mirrors inference.py).
+        Generate trajectory via autoregressive diffusion.
+        
+        This is the single unified entry point for trajectory generation, used by
+        both inference_mg.py and the evolutionary pipeline.
         
         Args:
             initial_condition: Dict with 'robot' (B, H, 36) or (H, 36) and 
                                'obj' (B, H, 7) or (H, 7) history in world frame.
-            goal_condition: np.ndarray (B, D_task) or (D_task,) — desired task params 
-                           (e.g. final object position) in world frame.
+                               Robot: [x, y, z, qw, qx, qy, qz, joint_1..joint_29].
+                               Object: [x, y, z, qw, qx, qy, qz].
+            goal_condition: np.ndarray (B, D) or (D,) — desired final object
+                           displacement from initial object position, expressed in
+                           the yaw-rotated initial robot pelvis frame.
+                           For pick_place_relative_box_pose: D=2, [relative_x, relative_y].
+                           Internally converted to world frame via:
+                             goal_world = R(yaw_init) @ goal_local + init_obj_pos
             target_traj_length: Desired output trajectory length (pre-interpolation).
                                 Used to auto-compute stitch_steps from the model window size.
                                 Ignored if stitch_steps is explicitly provided.
@@ -629,7 +795,15 @@ class MotionGenerator:
         if self.dataset is None:
              raise RuntimeError("Dataset not initialized. Call fit() or setup.")
 
-        self.diffuser.model.eval()
+        if self.two_phase_enabled:
+            self.phase1_diffuser.model.eval()
+            self.phase2_diffuser.model.eval()
+            self.phase1_diffuser.set_inference_speedups(use_fp16=use_fp16, compile_model=compile_model)
+            self.phase2_diffuser.set_inference_speedups(use_fp16=use_fp16, compile_model=compile_model)
+        else:
+            self.diffuser.model.eval()
+            # Runtime speedup toggles used by ablation runner
+            self.diffuser.set_inference_speedups(use_fp16=use_fp16, compile_model=compile_model)
         
         window_size = self.dataset.window_size  # model output length per segment
         history_size = self.dataset.history_size
@@ -637,12 +811,9 @@ class MotionGenerator:
         # --- Auto-compute stitch_steps from target trajectory length ---
         if stitch_steps is None:
             if target_traj_length is not None:
-                _eff = window_size - 1   # frames contributed by steps 1+ (t=0 skipped)
-                # Step 0 contributes window_size frames; steps 1+ contribute _eff each.
-                # Total = window_size + (stitch_steps-1)*_eff  =  1 + stitch_steps*_eff.
-                # Ensure total >= target_traj_length:
-                #   stitch_steps >= (target_traj_length - 1) / _eff
-                stitch_steps = max(1, math.ceil((target_traj_length - 1) / _eff))
+                # Effective frames added per window = window_size - history_size
+                _eff = max(1, window_size - history_size)
+                stitch_steps = max(1, math.ceil(target_traj_length / _eff))
             else:
                 stitch_steps = 1
 
@@ -699,6 +870,26 @@ class MotionGenerator:
         curr_state_tens = curr_state_tens.to(self.device)
         effective_batch = curr_state_tens.shape[0]
 
+        style_cond_tens = None
+        if self.model_cfg.get("style_condition", False):
+            num_styles = int(self.data_cfg.get("num_styles", 3))
+            if style_condition is None:
+                style_cond_np = np.tile(one_hot_style(style_name_to_id("push"), num_styles=num_styles), (effective_batch, 1))
+            elif isinstance(style_condition, str):
+                sid = style_name_to_id(style_condition)
+                style_cond_np = np.tile(one_hot_style(sid, num_styles=num_styles), (effective_batch, 1))
+            else:
+                sc = np.asarray(style_condition)
+                if sc.ndim == 1 and sc.shape[0] == effective_batch:
+                    style_cond_np = np.stack([one_hot_style(int(v), num_styles=num_styles) for v in sc], axis=0)
+                elif sc.ndim == 2 and sc.shape[1] == num_styles:
+                    style_cond_np = sc.astype(np.float32)
+                    if style_cond_np.shape[0] == 1 and effective_batch > 1:
+                        style_cond_np = np.repeat(style_cond_np, effective_batch, axis=0)
+                else:
+                    raise ValueError(f"Unsupported style_condition shape={sc.shape}")
+            style_cond_tens = torch.from_numpy(style_cond_np.astype(np.float32)).to(self.device)
+
         # Physics-check thresholds
         _FLOOR_Z        = -0.1   # m — pelvis/object z below this → ground penetration
         _MAX_ROBOT_STEP =  0.1   # m/frame — robot pelvis XY spike threshold
@@ -722,6 +913,22 @@ class MotionGenerator:
         _rest_obj_z = float(current_anchors['ref_obj_pos'][0, 2])
 
         stitched_segments = []
+        timing_stats = {
+            "forward_time_s": 0.0,
+            "reconstruction_time_s": 0.0,
+            "total_time_s": 0.0,
+            "num_steps": int(stitch_steps),
+            "avg_forward_time_s": 0.0,
+            "avg_reconstruction_time_s": 0.0,
+            "avg_step_time_s": 0.0,
+            "gpu_peak_mb": 0.0,
+        }
+        _t_total_start = time.perf_counter()
+        if self.device.type == "cuda":
+            try:
+                torch.cuda.reset_peak_memory_stats(self.device)
+            except Exception:
+                pass
 
         # 4. Autoregressive Loop
         with torch.no_grad():
@@ -747,14 +954,15 @@ class MotionGenerator:
 
                 # B. Build waypoints (full keyframe at t=0 + optional last-frame partial wp)
                 wv, wm = None, None
-                if getattr(self.diffuser.model, 'inbetweening_enabled', False):
+                if (not self.two_phase_enabled) and getattr(self.diffuser.model, 'inbetweening_enabled', False):
+                    model_feature_dim = int(getattr(self.diffuser.model, 'x_shape', torch.Size([self.data_cfg['num_features']]))[0])
                     remaining = max(stitch_steps - step, 1)
                     _current_obj_z = torch.from_numpy(
                         current_anchors['ref_obj_pos'][:, 2].astype(np.float32)
                     )
                     wv, wm = build_inference_waypoints(
                         curr_state_tens, task_actual, self.dataset,
-                        self.data_cfg['num_features'], window_size,
+                        model_feature_dim, window_size,
                         use_last_frame_wp=use_last_frame_wp,
                         stitch_steps=stitch_steps,
                         remaining_steps=remaining,
@@ -766,18 +974,60 @@ class MotionGenerator:
                         walk_start_z=walk_start_z,
                         current_obj_z=_current_obj_z,
                         rest_obj_z=_rest_obj_z,
+                        goal_obj_z=goal_world[:, 2],
+                        normalize_goal_vec=self.data_cfg.get("normalize_goal_vec", True),
                     )
 
                 # C. Generate normalized sample
-                normalized_sample = self.diffuser.getSample(
-                    num_trajectories=effective_batch,
-                    state_cond=curr_state_tens,
-                    goal_cond=task_cond,
-                    deterministic=self.noise_cfg.get("deterministic_inference", False),
-                    cfg_w=cfg_w,
-                    waypoint_values=wv,
-                    waypoint_mask=wm,
-                )  # (B, T, D_out)
+                _t_forward_start = time.perf_counter()
+                if self.two_phase_enabled:
+                    p1_order = self.phase1_data_cfg.get("feature_order", [])
+                    p2_order = self.phase2_data_cfg.get("feature_order", [])
+
+                    state_cond_p1 = self._extract_phase_state_cond(curr_state_tens, p1_order)
+                    state_cond_p2 = self._extract_phase_state_cond(curr_state_tens, p2_order)
+
+                    sample_p1 = self.phase1_diffuser.getSample(
+                        num_trajectories=effective_batch,
+                        state_cond=state_cond_p1,
+                        goal_cond=task_cond,
+                        style_cond=style_cond_tens,
+                        deterministic=self.noise_cfg.get("deterministic_inference", False),
+                        cfg_w=cfg_w,
+                        waypoint_values=None,
+                        waypoint_mask=None,
+                    )
+                    sample_p2 = self.phase2_diffuser.getSample(
+                        num_trajectories=effective_batch,
+                        state_cond=state_cond_p2,
+                        goal_cond=task_cond,
+                        style_cond=style_cond_tens,
+                        phase1_cond=self._build_phase1_context(sample_p1),
+                        deterministic=self.noise_cfg.get("deterministic_inference", False),
+                        cfg_w=cfg_w,
+                        waypoint_values=None,
+                        waypoint_mask=None,
+                    )
+
+                    full_dim = int(self.data_cfg["num_features"])
+                    normalized_sample = torch.zeros(
+                        sample_p1.shape[0], sample_p1.shape[1], full_dim,
+                        device=sample_p1.device, dtype=sample_p1.dtype,
+                    )
+                    self._scatter_phase_into_full(normalized_sample, sample_p1, self.phase1_slices, p1_order)
+                    self._scatter_phase_into_full(normalized_sample, sample_p2, self.phase2_slices, p2_order)
+                else:
+                    normalized_sample = self.diffuser.getSample(
+                        num_trajectories=effective_batch,
+                        state_cond=curr_state_tens,
+                        goal_cond=task_cond,
+                        style_cond=style_cond_tens,
+                        deterministic=self.noise_cfg.get("deterministic_inference", False),
+                        cfg_w=cfg_w,
+                        waypoint_values=wv,
+                        waypoint_mask=wm,
+                    )  # (B, T, D_out)
+                timing_stats["forward_time_s"] += (time.perf_counter() - _t_forward_start)
                 
                 # D. Denormalize
                 denorm_btc = self.dataset.denormalize_global(normalized_sample)
@@ -801,15 +1051,17 @@ class MotionGenerator:
                     current_anchors['final_obj_pos'],
                 ], axis=-1)
                 
+                _t_recon_start = time.perf_counter()
                 res = reconstruct_sbto_trajectory(
                     anchor_arr, future_traj_np, 
                     inpaint=self.diffuser.model_cfg.get("inpaint", False)
                 )
                 r_world, o_world = res[0], res[1]
+                timing_stats["reconstruction_time_s"] += (time.perf_counter() - _t_recon_start)
 
-                if step > 0:
-                    r_world = r_world[:, 1:, :]  # skip t=0 (anchored to current state)
-                    o_world = o_world[:, 1:, :]
+                # Always skip t=0 (anchor frame) — matches inference.py
+                r_world = r_world[:, history_size:, :]
+                o_world = o_world[:, history_size:, :]
                 
                 # Store segment: Robot(36) + Object(7)
                 segment_world = np.concatenate([r_world[..., :36], o_world[..., :7]], axis=-1)
@@ -853,20 +1105,23 @@ class MotionGenerator:
                     _newly = np.zeros(effective_batch, dtype=bool)
                     _trigger_frame = np.full(effective_batch, -1, dtype=np.int64)
                     _active = ~_goal_reached  # only check trajectories not yet reached
+                    _goal_needs_ground = np.abs(goal_world[:, 2] - _rest_obj_z) < end_ground_z_tol
                     for _t in range(_seg_T):
                         _obj_xyz_t = segment_world[:, _t, 36:39]  # (B, 3)
                         # Update ground counter: on-ground if |obj_z - rest_z| < tol
                         _on_ground = np.abs(_obj_xyz_t[:, 2] - _rest_obj_z) < end_ground_z_tol
                         _ground_counter = np.where(_on_ground, _ground_counter + 1, 0)
-                        # XY distance to goal
-                        _xy_err = np.linalg.norm(
-                            _obj_xyz_t[:, :2] - goal_world[:, :2], axis=-1
+                        # 3D distance to goal
+                        _goal_err = np.linalg.norm(
+                            _obj_xyz_t[:, :3] - goal_world[:, :3], axis=-1
                         )  # (B,)
-                        # Check both conditions
+                        _ground_ok = (~_goal_needs_ground) | (_ground_counter >= end_ground_num_frames)
+
+                        # Check goal and ground condition (if required)
                         _hit = (
                             _active & ~_newly
-                            & (_xy_err < end_error_threshold)
-                            & (_ground_counter >= end_ground_num_frames)
+                            & (_goal_err < end_error_threshold)
+                            & _ground_ok
                         )
                         if _hit.any():
                             for _ni in np.where(_hit)[0]:
@@ -876,7 +1131,7 @@ class MotionGenerator:
                             print(
                                 f"[goal] step {step+1}, frame {_t}: "
                                 f"sample {np.where(_hit)[0].tolist()} reached goal "
-                                f"(xy_err={_xy_err[_hit].round(4).tolist()}, "
+                                f"(goal_err={_goal_err[_hit].round(4).tolist()}, "
                                 f"ground_frames={_ground_counter[_hit].astype(int).tolist()})"
                             )
                     # Pad remainder of current segment for newly-reached trajectories
@@ -925,8 +1180,8 @@ class MotionGenerator:
                         ])
                         for _ in range(_steps_to_pad):
                             stitched_segments.append(_all_pad.copy())
-                        print(f"[goal] All {effective_batch} samples reached goal after "
-                              f"step {step+1}. Padding {_steps_to_pad} remaining steps.")
+                        # print(f"[goal] All {effective_batch} samples reached goal after "
+                        #       f"step {step+1}. Padding {_steps_to_pad} remaining steps.")
                     break
                 # ──────────────────────────────────────────────────────────────────────
 
@@ -941,6 +1196,24 @@ class MotionGenerator:
                     curr_state_tens = curr_state_tens.to(self.device)
         
         full_trajectory = np.concatenate(stitched_segments, axis=1)
+        timing_stats["total_time_s"] = time.perf_counter() - _t_total_start
+        if timing_stats["num_steps"] > 0:
+            timing_stats["avg_forward_time_s"] = timing_stats["forward_time_s"] / timing_stats["num_steps"]
+            timing_stats["avg_reconstruction_time_s"] = timing_stats["reconstruction_time_s"] / timing_stats["num_steps"]
+            timing_stats["avg_step_time_s"] = timing_stats["total_time_s"] / timing_stats["num_steps"]
+        if self.device.type == "cuda":
+            try:
+                timing_stats["gpu_peak_mb"] = float(torch.cuda.max_memory_allocated(self.device) / (1024 ** 2))
+            except Exception:
+                timing_stats["gpu_peak_mb"] = 0.0
+        if verbose_timing:
+            print(
+                f"[timing] total={timing_stats['total_time_s']:.3f}s "
+                f"avg_step={timing_stats['avg_step_time_s']:.4f}s "
+                f"avg_forward={timing_stats['avg_forward_time_s']:.4f}s "
+                f"avg_recon={timing_stats['avg_reconstruction_time_s']:.4f}s "
+                f"peak_gpu={timing_stats['gpu_peak_mb']:.1f}MB"
+            )
 
         # Finalise real lengths for samples that never triggered goal/physics stop
         _real_lengths[_real_lengths < 0] = full_trajectory.shape[1]
@@ -964,5 +1237,7 @@ class MotionGenerator:
         # Smooth trajectory
         full_trajectory = self._smooth_trajectory(full_trajectory, sigma=2.0)
 
+        if return_timing_stats:
+            return full_trajectory, _real_lengths, timing_stats
         return full_trajectory, _real_lengths
 

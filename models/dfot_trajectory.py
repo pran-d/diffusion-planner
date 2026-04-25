@@ -13,7 +13,7 @@ from einops.layers.torch import Rearrange
 import numpy as np
 from utils.configcls import Config
 
-from utils.math.sbto_utils import build_feature_layout, get_feature_indices
+from utils.math.sbto_utils import build_feature_layout
 
 # =========================
 # Conditioning Embeddings
@@ -64,6 +64,48 @@ class MLP(nn.Module):
         return self.net(x)
 
 
+class HistoryAggregator(nn.Module):
+    """Compress (B, H, D) history embeddings into (B, 1, D).
+
+    Supports two modes:
+      - ``"attn"`` (default): learned attention pooling — a single-head
+        attention query that attends to all H frames.  Most expressive
+        and order-aware.
+      - ``"mean"``: simple mean pooling over the time axis.  Parameter-free,
+        useful as a lightweight baseline.
+
+    When ``H == 1`` both modes reduce to an identity reshape.
+    """
+
+    def __init__(self, hidden_dim: int, mode: str = "attn"):
+        super().__init__()
+        self.mode = mode
+        if mode == "attn":
+            # Learned query vector that attends to the H history tokens
+            self.query = nn.Parameter(torch.randn(1, 1, hidden_dim) * 0.02)
+            self.attn = nn.MultiheadAttention(
+                embed_dim=hidden_dim, num_heads=1, batch_first=True,
+            )
+        elif mode != "mean":
+            raise ValueError(f"Unknown history aggregation mode: {mode!r}")
+
+    def forward(self, h: torch.Tensor) -> torch.Tensor:
+        """
+        Args:
+            h: (B, H, D) embedded history frames.
+        Returns:
+            (B, 1, D) aggregated conditioning token.
+        """
+        if h.shape[1] == 1:
+            return h  # no-op when H == 1
+        if self.mode == "mean":
+            return h.mean(dim=1, keepdim=True)
+        # attn: query (B, 1, D) attends to h (B, H, D)
+        query = self.query.expand(h.shape[0], -1, -1)
+        out, _ = self.attn(query, h, h)  # (B, 1, D)
+        return out
+
+
 class DFoTTrajectory(nn.Module):
     def __init__(self, model_config, data_config, noise_scheduler_config=None, training_config=None):
         super().__init__()
@@ -75,22 +117,47 @@ class DFoTTrajectory(nn.Module):
         self.x_shape = torch.Size([data_config['num_features']])
         self.state_condition = model_config.get("state_condition", False)
         self.task_condition = model_config.get("task_condition", False)
+        self.style_condition = model_config.get("style_condition", False)
+        self.phase1_condition = model_config.get("phase1_condition", False)
         
         self.state_dim = model_config['hidden_size'] if self.state_condition else 0
         self.task_dim = model_config.get("hidden_size", 64) if self.task_condition else 0
+        self.style_dim = model_config.get("hidden_size", 64) if self.style_condition else 0
+        self.phase1_ctx_dim = model_config.get("hidden_size", 64) if self.phase1_condition else 0
 
-        self.external_cond_dim = self.state_dim + self.task_dim
+        self.external_cond_dim = self.state_dim + self.task_dim + self.style_dim + self.phase1_ctx_dim
+
+        self.history_size = data_config.get("state_history", 1)
             
         if self.state_condition:
             self.state_embedding = MLP(
                 in_dim=data_config.get("num_observations", 86),
                 out_dim=model_config.get("hidden_size", 64)
             )
+            # Aggregate multi-frame history (B, H, hidden) → (B, 1, hidden)
+            # When H == 1 the aggregator is a no-op reshape.
+            agg_mode = model_config.get("history_aggregation", "attn")
+            self.history_aggregator = HistoryAggregator(
+                hidden_dim=model_config.get("hidden_size", 64),
+                mode=agg_mode,
+            )
 
         if self.task_condition:
             self.task_embedding = MLP(
                 in_dim=data_config.get("num_task_params", 10),
                 out_dim=model_config.get("hidden_size", 64) 
+            )
+
+        if self.style_condition:
+            self.style_embedding = MLP(
+                in_dim=data_config.get("num_styles", 3),
+                out_dim=model_config.get("hidden_size", 64)
+            )
+
+        if self.phase1_condition:
+            self.phase1_embedding = MLP(
+                in_dim=model_config.get("phase1_context_dim", data_config.get("phase1_context_dim", 13)),
+                out_dim=model_config.get("hidden_size", 64),
             )
   
         # Backbone config
@@ -171,6 +238,10 @@ class DFoTTrajectory(nn.Module):
         
         self.noise_level = self.noise_scheduler_config.get("noise_level", "random_independent")
         self.scheduling_matrix = self.noise_scheduler_config.get("scheduling_matrix", "full_sequence")
+        self.hierarchical_noise_cfg = self.noise_scheduler_config.get("hierarchical_noise", {})
+        self.hierarchical_schedule_cfg = self.noise_scheduler_config.get("hierarchical_schedule", {})
+        self.hierarchical_noise_enabled = bool(self.hierarchical_noise_cfg.get("enabled", False))
+        self.hierarchical_schedule_enabled = bool(self.hierarchical_schedule_cfg.get("enabled", False))
         self.uniform_future = False
 
         self.is_full_sequence = (
@@ -195,6 +266,23 @@ class DFoTTrajectory(nn.Module):
             if dim > 0:
                 self.feature_index_map[key] = slice(fidx, fidx + dim)
                 fidx += dim
+
+        # Build mapping from observation-conditioning vector indices -> model
+        # feature indices for inpaint pinning at t=0.
+        # current_state in the dataset is formed as the trailing
+        # `num_observations` features from the full feature vector.
+        self.obs_feature_index_map = {}
+        total_dim = int(data_config.get("num_features", fidx))
+        obs_dim = int(data_config.get("num_observations", 0))
+        obs_start = max(0, total_dim - obs_dim)
+        obs_end = total_dim
+        for key, sl in self.feature_index_map.items():
+            if sl.stop <= obs_start or sl.start >= obs_end:
+                continue
+            local_start = max(sl.start, obs_start) - obs_start
+            local_stop = min(sl.stop, obs_end) - obs_start
+            if local_stop > local_start:
+                self.obs_feature_index_map[key] = slice(local_start, local_stop)
 
         # Build feature group slices for partial masking
         partial_cfg = self.inbetweening_cfg.get("partial_masking", {})
@@ -222,6 +310,53 @@ class DFoTTrajectory(nn.Module):
         self.group_keep_probs = partial_cfg.get("group_keep_prob", {})
         self.waypoint_noise_fraction = self.inbetweening_cfg.get("waypoint_noise_fraction", 0.25)
 
+        # Hierarchical diffusion feature groups (phase-1: root/object plan first,
+        # phase-2: joints/body pose later).
+        self.phase1_feature_keys = self.hierarchical_noise_cfg.get(
+            "phase1_feature_keys",
+            [
+                "delta_xy",
+                "delta_yaw",
+                "obj_delta_xy",
+                "obj_z",
+                "obj_rel_pos",
+                "obj_rel_rot6d",
+            ],
+        )
+        self.phase2_feature_keys = self.hierarchical_noise_cfg.get(
+            "phase2_feature_keys",
+            [
+                "joints",
+                "body_z",
+                "body_rot6d",
+            ],
+        )
+        self._phase1_feature_mask = self._build_feature_mask(
+            self.phase1_feature_keys,
+            data_config["num_features"],
+        )
+        self._phase2_feature_mask = self._build_feature_mask(
+            self.phase2_feature_keys,
+            data_config["num_features"],
+        )
+
+        # Optional: group-wise input embeddings for the DiT1D backbone.
+        # Instead of a single nn.Linear(D, hidden) the backbone uses per-group
+        # projections whose outputs are summed → hidden, giving the model an
+        # inductive bias about the heterogeneous feature structure.
+        if model_config.get("group_wise_embedding", False) and backbone_type == "dit1d":
+            # Use the canonical feature_order groups (not the partial masking
+            # groups which merge multiple keys).  This gives one projection per
+            # semantic feature (delta_xy, delta_yaw, joints, …).
+            gw_slices = {
+                k: v for k, v in self.feature_index_map.items()
+                if k not in ("joints_lower", "joints_upper")  # avoid sub-slices
+            }
+            self.diffusion_model.model.set_group_wise_embedder(gw_slices)
+            # Recount params after replacement
+            total_params = sum(p.numel() for p in self.diffusion_model.model.parameters())
+            print(f"  Updated param count: {total_params/1e6:.2f}M parameters.")
+
         # Waypoint indicator embedding: projects per-feature binary mask (D) into
         # the backbone's hidden space so the model knows which features are constrained.
         # Added to token embeddings after input_embedder + pos_emb, before transformer blocks.
@@ -241,6 +376,14 @@ class DFoTTrajectory(nn.Module):
             self.resample_steps = self.inbetweening_cfg.get("resample_steps", 0)
 
 
+    def _build_feature_mask(self, feature_keys, feature_dim: int) -> torch.Tensor:
+        mask = torch.zeros(feature_dim, dtype=torch.bool)
+        for key in feature_keys:
+            sl = self.feature_index_map.get(key)
+            if sl is not None:
+                mask[sl] = True
+        return mask
+
     #### Training Utils ####
     def _get_training_noise_levels(
             self, xs: torch.Tensor, masks: torch.Tensor = None,
@@ -256,21 +399,58 @@ class DFoTTrajectory(nn.Module):
                 device=xs.device,
             )
 
-            match self.noise_level:
-                case "random_independent":  # independent noise levels (Diffusion Forcing)
+            if self.hierarchical_noise_enabled:
+                feature_dim = xs.shape[-1]
+                phase1_mask = self._phase1_feature_mask.to(xs.device)
+                phase2_mask = self._phase2_feature_mask.to(xs.device)
+
+                phase1_max_ratio = float(self.hierarchical_noise_cfg.get("phase1_max_ratio", 0.5))
+                phase2_min_ratio = float(self.hierarchical_noise_cfg.get("phase2_min_ratio", 0.0))
+                phase1_max = max(0, min(self.timesteps - 1, int(round((self.timesteps - 1) * phase1_max_ratio))))
+                phase2_min = max(0, min(self.timesteps - 1, int(round((self.timesteps - 1) * phase2_min_ratio))))
+
+                def _rand_range(shape, low: int, high_exclusive: int):
+                    high_exclusive = max(low + 1, high_exclusive)
+                    return torch.randint(low, high_exclusive, shape, device=xs.device)
+
+                if self.noise_level == "random_independent":
+                    p1 = _rand_range((batch_size, n_tokens), 0, phase1_max + 1)
+                    p2 = _rand_range((batch_size, n_tokens), phase2_min, self.timesteps)
+                elif self.noise_level == "random_uniform":
+                    p1 = _rand_range((batch_size, 1), 0, phase1_max + 1).repeat(1, n_tokens)
+                    p2 = _rand_range((batch_size, 1), phase2_min, self.timesteps).repeat(1, n_tokens)
+                else:
+                    raise ValueError(f"Unknown noise level mode: {self.noise_level}")
+
+                noise_levels = p2.unsqueeze(-1).repeat(1, 1, feature_dim)
+                if phase1_mask.any():
+                    noise_levels[..., phase1_mask] = p1.unsqueeze(-1)
+                if phase2_mask.any():
+                    noise_levels[..., phase2_mask] = p2.unsqueeze(-1)
+            else:
+                if self.noise_level == "random_independent":  # independent noise levels (Diffusion Forcing)
                     noise_levels = rand_fn((batch_size, n_tokens))
-                case "random_uniform":  # uniform noise levels (Typical Video Diffusion)
+                elif self.noise_level == "random_uniform":  # uniform noise levels (Typical Video Diffusion)
                     noise_levels = rand_fn((batch_size, 1)).repeat(1, n_tokens)
+                else:
+                    raise ValueError(f"Unknown noise level mode: {self.noise_level}")
 
             if self.uniform_future:  # simplified training (Appendix A.5)
-                noise_levels = rand_fn((batch_size, 1)).repeat(
-                    1, n_tokens
-                )
+                if noise_levels.ndim == 3:
+                    noise_levels = rand_fn((batch_size, 1, noise_levels.shape[-1])).repeat(
+                        1, n_tokens, 1
+                    )
+                else:
+                    noise_levels = rand_fn((batch_size, 1)).repeat(
+                        1, n_tokens
+                    )
 
             # treat frames that are not available as "full noise"
             if masks is not None:
+                valid_tokens = reduce(masks.bool(), "b t ... -> b t", torch.any)
+                valid_tokens = valid_tokens.unsqueeze(-1) if noise_levels.ndim == 3 else valid_tokens
                 noise_levels = torch.where(
-                    reduce(masks.bool(), "b t ... -> b t", torch.any),
+                    valid_tokens,
                     noise_levels,
                     torch.full_like(
                         noise_levels,
@@ -332,6 +512,12 @@ class DFoTTrajectory(nn.Module):
         keyframe decides whether it's "full" (all features known) or "partial"
         (only certain feature groups known, chosen randomly per group).
 
+        Supports forced extreme conditioning regimes (config-controlled):
+          - force_all_known_prob: with this probability, *all* frames become
+            full keyframes (model must reconstruct from fully-known input).
+          - force_near_empty_prob: with this probability, only one random
+            feature group at one random frame is kept (near-empty conditioning).
+
         Returns:
             waypoint_mask: (B, T, D) bool — True = known/clean, False = to be predicted
         """
@@ -340,38 +526,73 @@ class DFoTTrajectory(nn.Module):
         partial_enabled = partial_cfg.get("enabled", False)
         partial_prob = partial_cfg.get("prob", 0.5)
 
-        # Step 1: Frame-level keyframe selection
-        frame_mask = self._generate_inbetweening_mask(B, T, device)  # (B, T) bool
+        # ── Forced extreme conditioning ─────────────────────────────
+        force_all_known_prob = cfg.get("force_all_known_prob", 0.0)
+        force_near_empty_prob = cfg.get("force_near_empty_prob", 0.0)
 
-        if not partial_enabled:
-            # All waypoints are full keyframes (all features known)
-            return frame_mask.unsqueeze(-1).expand(-1, -1, D).clone()
+        extreme_roll = torch.rand(B, device=device)
+        all_known_mask = extreme_roll < force_all_known_prob
+        near_empty_mask = (
+            ~all_known_mask
+            & (extreme_roll < force_all_known_prob + force_near_empty_prob)
+        )
+        normal_mask = ~all_known_mask & ~near_empty_mask
 
-        # Step 2: For each keyframe, decide full vs partial
-        is_partial = (torch.rand(B, T, device=device) < partial_prob) & frame_mask
-
-        # Force first/last to be full keyframes if configured
-        if cfg.get("always_keep_first", True):
-            is_partial[:, 0] = False
-        if cfg.get("keep_last_partial", False) and T > 0:
-            is_partial[:, -1] = True
-
-        is_full = frame_mask & ~is_partial
-
-        # Step 3: Build feature mask
         waypoint_mask = torch.zeros(B, T, D, dtype=torch.bool, device=device)
 
-        # Full keyframes: all features known
-        waypoint_mask = waypoint_mask | is_full.unsqueeze(-1)  # broadcast (B,T,1) -> (B,T,D)
+        # --- All-known samples: every frame fully conditioned ---
+        if all_known_mask.any():
+            waypoint_mask[all_known_mask] = True
 
-        # Partial keyframes: per-group random keep
-        if is_partial.any():
-            for group_name, slices in self.feature_group_slices.items():
-                keep_prob = self.group_keep_probs.get(group_name, 0.5)
-                keep_group = (torch.rand(B, T, device=device) < keep_prob) & is_partial
-                for s in slices:
-                    width = s.stop - s.start
-                    waypoint_mask[:, :, s] |= keep_group.unsqueeze(-1).expand(-1, -1, width)
+        # --- Near-empty samples: 1 random group at 1 random frame ---
+        if near_empty_mask.any() and self.feature_group_slices:
+            group_names = list(self.feature_group_slices.keys())
+            n_empty = near_empty_mask.sum().item()
+            # Pick random group for each near-empty sample
+            g_idx = torch.randint(0, len(group_names), (n_empty,))
+            # Pick random frame for each near-empty sample
+            t_idx = torch.randint(0, T, (n_empty,))
+            empty_indices = near_empty_mask.nonzero(as_tuple=True)[0]
+            for i in range(n_empty):
+                b_i = empty_indices[i].item()
+                t_i = t_idx[i].item()
+                g_name = group_names[g_idx[i].item()]
+                for s in self.feature_group_slices[g_name]:
+                    waypoint_mask[b_i, t_i, s] = True
+
+        # --- Normal samples: standard keyframe + partial logic ---
+        if normal_mask.any():
+            normal_indices = normal_mask.nonzero(as_tuple=True)[0]
+            n_normal = normal_indices.shape[0]
+
+            # Step 1: Frame-level keyframe selection (only for normal samples)
+            frame_mask = self._generate_inbetweening_mask(n_normal, T, device)  # (n_normal, T)
+
+            if not partial_enabled:
+                waypoint_mask[normal_indices] = frame_mask.unsqueeze(-1).expand(-1, -1, D)
+            else:
+                # Step 2: full vs partial
+                is_partial = (torch.rand(n_normal, T, device=device) < partial_prob) & frame_mask
+                if cfg.get("always_keep_first", True):
+                    is_partial[:, 0] = False
+                if cfg.get("keep_last_partial", False) and T > 0:
+                    is_partial[:, -1] = True
+                is_full = frame_mask & ~is_partial
+
+                # Full keyframes
+                normal_wm = torch.zeros(n_normal, T, D, dtype=torch.bool, device=device)
+                normal_wm = normal_wm | is_full.unsqueeze(-1)
+
+                # Partial keyframes
+                if is_partial.any():
+                    for group_name, slices in self.feature_group_slices.items():
+                        keep_prob = self.group_keep_probs.get(group_name, 0.5)
+                        keep_group = (torch.rand(n_normal, T, device=device) < keep_prob) & is_partial
+                        for s in slices:
+                            width = s.stop - s.start
+                            normal_wm[:, :, s] |= keep_group.unsqueeze(-1).expand(-1, -1, width)
+
+                waypoint_mask[normal_indices] = normal_wm
 
         return waypoint_mask
 
@@ -453,7 +674,8 @@ class DFoTTrajectory(nn.Module):
             h = h + indicator
 
         # 3. Condition embedding (same as DiT1D.forward)
-        c = backbone.noise_level_pos_embedding(k)
+        model_k = self.diffusion_model.get_model_noise_levels(k)
+        c = backbone.noise_level_pos_embedding(model_k)
         if external_cond is not None:
             c = c + backbone.external_cond_embedding(external_cond, external_cond_mask)
 
@@ -507,31 +729,51 @@ class DFoTTrajectory(nn.Module):
         )
         c_coeff = (1 - alpha_next - sigma**2).sqrt()
 
-        alpha = dm.add_shape_channels(alpha)
-        alpha_next = dm.add_shape_channels(alpha_next)
-        c_coeff = dm.add_shape_channels(c_coeff)
-        sigma = dm.add_shape_channels(sigma)
+        alpha = dm.expand_to_x(alpha, x)
+        alpha_next = dm.expand_to_x(alpha_next, x)
+        c_coeff = dm.expand_to_x(c_coeff, x)
+        sigma = dm.expand_to_x(sigma, x)
 
-        # Conditional prediction (with indicator)
-        pred_cond = self._model_predictions_with_indicator(
-            x, clipped_curr, external_cond, external_cond_mask=None,
-            waypoint_mask=waypoint_mask,
-        )
+        if cfg_w == 1.0:
+            pred = self._model_predictions_with_indicator(
+                x, clipped_curr, external_cond, external_cond_mask=None,
+                waypoint_mask=waypoint_mask,
+            )
+            x_start = pred.pred_x_start
+            pred_noise = pred.pred_noise
+        else:
+            # Batched CFG: cond + uncond in one forward pass
+            if external_cond is not None:
+                if external_cond_mask is None:
+                    masked_ext = torch.zeros_like(external_cond)
+                else:
+                    masked_ext = (~external_cond_mask).float() * external_cond
+            else:
+                masked_ext = None
+            B = x.shape[0]
+            x_double = torch.cat([x, x], dim=0)
+            k_double = torch.cat([clipped_curr, clipped_curr], dim=0)
+            cond_double = (
+                torch.cat([external_cond, masked_ext], dim=0)
+                if external_cond is not None else None
+            )
+            wp_double = (
+                torch.cat([waypoint_mask, waypoint_mask], dim=0)
+                if waypoint_mask is not None else None
+            )
 
-        # Unconditional prediction (with indicator but masked external cond)
-        masked_ext = external_cond_mask * external_cond if external_cond is not None else None
-        pred_uncond = self._model_predictions_with_indicator(
-            x, clipped_curr, masked_ext, external_cond_mask=None,
-            waypoint_mask=waypoint_mask,
-        )
+            pred_both = self._model_predictions_with_indicator(
+                x_double, k_double, cond_double, external_cond_mask=None,
+                waypoint_mask=wp_double,
+            )
 
-        # CFG
-        x_start = pred_uncond.pred_x_start + cfg_w * (
-            pred_cond.pred_x_start - pred_uncond.pred_x_start
-        )
-        pred_noise = pred_uncond.pred_noise + cfg_w * (
-            pred_cond.pred_noise - pred_uncond.pred_noise
-        )
+            # First B = conditional, last B = unconditional
+            x_start = pred_both.pred_x_start[B:] + cfg_w * (
+                pred_both.pred_x_start[:B] - pred_both.pred_x_start[B:]
+            )
+            pred_noise = pred_both.pred_noise[B:] + cfg_w * (
+                pred_both.pred_noise[:B] - pred_both.pred_noise[B:]
+            )
 
         if cfg_w > 1.0:
             s = torch.quantile(torch.abs(x_start).flatten(1), 0.995, dim=1)
@@ -544,7 +786,7 @@ class DFoTTrajectory(nn.Module):
 
         # Only update frames where noise level decreases
         mask = curr_noise_level == next_noise_level
-        x_pred = torch.where(dm.add_shape_channels(mask), x, x_pred)
+        x_pred = torch.where(dm.expand_to_x(mask, x), x, x_pred)
         return x_pred
 
     #### ============== ####
@@ -560,6 +802,135 @@ class DFoTTrajectory(nn.Module):
 
         return loss
 
+    # ------------------------------------------------------------------
+    # Auxiliary losses (computed on predicted clean trajectory x_pred)
+    # ------------------------------------------------------------------
+
+    def compute_auxiliary_losses(
+        self, x_pred: torch.Tensor, x_gt: torch.Tensor, masks: torch.Tensor
+    ) -> dict:
+        """Compute optional auxiliary losses on the predicted clean trajectory.
+
+        All losses are returned as *scalar* tensors (already reduced) so they
+        can be summed into the main objective with per-loss weight coefficients.
+
+        Args:
+            x_pred: (B, T, D) predicted clean x0 in feature space.
+            x_gt:   (B, T, D) ground-truth trajectory.
+            masks:  (B, T) boolean validity mask.
+
+        Returns:
+            dict  {loss_name: scalar tensor}  (empty if nothing is enabled).
+        """
+        aux = {}
+        tcfg = self.training_config or {}
+        fim = self.feature_index_map  # e.g. {"joints": slice(6,35), ...}
+
+        # Helper: frame-pair mask for consecutive-frame losses (B, T-1)
+        if masks is not None and masks.shape[1] > 1:
+            pair_mask = (masks[:, :-1] & masks[:, 1:]).float()   # (B, T-1)
+        else:
+            pair_mask = None
+
+        # ---- 1. Temporal smoothness loss ----
+        # Penalise large frame-to-frame changes in x_pred (encourages smooth
+        # trajectories).  Applied to all features by default, but can be
+        # restricted to specific groups via config.
+        w_smooth = tcfg.get("smoothness_loss_weight", 0.0)
+        if w_smooth > 0.0 and x_pred.shape[1] > 1:
+            diff_pred = x_pred[:, 1:] - x_pred[:, :-1]  # (B, T-1, D)
+            diff_gt   = x_gt[:, 1:]   - x_gt[:, :-1]
+
+            smooth_groups = tcfg.get("smoothness_feature_groups", None)
+            if smooth_groups and fim:
+                # Only apply to listed groups
+                slices = [fim[g] for g in smooth_groups if g in fim]
+                if slices:
+                    sel = torch.cat(
+                        [diff_pred[..., s] for s in slices], dim=-1
+                    )
+                    sel_gt = torch.cat(
+                        [diff_gt[..., s] for s in slices], dim=-1
+                    )
+                else:
+                    sel, sel_gt = diff_pred, diff_gt
+            else:
+                sel, sel_gt = diff_pred, diff_gt
+
+            # MSE between predicted and true consecutive differences
+            smooth_loss = F.mse_loss(sel, sel_gt, reduction="none")
+            if pair_mask is not None:
+                smooth_loss = smooth_loss * pair_mask.unsqueeze(-1)
+                smooth_loss = smooth_loss.sum() / (pair_mask.sum() * sel.shape[-1] + 1e-8)
+            else:
+                smooth_loss = smooth_loss.mean()
+            aux["smoothness"] = w_smooth * smooth_loss
+
+        # ---- 2. Object grasping consistency loss ----
+        # During carry phases (object close to body), obj_rel_pos should stay
+        # stable.  We penalise large frame-to-frame changes in obj_rel_pos
+        # weighted by a soft "grasp gate" = sigmoid(-dist + threshold).
+        w_grasp = tcfg.get("grasp_consistency_loss_weight", 0.0)
+        if w_grasp > 0.0 and "obj_rel_pos" in fim and x_pred.shape[1] > 1:
+            rel_sl = fim["obj_rel_pos"]                          # slice(42, 45)
+            pred_rel = x_pred[..., rel_sl]                       # (B, T, 3)
+            gt_rel   = x_gt[..., rel_sl]
+
+            # Grasp gate: use GT relative distance so the gate is stable
+            dist_gt = gt_rel.norm(dim=-1, keepdim=True)          # (B, T, 1)
+            grasp_thresh = tcfg.get("grasp_distance_threshold", 0.35)
+            # Soft gate: 1 when object is close, 0 when far
+            gate = torch.sigmoid(5.0 * (grasp_thresh - dist_gt)) # (B, T, 1)
+
+            delta_pred = pred_rel[:, 1:] - pred_rel[:, :-1]     # (B, T-1, 3)
+            delta_gt   = gt_rel[:, 1:]   - gt_rel[:, :-1]
+            gate_pairs = torch.minimum(gate[:, 1:], gate[:, :-1]) # conservative
+
+            grasp_loss = F.mse_loss(delta_pred, delta_gt, reduction="none") * gate_pairs
+            if pair_mask is not None:
+                grasp_loss = grasp_loss * pair_mask.unsqueeze(-1)
+                denom = (pair_mask.unsqueeze(-1) * gate_pairs).sum() + 1e-8
+                grasp_loss = grasp_loss.sum() / denom
+            else:
+                grasp_loss = (grasp_loss.sum()) / (gate_pairs.sum() + 1e-8)
+            aux["grasp_consistency"] = w_grasp * grasp_loss
+
+        # ---- 3. Feet-sliding proxy loss ----
+        # Without differentiable FK we use a joint-velocity proxy: penalise
+        # large ankle-joint velocity in the prediction when the GT also has
+        # low ankle velocity (i.e., stance phases).
+        # Ankle indices inside the 29-joint block:
+        #   left ankle  pitch/roll → 4, 5
+        #   right ankle pitch/roll → 10, 11
+        w_feet = tcfg.get("feet_sliding_loss_weight", 0.0)
+        if w_feet > 0.0 and "joints" in fim and x_pred.shape[1] > 1:
+            j_sl = fim["joints"]  # slice(6, 35)
+            ankle_local = [4, 5, 10, 11]  # indices within 29-joint block
+            ankle_global = [j_sl.start + i for i in ankle_local]
+
+            pred_ankles = x_pred[..., ankle_global]              # (B, T, 4)
+            gt_ankles   = x_gt[..., ankle_global]
+
+            vel_pred = pred_ankles[:, 1:] - pred_ankles[:, :-1]  # (B, T-1, 4)
+            vel_gt   = gt_ankles[:, 1:]   - gt_ankles[:, :-1]
+
+            # Stance gate: GT ankle velocity is small → foot likely on ground
+            vel_gt_mag = vel_gt.abs()
+            stance_thresh = tcfg.get("stance_velocity_threshold", 0.02)
+            stance_gate = (vel_gt_mag < stance_thresh).float()   # (B, T-1, 4)
+
+            # Penalise predicted ankle velocity during GT stance
+            feet_loss = (vel_pred ** 2) * stance_gate
+            if pair_mask is not None:
+                feet_loss = feet_loss * pair_mask.unsqueeze(-1)
+                denom = (pair_mask.unsqueeze(-1) * stance_gate).sum() + 1e-8
+                feet_loss = feet_loss.sum() / denom
+            else:
+                feet_loss = feet_loss.sum() / (stance_gate.sum() + 1e-8)
+            aux["feet_sliding"] = w_feet * feet_loss
+
+        return aux
+
     def forward(self, x, model_cond=None, masks=None, timesteps=None):
         """
         Forward pass for training.
@@ -574,6 +945,8 @@ class DFoTTrajectory(nn.Module):
         
         state_cond = None
         task_cond = None
+        style_cond = None
+        phase1_cond = None
 
         if model_cond is not None:
             if isinstance(model_cond, (list, tuple)):
@@ -584,6 +957,12 @@ class DFoTTrajectory(nn.Module):
                 if self.task_condition:
                     if len(model_cond) > idx: task_cond = model_cond[idx]
                     idx += 1
+                if self.style_condition:
+                    if len(model_cond) > idx: style_cond = model_cond[idx]
+                    idx += 1
+                if self.phase1_condition:
+                    if len(model_cond) > idx: phase1_cond = model_cond[idx]
+                    idx += 1
 
             else:
                 # Single condition provided
@@ -591,12 +970,18 @@ class DFoTTrajectory(nn.Module):
                     state_cond = model_cond
                 elif self.task_condition:
                     task_cond = model_cond
+                elif self.style_condition:
+                    style_cond = model_cond
+                elif self.phase1_condition:
+                    phase1_cond = model_cond
         
         cond_list = []
         if self.state_condition and state_cond is not None:
             s_cond = self.state_embedding(state_cond) 
             if s_cond.ndim == 2:
-                s_cond = s_cond.unsqueeze(1)
+                s_cond = s_cond.unsqueeze(1)            # (B, 1, hidden)
+            # Aggregate multi-frame history → single conditioning token
+            s_cond = self.history_aggregator(s_cond)    # (B, 1, hidden)
             s_cond = apply_condition_dropout(
                 s_cond, 
                 self.training_config.get("condition_dropout_prob", {}).get("state", 0.0),
@@ -611,6 +996,24 @@ class DFoTTrajectory(nn.Module):
                 self.training_config.get("condition_dropout_prob", {}).get("task", 0.0),
             )
             cond_list.append(t_cond)
+        if self.style_condition and style_cond is not None:
+            st_cond = self.style_embedding(style_cond)
+            if st_cond.ndim == 2:
+                st_cond = st_cond.unsqueeze(1)
+            st_cond = apply_condition_dropout(
+                st_cond,
+                self.training_config.get("condition_dropout_prob", {}).get("style", 0.0),
+            )
+            cond_list.append(st_cond)
+        if self.phase1_condition and phase1_cond is not None:
+            p1_cond = self.phase1_embedding(phase1_cond)
+            if p1_cond.ndim == 2:
+                p1_cond = p1_cond.unsqueeze(1)
+            p1_cond = apply_condition_dropout(
+                p1_cond,
+                self.training_config.get("condition_dropout_prob", {}).get("phase1", 0.0),
+            )
+            cond_list.append(p1_cond)
 
         ext_cond = None
         if cond_list:
@@ -641,13 +1044,15 @@ class DFoTTrajectory(nn.Module):
             partially_known = waypoint_mask.any(dim=-1) & ~fully_known  # (B, T)
 
             # Fully-known frames → noise_level = 0 (clean signal to model)
-            k = torch.where(fully_known, torch.zeros_like(k), k)
+            full_mask = fully_known.unsqueeze(-1) if k.ndim == 3 else fully_known
+            k = torch.where(full_mask, torch.zeros_like(k), k)
 
             # Partially-known frames → intermediate noise level
             if partially_known.any():
                 max_wp_k = max(int(self.waypoint_noise_fraction * self.timesteps), 1)
                 wp_k = torch.randint(0, max_wp_k, k.shape, device=k.device)
-                k = torch.where(partially_known, wp_k, k)
+                partial_mask = partially_known.unsqueeze(-1) if k.ndim == 3 else partially_known
+                k = torch.where(partial_mask, wp_k, k)
 
         # --- Forward diffusion: q_sample ---
         noise = torch.randn_like(x)
@@ -689,20 +1094,33 @@ class DFoTTrajectory(nn.Module):
         loss_weight = self.diffusion_model.compute_loss_weights(
             k, self.diffusion_model.loss_weighting.strategy
         )
-        loss_weight = self.diffusion_model.add_shape_channels(loss_weight)
+        loss_weight = self.diffusion_model.expand_to_x(loss_weight, loss)
         loss = loss * loss_weight
 
-        # Zero out loss on known/pinned features so the model isn't
-        # penalised for predicting clean data it was given (esp. k=0 frames
-        # where the v-prediction target is pure noise → random loss).
-        fully_known = waypoint_mask.all(dim=-1)  # (B, T)
-        if fully_known.any():
-            loss = loss * (~fully_known).float().unsqueeze(-1)  
+        # Zero out loss on pinned features so the model isn't penalised for
+        # predicting values it was given as input (esp. k=0 full keyframes
+        # where the v-prediction target is pure noise → arbitrary loss, and
+        # partial waypoints where only the *known* features are injected).
+        #
+        #   • Full keyframes  (all features known)  → zero entire token's loss
+        #   • Partial keyframes (some features known) → zero only those features
+        #     The unknown features in a partial keyframe still contribute to loss.
+        if waypoint_mask is not None and waypoint_mask.any():
+            # Per-feature mask (B,T,D): True where feature was pinned/given.
+            # ~waypoint_mask → True where unknown (keep loss), False where known (zero loss).
+            # This correctly handles:
+            #   - Fully known frames:    all D features True  → all loss zeroed
+            #   - Partially known frames: only known features → only those zeroed
+            #   - Unknown frames:         all D features False → full loss kept
+            loss = loss * (~fully_known.unsqueeze(-1)).float()
 
         # Apply frame-level validity masks
         loss = self._reweight_loss(loss, masks)
 
-        return {"loss": loss, "xs_pred": x_pred, "xs": x}
+        # Compute optional auxiliary losses on the predicted clean trajectory
+        aux_losses = self.compute_auxiliary_losses(x_pred, x, masks)
+
+        return {"loss": loss, "xs_pred": x_pred, "xs": x, "aux_losses": aux_losses}
 
     def sample(self, num_trajectories, model_cond=None, cfg_w=0.0, guidance_wt=1.0, guidance_goal=None, inpaint=False, no_state_cond=False, waypoint_values=None, waypoint_mask=None):
         """
@@ -712,6 +1130,8 @@ class DFoTTrajectory(nn.Module):
         """
         state_cond_input = None
         task_cond = None
+        style_cond = None
+        phase1_cond = None
 
         if isinstance(model_cond, (list, tuple)):
             # Flatten list if nested
@@ -729,16 +1149,30 @@ class DFoTTrajectory(nn.Module):
             if len(flat_cond) > idx and self.task_condition:
                 task_cond = flat_cond[idx]
                 idx += 1
+            if len(flat_cond) > idx and self.style_condition:
+                style_cond = flat_cond[idx]
+                idx += 1
+            if len(flat_cond) > idx and self.phase1_condition:
+                phase1_cond = flat_cond[idx]
+                idx += 1
         else:
             if self.state_condition:
                 state_cond_input = model_cond
             elif self.task_condition:
                 task_cond = model_cond
+            elif self.style_condition:
+                style_cond = model_cond
+            elif self.phase1_condition:
+                phase1_cond = model_cond
 
         cond_list = []
         if self.state_condition and state_cond_input is not None:
             self.state_cond = state_cond_input
-            s_cond = self.state_embedding(state_cond_input) # (B, C)
+            s_cond = self.state_embedding(state_cond_input) # (B, H, hidden) or (B, hidden)
+            if s_cond.ndim == 2:
+                s_cond = s_cond.unsqueeze(1)                # (B, 1, hidden)
+            # Aggregate multi-frame history → single conditioning token
+            s_cond = self.history_aggregator(s_cond)         # (B, 1, hidden)
             if no_state_cond:
                 s_cond = apply_condition_dropout(
                     s_cond, 
@@ -749,6 +1183,12 @@ class DFoTTrajectory(nn.Module):
             self.task_cond = task_cond
             t_cond = self.task_embedding(task_cond) # (B, D)
             cond_list.append(t_cond)
+        if self.style_condition and style_cond is not None:
+            st_cond = self.style_embedding(style_cond)
+            cond_list.append(st_cond)
+        if self.phase1_condition and phase1_cond is not None:
+            p1_cond = self.phase1_embedding(phase1_cond)
+            cond_list.append(p1_cond)
         
         # If we have external conditions (init_cond), pass them as conditions
         conditions = None
@@ -808,32 +1248,77 @@ class DFoTTrajectory(nn.Module):
         
         return noise_level
 
+    def _generate_hierarchical_two_phase_scheduling_matrix(
+        self,
+        horizon: int,
+    ) -> torch.Tensor:
+        """Create an (M, T, D) schedule where phase-1 features finish early."""
+        K = self.sampling_timesteps
+        M = K + 1
+        phase1_end_ratio = float(self.hierarchical_schedule_cfg.get("phase1_end_ratio", 0.5))
+        phase1_end_step = max(1, min(K, int(round(K * phase1_end_ratio))))
+
+        steps = np.arange(M)
+        phase2_idx = np.clip(K - steps, 0, K)
+        phase1_idx = np.where(
+            steps <= phase1_end_step,
+            np.clip(K - np.rint(steps * K / phase1_end_step).astype(np.int64), 0, K),
+            0,
+        )
+
+        phase1_curve = np.repeat(phase1_idx[:, None], horizon, axis=1)
+        phase2_curve = np.repeat(phase2_idx[:, None], horizon, axis=1)
+
+        D = self.x_shape[0]
+        out_idx = np.repeat(phase2_curve[:, :, None], D, axis=2)
+        phase1_mask = self._phase1_feature_mask.cpu().numpy()
+        if phase1_mask.any():
+            out_idx[:, :, phase1_mask] = phase1_curve[:, :, None]
+
+        scheduling_matrix = torch.from_numpy(out_idx).long()
+        scheduling_matrix = self.diffusion_model.ddim_idx_to_noise_level(scheduling_matrix)
+        return scheduling_matrix
+
     def _generate_scheduling_matrix(
         self,
         horizon: int,
         padding: int = 0,
     ):
-        if self.scheduling_matrix == "full_sequence":
+        if self.scheduling_matrix == "hierarchical_two_phase" or self.hierarchical_schedule_enabled:
+            scheduling_matrix = self._generate_hierarchical_two_phase_scheduling_matrix(horizon)
+        elif self.scheduling_matrix == "full_sequence":
             scheduling_matrix = np.arange(self.sampling_timesteps, -1, -1)[
                 :, None
             ].repeat(horizon, axis=1)
+            scheduling_matrix = torch.from_numpy(scheduling_matrix).long()
+            scheduling_matrix = self.diffusion_model.ddim_idx_to_noise_level(
+                scheduling_matrix
+            )
         elif self.scheduling_matrix == "autoregressive":
              scheduling_matrix = self._generate_pyramid_scheduling_matrix(
                  horizon, self.sampling_timesteps
              )
+             scheduling_matrix = torch.from_numpy(scheduling_matrix).long()
+             scheduling_matrix = self.diffusion_model.ddim_idx_to_noise_level(
+                 scheduling_matrix
+             )
         else:
              raise ValueError(f"Unknown scheduling matrix type: {self.scheduling_matrix}")
-        
-        scheduling_matrix = torch.from_numpy(scheduling_matrix).long()
-
-        scheduling_matrix = self.diffusion_model.ddim_idx_to_noise_level(
-            scheduling_matrix
-        )
 
         # paded entries are labeled as pure noise
-        scheduling_matrix = F.pad(
-            scheduling_matrix, (0, padding, 0, 0), value=self.timesteps - 1
-        )
+        if padding > 0:
+            if scheduling_matrix.ndim == 2:
+                scheduling_matrix = F.pad(
+                    scheduling_matrix, (0, padding, 0, 0), value=self.timesteps - 1
+                )
+            else:
+                pad_vals = torch.full(
+                    (scheduling_matrix.shape[0], padding, scheduling_matrix.shape[2]),
+                    self.timesteps - 1,
+                    dtype=scheduling_matrix.dtype,
+                    device=scheduling_matrix.device,
+                )
+                scheduling_matrix = torch.cat([scheduling_matrix, pad_vals], dim=1)
 
         return scheduling_matrix
 
@@ -876,7 +1361,10 @@ class DFoTTrajectory(nn.Module):
             init_sched = self._generate_scheduling_matrix(
                 horizon - padding, padding,
             ).to(xs_pred.device)
-            init_noise_levels = repeat(init_sched[0], "t -> b t", b=batch_size)
+            if init_sched.ndim == 2:
+                init_noise_levels = repeat(init_sched[0], "t -> b t", b=batch_size)
+            else:
+                init_noise_levels = repeat(init_sched[0], "t d -> b t d", b=batch_size)
             xs_pred = self._inject_waypoints(
                 xs_pred, waypoint_values, waypoint_mask,
                 noise_levels=init_noise_levels,
@@ -893,30 +1381,30 @@ class DFoTTrajectory(nn.Module):
             padding,
         )
         scheduling_matrix = scheduling_matrix.to(xs_pred.device)
-        scheduling_matrix = repeat(scheduling_matrix, "m t -> m b t", b=batch_size)
+        if scheduling_matrix.ndim == 2:
+            scheduling_matrix = repeat(scheduling_matrix, "m t -> m b t", b=batch_size)
+        else:
+            scheduling_matrix = repeat(scheduling_matrix, "m t d -> m b t d", b=batch_size)
     
         # prune scheduling matrix to remove identical adjacent rows
         diff = scheduling_matrix[1:] - scheduling_matrix[:-1]
-        skip = torch.argmax((~reduce(diff == 0, "m b t -> m", torch.all)).float())
+        skip = torch.argmax((~reduce(diff == 0, "m b ... -> m", torch.all)).float())
         scheduling_matrix = scheduling_matrix[skip:]
 
         record = [] if return_all else None
 
-        if pbar is None:
-            pbar = tqdm(
-                total=scheduling_matrix.shape[0] - 1,
-                initial=0,
-                desc="Sampling with DFoT",
-                leave=False,
-            )
-
+        # Avoid creating tqdm by default in cluster inference paths.
+        # Caller may still pass a custom progress object with update().
+        f_map = self.feature_index_map
+        obs_f_map = self.obs_feature_index_map
         for m in range(scheduling_matrix.shape[0] - 1):
             from_noise_levels = scheduling_matrix[m]
             to_noise_levels = scheduling_matrix[m + 1]
 
             # update context mask by changing 0 -> 2 for fully generated tokens
+            finished_tokens = reduce(from_noise_levels == -1, "b t ... -> b t", torch.all)
             context_mask = torch.where(
-                torch.logical_and(context_mask == 0, from_noise_levels == -1),
+                torch.logical_and(context_mask == 0, finished_tokens),
                 2,
                 context_mask,
             )
@@ -991,14 +1479,20 @@ class DFoTTrajectory(nn.Module):
                             )
                 
             if inpaint:
-                f_map = get_feature_indices(build_feature_layout())
-                xs_pred[..., 0, f_map['joints']] = self.state_cond[..., 0, :29]
-                xs_pred[..., 0, f_map['body_z']] = self.state_cond[..., 0, 29:30]
-                xs_pred[..., 0, f_map['body_rot6d']] = self.state_cond[..., 0, 30:36]
-                xs_pred[..., 0, f_map['obj_rel_pos']] = self.state_cond[..., 0, 36:39]
-                xs_pred[..., 0, f_map['obj_rel_rot6d']] = self.state_cond[..., 0, 39:45]
+                # Pin t=0 of the output window to the current (most recent) history frame.
+                # state_cond is (B, H, obs_dim); index -1 is the latest observation.
+                _cur = self.state_cond[..., -1, :]  # (B, obs_dim)
+                for key in ("joints", "body_z", "body_rot6d", "obj_rel_pos", "obj_rel_rot6d"):
+                    x_sl = f_map.get(key)
+                    obs_sl = obs_f_map.get(key)
+                    if x_sl is None or obs_sl is None:
+                        continue
+                    if (x_sl.stop - x_sl.start) != (obs_sl.stop - obs_sl.start):
+                        continue
+                    xs_pred[..., 0, x_sl] = _cur[..., obs_sl]
             
-            pbar.update(1)
+            if pbar is not None:
+                pbar.update(1)
 
         if return_all:
             record.append(xs_pred.clone())

@@ -1,4 +1,5 @@
 import argparse
+import random
 
 from matplotlib.pylab import cond, sample
 import torch
@@ -8,9 +9,7 @@ from torch.nn import functional as F
 from torch.utils.data import DataLoader, WeightedRandomSampler
 from torch.utils.tensorboard import SummaryWriter
 from torch.amp import GradScaler
-from tqdm import tqdm
 from matplotlib import pyplot as plt
-from tqdm import tqdm
 import os
 import yaml
 import mujoco
@@ -18,9 +17,24 @@ import mujoco
 from diffusers import EMAModel
 from datasets import BufferDataset, ConditionalStateDataset
 from models.model import RobotDiffuser
-from config.configure import load_config, get_data_path, get_save_path, get_log_path, get_norm_path
+from config.configure import load_config, get_data_path, get_save_path, get_log_path, get_norm_path, get_mj_xml_paths
 from utils.data.load_dataset import preload_dataset
-from utils.math.sbto_utils import build_feature_layout, get_feature_indices
+from utils.two_phase import resolve_two_phase_cfg, apply_phase_to_configs
+
+
+# ===============================
+# Reproducibility
+# ===============================
+def seed_everything(seed: int):
+    """Seed all RNGs for reproducible training."""
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+    # Deterministic algorithms may be slower but guarantee reproducibility
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
+    print(f"All RNGs seeded with seed={seed}")
 
 # ===============================
 # Helper Functions
@@ -52,7 +66,7 @@ def compute_dataset_weights(dataset, sigma=0.2):
     tp_list = []
     key_list = []
         
-    for f, b in tqdm(unique_traj_keys, desc="Extracting Task Params"):
+    for f, b in unique_traj_keys:
         raw = dataset._get_single_traj(f, b)
         tp_raw = dataset._compute_task_params(raw['base'], raw['obj'], start_idx=0)
         
@@ -122,11 +136,7 @@ def check_physical_consistency(
     _FLOOR_Z = -0.1
     _MAX_DXY =  0.2  # m / frame at 100 Hz
 
-    layout = build_feature_layout(
-        has_vel=data_cfg.get("has_vel", False),
-        has_obj_delta_xy=data_cfg.get("has_obj_delta_xy", True),
-        has_obj_z=data_cfg.get("has_obj_z", True),
-    )
+    layout = build_feature_layout()
     feat_idx   = get_feature_indices(layout)
     body_z_col = feat_idx["body_z"].start
     dxy_sl     = feat_idx["delta_xy"]                          # slice(0, 2)
@@ -195,18 +205,33 @@ def check_physical_consistency(
 # ===============================
 parser = argparse.ArgumentParser(description="Clean Inference & Stitching Pipeline")
 parser.add_argument("--resume", type=int, default=None, help="Resume from checkpoint epoch (int)")
-parser.add_argument("--save_every", type=int, default=50, help="Save checkpoint every N epochs")
-parser.add_argument("--eval_every", type=int, default=20,
-                    help="Run generative physics eval every N epochs (0 = disable, default: 20)")
-parser.add_argument("--num_eval_samples", type=int, default=32,
-                    help="Number of dataset samples to use for each physics eval (default: 32)")
+parser.add_argument("--save_every", type=int, default=None, help="Save checkpoint every N epochs")
+parser.add_argument("--seed", type=int, default=42, help="Random seed for reproducibility")
+parser.add_argument("--no_tensorboard", action="store_true", help="Disable TensorBoard logging")
+parser.add_argument("--config", type=str, default="config/config.yaml", help="Path to training config YAML")
+parser.add_argument("--phase", type=str, default="all", choices=["all", "phase1", "phase2"], help="Train full model (all) or a specific two-phase model")
 
 args = parser.parse_args()
 
-with open("config/config.yaml", 'r') as file:
+# Seed everything for reproducibility
+seed_everything(args.seed)
+
+with open(args.config, 'r') as file:
     config = yaml.safe_load(file)
 
-model_cfg, data_cfg, training_cfg, noise_schedule_cfg = load_config("config/config.yaml", config.get("auto_conf", False))
+model_cfg, data_cfg, training_cfg, noise_schedule_cfg = load_config(args.config, config.get("auto_conf", False))
+
+two_phase_cfg = resolve_two_phase_cfg(config.get("two_phase", {}))
+if args.phase in ("phase1", "phase2"):
+    model_cfg, data_cfg, training_cfg, noise_schedule_cfg = apply_phase_to_configs(
+        model_cfg=model_cfg,
+        data_cfg=data_cfg,
+        training_cfg=training_cfg,
+        noise_cfg=noise_schedule_cfg,
+        phase=args.phase,
+        two_phase_cfg=two_phase_cfg,
+    )
+    print(f"Two-phase training override: phase={args.phase}, features={data_cfg.get('feature_order', [])}")
 
 save_dir = get_save_path(model_cfg, data_cfg, training_cfg)
 os.makedirs(save_dir, exist_ok=True)
@@ -235,6 +260,8 @@ else:
 
 state_condition = model_cfg.get("state_condition", False)
 task_condition = model_cfg.get("task_condition", False)
+style_condition = model_cfg.get("style_condition", False)
+phase1_condition = model_cfg.get("phase1_condition", False)
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
@@ -262,11 +289,13 @@ scaler = GradScaler()
 
 ema = EMAModel(
     diffuser.model.parameters(),
-    decay=0.9995,
-    update_after_step=0,
+    decay=training_cfg.get("ema_decay", 0.9995),
+    update_after_step=training_cfg.get("ema_update_after_step", 0),
 )
 
 starting_epoch = 0
+best_loss = float("inf")
+
 if args.resume is not None:
     starting_epoch = args.resume
     checkpoint = diffuser.loadWeights(starting_epoch)
@@ -279,7 +308,10 @@ if args.resume is not None:
             scaler.load_state_dict(checkpoint["scaler"])
         if "ema" in checkpoint:
             ema.load_state_dict(checkpoint["ema"])
-            print("Loaded EMA state from checkpoint.")
+            print("  Loaded EMA state from checkpoint.")
+        if "best_loss" in checkpoint:
+            best_loss = checkpoint["best_loss"]
+            print(f"  Restored best_loss = {best_loss:.6f}")
 
 if data_cfg.get("dataset_class", "flexible") == "conditional":
     dataset = ConditionalStateDataset(
@@ -296,14 +328,28 @@ elif data_cfg.get("dataset_class", "flexible") == "flexible":
         training_cfg=training_cfg,
     )
 
+if len(dataset) <= 0:
+    raise ValueError(
+        "Resolved dataset is empty (0 windows). "
+        f"data_path={data_path}, "
+        f"task_list_path={data_cfg.get('task_list_path')}, "
+        f"file_names={data_cfg.get('file_names')}. "
+        "Check that requested files exist for tasks in the task list "
+        "and that windowing params (num_timesteps/stride/downsample) are valid."
+    )
+
 sampler = None
 shuffle = True
+
+# Seeded generator for reproducible data ordering
+dl_generator = torch.Generator()
+dl_generator.manual_seed(args.seed)
 
 # Task Density Balancing
 if training_cfg.get("balance_task_density", True): # Default to True as requested
     weights = compute_dataset_weights(dataset, sigma=training_cfg.get("density_sigma", 0.2))
     if weights is not None:
-        sampler = WeightedRandomSampler(weights, len(weights))
+        sampler = WeightedRandomSampler(weights, len(weights), generator=dl_generator)
         shuffle = False
         print("WeightedRandomSampler activated (Balance Task Density).")
 
@@ -316,10 +362,11 @@ train_dataloader = DataLoader(
     pin_memory=True,
     persistent_workers=True,
     prefetch_factor=2,
+    generator=dl_generator if sampler is None else None,  # only used when shuffle=True
 )
 
 # Load MuJoCo
-xml_path = "./unitree_g1/mj_model.xml"
+xml_path, _ = get_mj_xml_paths()
 mj_model = mujoco.MjModel.from_xml_path(xml_path)
 mj_data = mujoco.MjData(mj_model)
 
@@ -332,7 +379,11 @@ window_size = 5
 
 log_dir = get_log_path(model_cfg, data_cfg, training_cfg)
 os.makedirs(log_dir, exist_ok=True)
-writer = SummaryWriter(log_dir=log_dir)
+is_cluster_run = any(k in os.environ for k in ["SLURM_JOB_ID", "PBS_JOBID", "LSB_JOBID"])
+use_tensorboard = (not args.no_tensorboard) and (not is_cluster_run)
+writer = SummaryWriter(log_dir=log_dir) if use_tensorboard else None
+if writer is None:
+    print("TensorBoard logging disabled (cluster run or --no_tensorboard).")
 
 # ===============================
 # Training Loop
@@ -347,11 +398,7 @@ best_phys_epoch      = -1
 for epoch in range(starting_epoch, num_epochs):
     epoch_losses = []
 
-    total_batches = training_cfg.get("batches_per_epoch", len(train_dataloader))
-    
-    pbar = tqdm(enumerate(train_dataloader), total=total_batches, desc=f"Epoch {epoch}/{num_epochs-1}")
-
-    for step, batch in pbar:
+    for step, batch in enumerate(train_dataloader):
         
         if training_cfg.get("batches_per_epoch", False) and step >= training_cfg["batches_per_epoch"]:
             break
@@ -368,12 +415,14 @@ for epoch in range(starting_epoch, num_epochs):
                     dims = [1] * item.dim()
                     dims[0] = repeats
                     new_batch.append(item.repeat(*dims)[:target_bs])
-            else:
+                else:
                     new_batch.append(item)
             batch = new_batch
 
         state_cond = None
-        task_cond = None    
+        task_cond = None
+        style_cond = None
+        phase1_cond = None
 
         # Unpack batch
         batch_data = list(batch)
@@ -388,11 +437,23 @@ for epoch in range(starting_epoch, num_epochs):
         if task_condition:
             task_cond = batch_data[idx].to(device)
             idx += 1
+
+        if style_condition:
+            if idx < len(batch_data) and isinstance(batch_data[idx], torch.Tensor):
+                style_cond = batch_data[idx].to(device)
+                idx += 1
+
+        if phase1_condition:
+            if idx < len(batch_data) and isinstance(batch_data[idx], torch.Tensor):
+                phase1_cond = batch_data[idx].to(device)
+                idx += 1
             
         # Construct cond for model
         cond = []
         if state_cond is not None: cond.append(state_cond)
         if task_cond is not None: cond.append(task_cond)
+        if style_cond is not None: cond.append(style_cond)
+        if phase1_cond is not None: cond.append(phase1_cond)
     
         model_cond = tuple(cond) if len(cond) > 0 else None
         if len(cond) == 1: model_cond = cond[0]
@@ -404,13 +465,27 @@ for epoch in range(starting_epoch, num_epochs):
         # ).long()
         timesteps = None
         with torch.autocast(device_type="cuda", dtype=torch.float32):
-            diff_output = diffuser.model(
-                prediction_target, 
-                model_cond, 
-                timesteps=timesteps, 
+            # ── Stitched rollout training ────────────────────────────
+            use_stitch = (
+                hasattr(diffuser.model, "stitch_enabled")
+                and diffuser.model.stitch_enabled
+                and torch.rand(1).item() < diffuser.model.get_stitch_prob(epoch)
             )
+            if use_stitch:
+                diff_output = diffuser.model.forward_stitched(
+                    prediction_target,
+                    model_cond,
+                    timesteps=timesteps,
+                )
+            else:
+                diff_output = diffuser.model(
+                    prediction_target, 
+                    model_cond, 
+                    timesteps=timesteps, 
+                )
             model_pred = diff_output["xs_pred"]
             pred_loss = diff_output["loss"]
+            aux_losses = diff_output.get("aux_losses", {})
 
             if model_pred.shape[-1] > 50 and training_cfg.get("geom_loss_weight", 0.0) > 0.0:
                 pred_ee_pos = model_pred[..., 50:56].reshape(*model_pred.shape[:-1], 2, 3)
@@ -424,7 +499,10 @@ for epoch in range(starting_epoch, num_epochs):
             else:
                 geom_loss = 0.0
 
-            loss = pred_loss.mean() + geom_loss
+            # Sum auxiliary losses (smoothness, grasp consistency, feet sliding)
+            aux_total = sum(aux_losses.values()) if aux_losses else 0.0
+
+            loss = pred_loss.mean() + geom_loss + aux_total
 
         optimizer.zero_grad()
         
@@ -449,20 +527,31 @@ for epoch in range(starting_epoch, num_epochs):
 
         # Step-wise logging
         global_step = epoch * len(train_dataloader) + step
-        writer.add_scalar("Loss/train_step", loss.item(), global_step)
-        writer.add_scalar("Loss/pred_loss", pred_loss.mean().item(), global_step)
+        if writer is not None:
+            writer.add_scalar("Loss/train_step", loss.item(), global_step)
+            writer.add_scalar("Loss/pred_loss", pred_loss.mean().item(), global_step)
+            for aux_name, aux_val in aux_losses.items():
+                writer.add_scalar(f"Loss/{aux_name}", aux_val.item(), global_step)
 
-        pbar.set_postfix({
-            "Mean loss": f"{np.mean(epoch_losses).item():.5f}"
-        })
+        if step % 100 == 0:
+            aux_val = aux_total.item() if isinstance(aux_total, torch.Tensor) else float(aux_total)
+            print(
+                f"Epoch {epoch}/{num_epochs-1} Step {step}: "
+                f"loss={loss.item():.4f}, "
+                f"pred_loss={pred_loss.mean().item():.4f}, "
+                f"aux={aux_val:.4f}",
+                flush=True,
+            )
 
     # Epoch summary
     mean_loss = np.mean(epoch_losses)
     epoch_losses_history.append(mean_loss)
-    writer.add_scalar("Loss/train_epoch", mean_loss, epoch)
+    if writer is not None:
+        writer.add_scalar("Loss/train_epoch", mean_loss, epoch)
     
     scheduler.step()
-    writer.add_scalar("Learning Rate", scheduler.get_last_lr()[0], epoch)
+    if writer is not None:
+        writer.add_scalar("Learning Rate", scheduler.get_last_lr()[0], epoch)
 
     window_mean = np.mean(epoch_losses_history[-window_size:])
     print(f"Epoch [{epoch}/{num_epochs-1}] - Windowed Mean Loss: {window_mean:.5f}")
@@ -492,11 +581,35 @@ for epoch in range(starting_epoch, num_epochs):
                 "scaler": scaler.state_dict(),
                 "scheduler": scheduler.state_dict(),
                 "ema": ema.state_dict(),
+                "best_loss": best_loss,
+                "epoch": epoch,
+                "seed": args.seed,
             }
             torch.save(checkpoint, f"{save_dir}/model_{epoch}.pth")
+            
+            # Also save EMA weights for inference
             diffuser.save_ema_weights(ema.shadow_params, f"{save_dir}/ema_model_{epoch}.pth")
             break
     
+    # ===============================
+    # Best Model Tracking
+    # ===============================
+    if mean_loss < best_loss:
+        best_loss = mean_loss
+        best_checkpoint = {
+            "model": diffuser.model.state_dict(),
+            "optimizer": optimizer.state_dict(),
+            "scaler": scaler.state_dict(),
+            "scheduler": scheduler.state_dict(),
+            "ema": ema.state_dict(),
+            "best_loss": best_loss,
+            "epoch": epoch,
+            "seed": args.seed,
+        }
+        torch.save(best_checkpoint, f"{save_dir}/model_best.pth")
+        diffuser.save_ema_weights(ema.shadow_params, f"{save_dir}/ema_model_best.pth")
+        print(f"  ★ New best model saved (loss={best_loss:.6f})")
+
     # ===============================
     # Regular Checkpoint Saving
     # ===============================
@@ -509,8 +622,13 @@ for epoch in range(starting_epoch, num_epochs):
             "scaler": scaler.state_dict(),
             "scheduler": scheduler.state_dict(),
             "ema": ema.state_dict(),
+            "best_loss": best_loss,
+            "epoch": epoch,
+            "seed": args.seed,
         }
         torch.save(checkpoint, f"{save_dir}/model_{epoch}.pth")
+        
+        # Save EMA weights separately for direct inference loading
         diffuser.save_ema_weights(ema.shadow_params, f"{save_dir}/ema_model_{epoch}.pth")
 
 # ===============================
@@ -528,4 +646,5 @@ plt.tight_layout()
 plt.savefig("loss_curve.png", dpi=300, bbox_inches="tight")
 plt.close(fig)
 
-writer.close()
+if writer is not None:
+    writer.close()

@@ -12,8 +12,9 @@ from models.model import RobotDiffuser
 from datasets.flexible_dataset import FlexibleWindowDataset, yaw_to_rot_matrix, yaw_from_quat
 from utils.data.load_dataset import preload_dataset
 from utils.math.sbto_utils import reconstruct_sbto_trajectory, compute_task_params
+from utils.physics_limits import apply_physics_clamp
 from utils.visualize.visualize import MjVisualizer
-from inference import build_inference_waypoints, DEFAULT_LIFT_HEIGHT, run_visualization
+from utils.inference_utils import build_inference_waypoints, DEFAULT_LIFT_HEIGHT, run_visualization
 
 def update_condition(dataset, robot_world_history, obj_world_history, final_obj_pos=None):
     """
@@ -177,7 +178,7 @@ def run_evaluation_batch(
 
     # Per-trajectory goal-stop state
     enable_goal_stop     = getattr(args, 'enable_goal_stop', True)
-    enable_physics_stop  = getattr(args, 'enable_physics_stop', True)
+    enable_physics_stop  = getattr(args, 'enable_physics_stop', False)
     goal_stop_threshold  = getattr(args, 'goal_stop_threshold', 0.1)
     goal_reached         = np.zeros(num_samples, dtype=bool)
     _goal_last_frame     = np.zeros((num_samples, 43), dtype=np.float64)
@@ -224,7 +225,7 @@ def run_evaluation_batch(
             # Keep a copy with actual (unclipped) distance for waypoint building
             tp_raw = tp.copy()
             if tp_raw.shape[-1] >= 3:
-                tp_raw[..., 2] = actual_dist.item() if hasattr(actual_dist, 'item') else float(actual_dist)
+                tp_raw[..., -1] = actual_dist.item() if hasattr(actual_dist, 'item') else float(actual_dist)
             raw_task_list.append(tp_raw)
         
         new_task_arr = np.stack(new_task_list)
@@ -296,6 +297,13 @@ def run_evaluation_batch(
             # Denormalize
             denorm = dataset.denormalize_global(sample)
             future_traj = denorm.cpu().numpy()
+
+            if args.enable_phys_clamp:
+                dt_eff = diffuser.data_cfg.get("raw_dt", 0.01) * diffuser.data_cfg.get("stride", 1)
+                future_traj = apply_physics_clamp(
+                    future_traj,
+                    dt=dt_eff,
+                )
             
             # Reconstruct
             b_anchors = np.concatenate([
@@ -319,14 +327,15 @@ def run_evaluation_batch(
                     inpaint=diffuser.model_cfg.get("inpaint", False)
                 )
 
+            history_size = diffuser.data_cfg.get("history_size", 1)
             if args.action_horizon is not None:
-                robot_world = robot_world[:, 1:, :]  # skip t=0 then apply horizon
-                obj_world   = obj_world[:, 1:, :]
+                robot_world = robot_world[:, history_size:, :]  # skip t=0 then apply horizon
+                obj_world   = obj_world[:, history_size:, :]
                 robot_world = robot_world[:, :args.action_horizon, :]
                 obj_world = obj_world[:, :args.action_horizon, :]
             else:
-                robot_world = robot_world[:, 1:, :]  # skip t=0 (anchored to current state)
-                obj_world   = obj_world[:, 1:, :]
+                robot_world = robot_world[:, history_size:, :]  # skip t=0 (anchored to current state)
+                obj_world   = obj_world[:, history_size:, :]
 
             # Store (B, T, D)
             segment = np.concatenate([robot_world[..., :36], obj_world[..., :7]], axis=-1)
@@ -576,7 +585,9 @@ def main():
         stitch_steps_list = []
         
         for idx in tqdm(selected, desc="Prep Dataset Tasks"):
-            _, curr_state, _, anchor = dataset[idx]
+            sample = dataset[idx]
+            curr_state = sample[1]
+            anchor = sample[-1]
             
             # Find GT Final
             file_idx, batch_idx, _ = dataset.indices[idx]
@@ -686,7 +697,9 @@ def main():
         stitch_steps_list_ood = []
 
         for i, idx in enumerate(tqdm(selected, desc="Prep OOD Tasks")):
-            _, curr_state, _, anchor = dataset[idx]
+            sample = dataset[idx]
+            curr_state = sample[1]
+            anchor = sample[-1]
             
             # Construct Target
             start_pos = anchor['ref_obj_pos'][:data_cfg["num_task_params"]]
@@ -774,7 +787,9 @@ def main():
         base_stitch_list = []
 
         for idx in tqdm(selected, desc="Prep Multiplier Base"):
-            _, curr_state, _, anchor = dataset[idx]
+            sample = dataset[idx]
+            curr_state = sample[1]
+            anchor = sample[-1]
             file_idx, batch_idx, _ = dataset.indices[idx]
             traj_data = dataset._get_single_traj(file_idx, batch_idx)
             final_pos = traj_data['obj'][-1, :3] if 'obj' in traj_data else anchor['ref_obj_pos'][:3]

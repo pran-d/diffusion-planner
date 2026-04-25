@@ -2,6 +2,7 @@ import torch
 import torch.nn as nn
 import numpy as np
 from typing import Iterable
+from contextlib import nullcontext
 
 from .latent_diffusion import UNetDiffuser
 from .basic_diffusion import SimpleDiffuser
@@ -31,7 +32,6 @@ class RobotDiffuser():
         
         self.num_channels = data_config['num_features']
             
-        self.goal_condition = self.model_cfg.get("goal_condition", False)
         self.state_condition = self.model_cfg.get("state_condition", False)
 
         if model_type == "simple_diffusion":
@@ -42,6 +42,22 @@ class RobotDiffuser():
             self.model = DFoTTrajectory(self.model_cfg, self.data_cfg, self.noise_schedule_cfg, self.training_cfg).to(self.device)
         else:
             raise ValueError(f"Unknown model type: {model_type}")           
+
+        self.use_fp16 = bool(self.model_cfg.get("use_fp16", False))
+        self.compile_model = bool(self.model_cfg.get("compile_model", False))
+        self._compiled_once = False
+
+        if self.compile_model and hasattr(torch, "compile"):
+            try:
+                backbone = None
+                if hasattr(self.model, "diffusion_model") and hasattr(self.model.diffusion_model, "model"):
+                    backbone = self.model.diffusion_model.model
+                if backbone is not None:
+                    self.model.diffusion_model.model = torch.compile(backbone, mode="reduce-overhead")
+                    self._compiled_once = True
+                    print("Enabled torch.compile on diffusion backbone (mode=reduce-overhead).")
+            except Exception as e:
+                print(f"[Warning] torch.compile failed, continuing without compile: {e}")
         
         if mode == "train":
             self.model.train()
@@ -57,7 +73,7 @@ class RobotDiffuser():
             else:
                 path = self.save_dir + f"model_{policy_num}.pth"
         print(f"Loading diffusion model weights from {path}{'  [EMA]' if ema else ''}... \n")
-        weights = torch.load(path, map_location=self.device)
+        weights = torch.load(path, map_location=self.device, weights_only=False)
         # EMA weight files are saved as plain state_dicts (no "model" key)
         state = weights["model"] if "model" in weights else weights
         missing, unexpected = self.model.load_state_dict(state, strict=False)
@@ -73,7 +89,7 @@ class RobotDiffuser():
     def load_weights_from_file(self, path):
         """Load weights from a specific file path."""
         print(f"Loading model weights from {path}... \n")
-        weights = torch.load(path, map_location=self.device)
+        weights = torch.load(path, map_location=self.device, weights_only=False)
         state = weights["model"] if "model" in weights else weights
         missing, unexpected = self.model.load_state_dict(state, strict=False)
         if missing:
@@ -81,7 +97,7 @@ class RobotDiffuser():
         if unexpected:
             print(f"  [Warning] Unexpected keys (ignored): {unexpected}")
 
-    def getSample(self, num_trajectories=1, state_cond=None, goal_cond=None, deterministic=False, cfg_w=1.0, guidance_wt=0.0, guidance_goal=None, no_state_cond=False, waypoint_values=None, waypoint_mask=None):
+    def getSample(self, num_trajectories=1, state_cond=None, goal_cond=None, style_cond=None, phase1_cond=None, deterministic=False, cfg_w=1.0, guidance_wt=0.0, guidance_goal=None, no_state_cond=False, waypoint_values=None, waypoint_mask=None):
         """
         Run reverse diffusion to generate trajectories.
         """
@@ -98,6 +114,16 @@ class RobotDiffuser():
                 goal_cond = torch.from_numpy(goal_cond).to(self.device).to(sample.dtype)
             cond_list.append(goal_cond)
 
+        if style_cond is not None:
+            if isinstance(style_cond, np.ndarray):
+                style_cond = torch.from_numpy(style_cond).to(self.device).to(sample.dtype)
+            cond_list.append(style_cond)
+
+        if phase1_cond is not None:
+            if isinstance(phase1_cond, np.ndarray):
+                phase1_cond = torch.from_numpy(phase1_cond).to(self.device).to(sample.dtype)
+            cond_list.append(phase1_cond)
+
         # tuple containing state cond, goal cond    
         model_cond = tuple(cond_list) if len(cond_list) > 0 else None
         if len(cond_list) == 1: model_cond = cond_list[0]
@@ -110,14 +136,38 @@ class RobotDiffuser():
             'waypoint_mask': waypoint_mask,
         }
 
-        sample = self.model.sample(
-            num_trajectories, 
-            model_cond=model_cond,
-            cfg_w=cfg_w,
-            **sample_kwargs
+        autocast_ctx = (
+            torch.autocast(device_type=self.device.type, dtype=torch.float16)
+            if (self.use_fp16 and self.device.type == "cuda") else nullcontext()
         )
+        with torch.inference_mode():
+            with autocast_ctx:
+                sample = self.model.sample(
+                    num_trajectories,
+                    model_cond=model_cond,
+                    cfg_w=cfg_w,
+                    **sample_kwargs
+                )
         
         return sample.detach()
+
+    def set_inference_speedups(self, use_fp16: bool | None = None, compile_model: bool | None = None):
+        if use_fp16 is not None:
+            self.use_fp16 = bool(use_fp16)
+        if compile_model is not None:
+            want_compile = bool(compile_model)
+            if want_compile and (not self._compiled_once) and hasattr(torch, "compile"):
+                try:
+                    backbone = None
+                    if hasattr(self.model, "diffusion_model") and hasattr(self.model.diffusion_model, "model"):
+                        backbone = self.model.diffusion_model.model
+                    if backbone is not None:
+                        self.model.diffusion_model.model = torch.compile(backbone, mode="reduce-overhead")
+                        self._compiled_once = True
+                        print("Enabled torch.compile on diffusion backbone (runtime).")
+                except Exception as e:
+                    print(f"[Warning] torch.compile failed at runtime: {e}")
+            self.compile_model = want_compile
 
     
     def save_ema_weights(self, parameters: Iterable[torch.nn.Parameter], path):
