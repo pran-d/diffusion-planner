@@ -1,2 +1,0 @@
-model:
-  group_wise_embedding: False  # per-semantic-group input projections (sum into hidden)

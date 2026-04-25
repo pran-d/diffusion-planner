@@ -1,2 +1,0 @@
-model:
-  pos_emb_type: "sinusoidal_1d"

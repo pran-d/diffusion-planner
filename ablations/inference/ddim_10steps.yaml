@@ -1,3 +1,0 @@
-name: ddim_10steps
-inference:
-  inference_timesteps: 10

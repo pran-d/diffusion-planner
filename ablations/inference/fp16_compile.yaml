@@ -1,4 +1,0 @@
-name: fp16_compile
-speedup_tricks:
-  use_fp16: true
-  torch_compile: true

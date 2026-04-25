@@ -1,5 +1,0 @@
-name: one_step
-inference:
-  inference_timesteps: 1
-speedup_tricks:
-  consistency_decoding: true
