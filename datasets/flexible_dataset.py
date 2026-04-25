@@ -16,6 +16,7 @@ from utils.data.style_conditioning import (
     classify_style_from_task_text,
     load_task_text_map,
     one_hot_style,
+    style_name_to_id,
 )
 
 class FlexibleWindowDataset(Dataset):
@@ -30,7 +31,8 @@ class FlexibleWindowDataset(Dataset):
         task_params=None,
         norm_path=None, 
         calculate_stats=False,
-        training_cfg=None,  
+        training_cfg=None,
+        motion_styles=None,
     ):
         training_cfg = training_cfg or {}
         
@@ -61,6 +63,17 @@ class FlexibleWindowDataset(Dataset):
         self._style_rng = np.random.default_rng(int(style_cfg.get("seed", 42)))
         self._task_text_by_folder = load_task_text_map(style_cfg.get("tasks_file", None))
         
+        self.state_condition = config.get("state_condition", True)
+        self.task_condition = config.get("task_condition", True)
+        self.phase1_condition = config.get("phase1_condition", False)
+        self.two_phase_enabled = config.get("two_phase_enabled", False)
+        self.two_phase_phase = config.get("two_phase_phase", None)
+        self.phase1_context_features = config.get("phase1_context_features", [])
+        
+        self.full_feature_order = config.get("full_feature_order", self.feature_order)
+        self.full_num_features = config.get("full_num_features", self.num_features)
+        self.full_num_observations = config.get("full_num_observations", self.num_observations)
+        
         print(f"Using feature order: {self.feature_order}")
         print(f"Using normalization type: {self.normalization_type}")
         print(f"Using key mapping: {self.key_mapping}")
@@ -79,11 +92,11 @@ class FlexibleWindowDataset(Dataset):
         self.mirror_enabled = mirror_cfg.get("enabled", False)
         self.mirror_prob = mirror_cfg.get("prob", 0.5)
         if self.mirror_enabled:
-            self._build_mirror_tables()
             print(f"Mirror symmetry augmentation enabled (prob={self.mirror_prob})")
 
         self._raw_buffer = data_buffer
         self._task_params = task_params
+        self._motion_styles = motion_styles
         
         # ---- Preload buffer into ram_cache ----
         self.ram_cache = []
@@ -258,6 +271,7 @@ class FlexibleWindowDataset(Dataset):
 
         total_trajs = 0
         tp_offset = 0  # running offset into the flat task_params list
+        style_offset = 0
 
         for raw_data in buf:
             if not raw_data:
@@ -309,11 +323,18 @@ class FlexibleWindowDataset(Dataset):
                 style_ids = np.zeros((N_i,), dtype=np.int64)
                 style_onehot = np.zeros((N_i, self.num_styles), dtype=np.float32)
                 for j in range(N_i):
-                    sid = self._infer_style_for_trajectory(processed, j)
-                    style_ids[j] = sid
+                    if self._motion_styles is not None:
+                        sid = self._motion_styles[style_offset + j]
+                        if isinstance(sid, str):
+                            sid = style_name_to_id(sid)
+                    else:
+                        sid = self._infer_style_for_trajectory(processed, j)
+                    style_ids[j] = int(sid)
                     style_onehot[j] = one_hot_style(sid, num_styles=self.num_styles)
                 processed['style_id'] = style_ids
                 processed['style_onehot'] = style_onehot
+                if self._motion_styles is not None:
+                    style_offset += N_i
 
             self.ram_cache.append(processed)
             total_trajs += N_i
@@ -1014,24 +1035,59 @@ class FlexibleWindowDataset(Dataset):
                 
         window_tensor = torch.cat(window_parts, dim=-1) # (W, Total_Dim)
         
-        # Current State 
-        current_state = window_tensor[:self.history_size, (self.num_features-self.num_observations):].clone()
-
         # Future trajectory
         future_states = window_tensor.clone()
 
-        task_params = torch.from_numpy(features["task_params"]).float()
-        task_params = self._normalize("task_params", task_params)
-        if self.add_goal_noise:
-            task_params = self._add_obs_noise(task_params, "task_params")
+        ret = [future_states]
 
-        style_cond = None
+        # Current State 
+        if self.state_condition:
+            if self.num_observations == self.full_num_observations and self.full_feature_order != self.feature_order:
+                full_parts = []
+                for key in self.full_feature_order:
+                    if key in features:
+                        part = torch.from_numpy(features[key]).float()
+                        part = self._normalize(key, part)
+                        if self.add_noise:
+                            history_slice = part[:self.history_size]
+                            part[:self.history_size] = self._add_obs_noise(history_slice, key)
+                        full_parts.append(part)
+                    else:
+                        raise ValueError(f"Feature {key} needed but not computed.")
+                full_window_tensor = torch.cat(full_parts, dim=-1)
+                current_state = full_window_tensor[:self.history_size, (self.full_num_features - self.full_num_observations):].clone()
+            else:
+                current_state = window_tensor[:self.history_size, (self.num_features-self.num_observations):].clone()
+            ret.append(current_state)
+
+        # Task Params
+        if self.task_condition:
+            task_params = torch.from_numpy(features["task_params"]).float()
+            task_params = self._normalize("task_params", task_params)
+            if self.add_goal_noise:
+                task_params = self._add_obs_noise(task_params, "task_params")
+            ret.append(task_params)
+
+        # Style Condition
         if self.style_condition and "style_onehot" in raw_traj:
             style_cond = torch.from_numpy(np.asarray(raw_traj["style_onehot"]).astype(np.float32))
+            ret.append(style_cond)
 
-        if style_cond is not None:
-            return future_states, current_state, task_params, style_cond, anchor
-        return future_states, current_state, task_params, anchor
+        # Phase 1 Condition
+        if self.phase1_condition:
+            p1_parts = []
+            for key in self.phase1_context_features:
+                if key in features:
+                    part = torch.from_numpy(features[key]).float()
+                    part = self._normalize(key, part)
+                    p1_parts.append(part[-1])
+                else:
+                    raise ValueError(f"Phase1 feature {key} needed but not computed.")
+            phase1_cond = torch.cat(p1_parts, dim=-1)
+            ret.append(phase1_cond)
+
+        ret.append(anchor)
+        return tuple(ret)
 
 
     def _calculate_stats(self):

@@ -236,24 +236,42 @@ class MotionGenerator:
         parts = [full_tensor[..., slices[k]] for k in feature_order if k in slices]
         return torch.cat(parts, dim=-1)
 
-    def _scatter_phase_into_full(self, target_full: torch.Tensor, phase_tensor: torch.Tensor, slices: Dict[str, slice], feature_order: List[str]):
+    def _scatter_phase_into_full(
+        self,
+        target_full: torch.Tensor,
+        phase_tensor: torch.Tensor,
+        slices: Dict[str, slice],
+        feature_order: List[str],
+    ):
+        """Write phase_tensor columns back into their correct positions in target_full.
+        
+        feature_order must list exactly the keys in this phase, in the order they
+        appear packed in phase_tensor (i.e. the same order used when the phase
+        tensor was assembled).
+        """
         cursor = 0
         for key in feature_order:
             sl = slices.get(key)
             if sl is None:
-                continue
+                raise ValueError(
+                    f"Key '{key}' in feature_order has no corresponding slice. "
+                    f"Available slices: {list(slices.keys())}"
+                )
             width = sl.stop - sl.start
             if cursor + width > phase_tensor.shape[-1]:
                 raise ValueError(
                     f"Phase tensor too small while scattering '{key}': "
-                    f"need {cursor + width}, got {phase_tensor.shape[-1]}"
+                    f"need up to dim {cursor + width}, got {phase_tensor.shape[-1]}"
                 )
-            target_full[..., sl] = phase_tensor[..., cursor:cursor + width]
+            target_full[..., sl] = phase_tensor[..., cursor : cursor + width]
             cursor += width
+
         if cursor != phase_tensor.shape[-1]:
             raise ValueError(
-                f"Phase tensor has trailing dims not consumed during scatter: "
-                f"consumed={cursor}, tensor_dim={phase_tensor.shape[-1]}"
+                f"Phase tensor not fully consumed during scatter: "
+                f"consumed={cursor}, tensor_dim={phase_tensor.shape[-1]}. "
+                f"Check that feature_order ({feature_order}) matches exactly "
+                f"what was packed into the phase tensor."
             )
 
     def _extract_phase_state_cond(self, full_state_cond: torch.Tensor, phase_feature_order: List[str]) -> torch.Tensor:
@@ -311,6 +329,7 @@ class MotionGenerator:
         save_path: str = None,
         checkpoint: Optional[str] = None,
         calc_stats: bool = True,
+        motion_styles: Optional[Union[List[str], List[int]]] = None,
     ):
 
         """
@@ -356,6 +375,7 @@ class MotionGenerator:
             calculate_stats=calc_stats, 
             norm_path=norm_path,
             training_cfg=self.training_cfg,
+            motion_styles=motion_styles,
         )
 
         # Task Density Balancing
@@ -983,9 +1003,12 @@ class MotionGenerator:
                 if self.two_phase_enabled:
                     p1_order = self.phase1_data_cfg.get("feature_order", [])
                     p2_order = self.phase2_data_cfg.get("feature_order", [])
+                    
+                    p1_state_order = self.phase1_data_cfg.get("full_feature_order", p1_order) if self.phase1_data_cfg.get("num_observations") == self.phase1_data_cfg.get("full_num_observations") else p1_order
+                    p2_state_order = self.phase2_data_cfg.get("full_feature_order", p2_order) if self.phase2_data_cfg.get("num_observations") == self.phase2_data_cfg.get("full_num_observations") else p2_order
 
-                    state_cond_p1 = self._extract_phase_state_cond(curr_state_tens, p1_order)
-                    state_cond_p2 = self._extract_phase_state_cond(curr_state_tens, p2_order)
+                    state_cond_p1 = self._extract_phase_state_cond(curr_state_tens, p1_state_order)
+                    state_cond_p2 = self._extract_phase_state_cond(curr_state_tens, p2_state_order)
 
                     sample_p1 = self.phase1_diffuser.getSample(
                         num_trajectories=effective_batch,
