@@ -50,6 +50,25 @@ class DiscreteDiffusion(nn.Module):
         self._build_model()
         self._build_buffer()
 
+    def get_model_noise_levels(self, k: torch.Tensor) -> torch.Tensor:
+        """Reduce per-feature noise levels to per-token levels for backbone conditioning.
+
+        Diffusion coefficients can use ``k`` shaped ``(B,T,D)``, but the current
+        backbone time embedding is token-level. We therefore reduce feature-wise
+        noise levels to ``(B,T)`` only for the model conditioning path.
+        """
+        if k.ndim <= 2:
+            return k
+
+        reduce_mode = self.cfg.get("noise_level_conditioning_reduce", "max")
+        if reduce_mode == "max":
+            return k.max(dim=-1).values
+        if reduce_mode == "min":
+            return k.min(dim=-1).values
+        if reduce_mode == "mean":
+            return k.float().mean(dim=-1).round().long()
+        raise ValueError(f"unknown noise level conditioning reduction: {reduce_mode}")
+
     def _build_model(self):
         match self.backbone_cfg.name:
             case "dit1d":
@@ -148,8 +167,17 @@ class DiscreteDiffusion(nn.Module):
     def add_shape_channels(self, x):
         return rearrange(x, f"... -> ...{' 1' * len(self.x_shape)}")
 
+    @staticmethod
+    def expand_to_x(x: torch.Tensor, x_ref: torch.Tensor) -> torch.Tensor:
+        """Expand ``x`` with trailing singleton dims to broadcast with ``x_ref``."""
+        extra = x_ref.ndim - x.ndim
+        if extra <= 0:
+            return x
+        return x.reshape(*x.shape, *((1,) * extra))
+
     def model_predictions(self, x, k, external_cond=None, external_cond_mask=None):
-        model_output = self.model(x, k, external_cond, external_cond_mask)
+        model_k = self.get_model_noise_levels(k)
+        model_output = self.model(x, model_k, external_cond, external_cond_mask)
 
         if self.objective == "pred_noise":
             pred_noise = torch.clamp(model_output, -self.clip_noise, self.clip_noise)
@@ -243,7 +271,7 @@ class DiscreteDiffusion(nn.Module):
             return torch.ones_like(k)
         if strategy == "goal-weighted":
             weights = torch.ones_like(k)
-            weights[..., -1] = weights[..., -1] * self.loss_weighting.final_frame_weight
+            weights[:, -1, ...] = weights[:, -1, ...] * self.loss_weighting.final_frame_weight
             return weights
         snr = self.snr[k]
         epsilon_weighting = None
@@ -285,7 +313,8 @@ class DiscreteDiffusion(nn.Module):
                                 cum_snr_decay * cum_snr[:, t - 1]
                                 + (1 - cum_snr_decay) * new_normalized_clipped_snr[:, t]
                             )
-                    cum_snr = F.pad(cum_snr[:, :-1], (1, 0, 0, 0), value=0.0)
+                    zero = torch.zeros_like(cum_snr[:, :1])
+                    cum_snr = torch.cat([zero, cum_snr[:, :-1]], dim=1)
                     return cum_snr.flip(1) if reverse else cum_snr
 
                 if self.use_causal_mask:
@@ -344,7 +373,7 @@ class DiscreteDiffusion(nn.Module):
         loss = F.mse_loss(pred, target.detach(), reduction="none")
 
         loss_weight = self.compute_loss_weights(k, self.loss_weighting.strategy)
-        loss_weight = self.add_shape_channels(loss_weight)
+        loss_weight = self.expand_to_x(loss_weight, loss)
         loss = loss * loss_weight
 
         return x_pred, pred, loss
@@ -433,7 +462,7 @@ class DiscreteDiffusion(nn.Module):
             )
 
         noise = torch.where(
-            self.add_shape_channels(clipped_curr_noise_level > 0),
+            self.expand_to_x(clipped_curr_noise_level > 0, x),
             torch.randn_like(x),
             0,
         )
@@ -441,7 +470,7 @@ class DiscreteDiffusion(nn.Module):
         x_pred = model_mean + torch.exp(0.5 * model_log_variance) * noise
 
         # only update frames where the noise level decreases
-        return torch.where(self.add_shape_channels(curr_noise_level == -1), x, x_pred)
+        return torch.where(self.expand_to_x(curr_noise_level == -1, x), x, x_pred)
 
     def _cfg_predict(self, x, k, external_cond, external_cond_mask, cfg_w):
         """
@@ -518,10 +547,10 @@ class DiscreteDiffusion(nn.Module):
         )
         c = (1 - alpha_next - sigma**2).sqrt()
 
-        alpha = self.add_shape_channels(alpha)
-        alpha_next = self.add_shape_channels(alpha_next)
-        c = self.add_shape_channels(c)
-        sigma = self.add_shape_channels(sigma)
+        alpha = self.expand_to_x(alpha, x)
+        alpha_next = self.expand_to_x(alpha_next, x)
+        c = self.expand_to_x(c, x)
+        sigma = self.expand_to_x(sigma, x)
 
         if guidance_fn is not None:
             # 1. Enable grad on x (x_t)
@@ -571,7 +600,7 @@ class DiscreteDiffusion(nn.Module):
         # only update frames where the noise level decreases
         mask = curr_noise_level == next_noise_level
         x_pred = torch.where(
-            self.add_shape_channels(mask),
+            self.expand_to_x(mask, x),
             x,
             x_pred,
         )

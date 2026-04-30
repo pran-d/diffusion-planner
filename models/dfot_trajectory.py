@@ -256,6 +256,23 @@ class DFoTTrajectory(nn.Module):
                 self.feature_index_map[key] = slice(fidx, fidx + dim)
                 fidx += dim
 
+        # Build mapping from observation-conditioning vector indices -> model
+        # feature indices for inpaint pinning at t=0.
+        # current_state in the dataset is formed as the trailing
+        # `num_observations` features from the full feature vector.
+        self.obs_feature_index_map = {}
+        total_dim = int(data_config.get("num_features", fidx))
+        obs_dim = int(data_config.get("num_observations", 0))
+        obs_start = max(0, total_dim - obs_dim)
+        obs_end = total_dim
+        for key, sl in self.feature_index_map.items():
+            if sl.stop <= obs_start or sl.start >= obs_end:
+                continue
+            local_start = max(sl.start, obs_start) - obs_start
+            local_stop = min(sl.stop, obs_end) - obs_start
+            if local_stop > local_start:
+                self.obs_feature_index_map[key] = slice(local_start, local_stop)
+
         # Build feature group slices for partial masking
         partial_cfg = self.inbetweening_cfg.get("partial_masking", {})
 
@@ -332,22 +349,29 @@ class DFoTTrajectory(nn.Module):
                 ),
                 device=xs.device,
             )
-
-            match self.noise_level:
-                case "random_independent":  # independent noise levels (Diffusion Forcing)
-                    noise_levels = rand_fn((batch_size, n_tokens))
-                case "random_uniform":  # uniform noise levels (Typical Video Diffusion)
-                    noise_levels = rand_fn((batch_size, 1)).repeat(1, n_tokens)
+            if self.noise_level == "random_independent":  # independent noise levels (Diffusion Forcing)
+                noise_levels = rand_fn((batch_size, n_tokens))
+            elif self.noise_level == "random_uniform":  # uniform noise levels (Typical Video Diffusion)
+                noise_levels = rand_fn((batch_size, 1)).repeat(1, n_tokens)
+            else:
+                raise ValueError(f"Unknown noise level mode: {self.noise_level}")
 
             if self.uniform_future:  # simplified training (Appendix A.5)
-                noise_levels = rand_fn((batch_size, 1)).repeat(
-                    1, n_tokens
-                )
+                if noise_levels.ndim == 3:
+                    noise_levels = rand_fn((batch_size, 1, noise_levels.shape[-1])).repeat(
+                        1, n_tokens, 1
+                    )
+                else:
+                    noise_levels = rand_fn((batch_size, 1)).repeat(
+                        1, n_tokens
+                    )
 
             # treat frames that are not available as "full noise"
             if masks is not None:
+                valid_tokens = reduce(masks.bool(), "b t ... -> b t", torch.any)
+                valid_tokens = valid_tokens.unsqueeze(-1) if noise_levels.ndim == 3 else valid_tokens
                 noise_levels = torch.where(
-                    reduce(masks.bool(), "b t ... -> b t", torch.any),
+                    valid_tokens,
                     noise_levels,
                     torch.full_like(
                         noise_levels,
@@ -530,7 +554,8 @@ class DFoTTrajectory(nn.Module):
             h = h + indicator
 
         # 3. Condition embedding (same as DiT1D.forward)
-        c = backbone.noise_level_pos_embedding(k)
+        model_k = self.diffusion_model.get_model_noise_levels(k)
+        c = backbone.noise_level_pos_embedding(model_k)
         if external_cond is not None:
             c = c + backbone.external_cond_embedding(external_cond, external_cond_mask)
 
@@ -584,10 +609,10 @@ class DFoTTrajectory(nn.Module):
         )
         c_coeff = (1 - alpha_next - sigma**2).sqrt()
 
-        alpha = dm.add_shape_channels(alpha)
-        alpha_next = dm.add_shape_channels(alpha_next)
-        c_coeff = dm.add_shape_channels(c_coeff)
-        sigma = dm.add_shape_channels(sigma)
+        alpha = dm.expand_to_x(alpha, x)
+        alpha_next = dm.expand_to_x(alpha_next, x)
+        c_coeff = dm.expand_to_x(c_coeff, x)
+        sigma = dm.expand_to_x(sigma, x)
 
         # Conditional prediction (with indicator)
         pred_cond = self._model_predictions_with_indicator(
@@ -621,7 +646,7 @@ class DFoTTrajectory(nn.Module):
 
         # Only update frames where noise level decreases
         mask = curr_noise_level == next_noise_level
-        x_pred = torch.where(dm.add_shape_channels(mask), x, x_pred)
+        x_pred = torch.where(dm.expand_to_x(mask, x), x, x_pred)
         return x_pred
 
     #### ============== ####
@@ -1036,23 +1061,35 @@ class DFoTTrajectory(nn.Module):
             scheduling_matrix = np.arange(self.sampling_timesteps, -1, -1)[
                 :, None
             ].repeat(horizon, axis=1)
+            scheduling_matrix = torch.from_numpy(scheduling_matrix).long()
+            scheduling_matrix = self.diffusion_model.ddim_idx_to_noise_level(
+                scheduling_matrix
+            )
         elif self.scheduling_matrix == "autoregressive":
              scheduling_matrix = self._generate_pyramid_scheduling_matrix(
                  horizon, self.sampling_timesteps
              )
+             scheduling_matrix = torch.from_numpy(scheduling_matrix).long()
+             scheduling_matrix = self.diffusion_model.ddim_idx_to_noise_level(
+                 scheduling_matrix
+             )
         else:
              raise ValueError(f"Unknown scheduling matrix type: {self.scheduling_matrix}")
-        
-        scheduling_matrix = torch.from_numpy(scheduling_matrix).long()
-
-        scheduling_matrix = self.diffusion_model.ddim_idx_to_noise_level(
-            scheduling_matrix
-        )
 
         # paded entries are labeled as pure noise
-        scheduling_matrix = F.pad(
-            scheduling_matrix, (0, padding, 0, 0), value=self.timesteps - 1
-        )
+        if padding > 0:
+            if scheduling_matrix.ndim == 2:
+                scheduling_matrix = F.pad(
+                    scheduling_matrix, (0, padding, 0, 0), value=self.timesteps - 1
+                )
+            else:
+                pad_vals = torch.full(
+                    (scheduling_matrix.shape[0], padding, scheduling_matrix.shape[2]),
+                    self.timesteps - 1,
+                    dtype=scheduling_matrix.dtype,
+                    device=scheduling_matrix.device,
+                )
+                scheduling_matrix = torch.cat([scheduling_matrix, pad_vals], dim=1)
 
         return scheduling_matrix
 
@@ -1095,7 +1132,10 @@ class DFoTTrajectory(nn.Module):
             init_sched = self._generate_scheduling_matrix(
                 horizon - padding, padding,
             ).to(xs_pred.device)
-            init_noise_levels = repeat(init_sched[0], "t -> b t", b=batch_size)
+            if init_sched.ndim == 2:
+                init_noise_levels = repeat(init_sched[0], "t -> b t", b=batch_size)
+            else:
+                init_noise_levels = repeat(init_sched[0], "t d -> b t d", b=batch_size)
             xs_pred = self._inject_waypoints(
                 xs_pred, waypoint_values, waypoint_mask,
                 noise_levels=init_noise_levels,
@@ -1112,30 +1152,30 @@ class DFoTTrajectory(nn.Module):
             padding,
         )
         scheduling_matrix = scheduling_matrix.to(xs_pred.device)
-        scheduling_matrix = repeat(scheduling_matrix, "m t -> m b t", b=batch_size)
+        if scheduling_matrix.ndim == 2:
+            scheduling_matrix = repeat(scheduling_matrix, "m t -> m b t", b=batch_size)
+        else:
+            scheduling_matrix = repeat(scheduling_matrix, "m t d -> m b t d", b=batch_size)
     
         # prune scheduling matrix to remove identical adjacent rows
         diff = scheduling_matrix[1:] - scheduling_matrix[:-1]
-        skip = torch.argmax((~reduce(diff == 0, "m b t -> m", torch.all)).float())
+        skip = torch.argmax((~reduce(diff == 0, "m b ... -> m", torch.all)).float())
         scheduling_matrix = scheduling_matrix[skip:]
 
         record = [] if return_all else None
 
-        if pbar is None:
-            pbar = tqdm(
-                total=scheduling_matrix.shape[0] - 1,
-                initial=0,
-                desc="Sampling with DFoT",
-                leave=False,
-            )
-
+        # Avoid creating tqdm by default in cluster inference paths.
+        # Caller may still pass a custom progress object with update().
+        f_map = self.feature_index_map
+        obs_f_map = self.obs_feature_index_map
         for m in range(scheduling_matrix.shape[0] - 1):
             from_noise_levels = scheduling_matrix[m]
             to_noise_levels = scheduling_matrix[m + 1]
 
             # update context mask by changing 0 -> 2 for fully generated tokens
+            finished_tokens = reduce(from_noise_levels == -1, "b t ... -> b t", torch.all)
             context_mask = torch.where(
-                torch.logical_and(context_mask == 0, from_noise_levels == -1),
+                torch.logical_and(context_mask == 0, finished_tokens),
                 2,
                 context_mask,
             )
@@ -1210,14 +1250,20 @@ class DFoTTrajectory(nn.Module):
                             )
                 
             if inpaint:
-                f_map = get_feature_indices(build_feature_layout())
-                xs_pred[..., 0, f_map['joints']] = self.state_cond[..., 0, :29]
-                xs_pred[..., 0, f_map['body_z']] = self.state_cond[..., 0, 29:30]
-                xs_pred[..., 0, f_map['body_rot6d']] = self.state_cond[..., 0, 30:36]
-                xs_pred[..., 0, f_map['obj_rel_pos']] = self.state_cond[..., 0, 36:39]
-                xs_pred[..., 0, f_map['obj_rel_rot6d']] = self.state_cond[..., 0, 39:45]
+                # Pin t=0 of the output window to the current (most recent) history frame.
+                # state_cond is (B, H, obs_dim); index -1 is the latest observation.
+                _cur = self.state_cond[..., -1, :]  # (B, obs_dim)
+                for key in ("joints", "body_z", "body_rot6d", "obj_rel_pos", "obj_rel_rot6d"):
+                    x_sl = f_map.get(key)
+                    obs_sl = obs_f_map.get(key)
+                    if x_sl is None or obs_sl is None:
+                        continue
+                    if (x_sl.stop - x_sl.start) != (obs_sl.stop - obs_sl.start):
+                        continue
+                    xs_pred[..., 0, x_sl] = _cur[..., obs_sl]
             
-            pbar.update(1)
+            if pbar is not None:
+                pbar.update(1)
 
         if return_all:
             record.append(xs_pred.clone())
