@@ -43,7 +43,8 @@ class MjVisualizer():
                 self.exit_request["active"] = True
             # 'C' for clean
             elif keycode == 67:  
-                self.clean_request["active"] = True
+                self.clean_request["active"] = not self.clean_request["active"]
+                print("[clean request]: ", self.clean_request["active"])
             # 'N': jump to next file, batch 0 (consumed by caller)
             elif keycode == glfw.KEY_N:
                 self.next_file_batch0_request["active"] = True

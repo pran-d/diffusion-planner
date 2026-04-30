@@ -228,6 +228,28 @@ class FlexibleWindowDataset(Dataset):
             if 'ee_rel_pos' in keys:
                 processed['ee_rel_pos'] = np.asarray(raw_data['ee_rel_pos'], dtype=np.float64)
 
+        # ---- OmniRetarget qpos schema ----
+        elif 'qpos' in keys:
+            qpos = np.asarray(raw_data['qpos'], dtype=np.float64)  # (T, D)
+
+            # Floating base: qpos[..., 0:7] = [qw, qx, qy, qz, x, y, z]
+            # Reorder to standardized [x, y, z, qw, qx, qy, qz]
+            base_raw = qpos[..., :7]
+            processed['base'] = np.concatenate(
+                [base_raw[..., 4:7], base_raw[..., 0:4]], axis=-1
+            )
+
+            # Joint positions: qpos[..., 7:36]
+            processed['joints'] = qpos[..., 7:36]
+
+            # Object pose (optional): qpos[..., 36:43] = [qw, qx, qy, qz, x, y, z]
+            # Reorder to standardized [x, y, z, qw, qx, qy, qz]
+            if qpos.shape[-1] == 43:
+                obj_raw = qpos[..., 36:43]
+                processed['obj'] = np.concatenate(
+                    [obj_raw[..., 4:7], obj_raw[..., 0:4]], axis=-1
+                )
+
         else:
             print(f"Warning: Unrecognized buffer schema. Keys: {keys}")
             return None

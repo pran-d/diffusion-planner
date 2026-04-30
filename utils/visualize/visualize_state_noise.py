@@ -16,182 +16,59 @@ from utils.math.sbto_utils import rot6d_to_rot, rot_to_quat, reconstruct_sbto_tr
 # Helper Functions
 # ===============================
 
-def get_feature_dims(dataset):
-    """Returns a dictionary mapping feature name to its dimension size."""
-    dims = {}
-    for key in dataset.feature_order:
-        # Check for min_key or mean_key depending on normalization
-        if f"min_{key}" in dataset.stats:
-            dims[key] = dataset.stats[f"min_{key}"].shape[0]
-        elif f"mean_{key}" in dataset.stats:
-             dims[key] = dataset.stats[f"mean_{key}"].shape[0]
-    return dims
+def get_reconstructed_qpos(dataset, current_idx, force_clean=False):
+    # Remember current noise setting
+    orig_noise = getattr(dataset, "add_noise", False)
+    
+    if force_clean:
+        dataset.add_noise = False
+    else:
+        dataset.add_noise = True
+        
+    sample = dataset[current_idx]
+    
+    # Restore original setting
+    dataset.add_noise = orig_noise
 
-def denormalize_state(state_tensor, dataset):
-    """Denormalizes a partial state vector using the global stats."""
+    future_tensor = sample[0]
+    anchor = sample[-1]
     
-    # We are denormalizing the *State*, which is a subset of the *Full Window*.
-    # The global stats (mean/std/min/max) are concatenated for the *Full Feature Vector*.
-    # We need to slice them to align with the state (last N observations).
-    
-    # State corresponds to the LAST obs_dim elements of the full feature vector
-    obs_dim = dataset.num_observations
-    total_dim = dataset.num_features
-    # NOTE: In FlexibleDataset, if feature_order is just current observation features, total_dim might equal obs_dim.
-    # But usually features = [delta_xy, delta_yaw, ..., joints, ...]
-    # The *current state* usually omits the first few elements dependent on deltas from previous frame if they haven't happened yet? 
-    # Or in the dataset logic:   current_state = window_tensor[:self.history_size, ...]
-    # It takes the full feature vector?
-    # No: current_state = window_tensor[:self.history_size, (self.num_features-self.num_observations):]
-    # So it takes the LAST obs_dim columns.
-    
-    global_start_idx = total_dim - obs_dim
-
+    # Denormalize full window
     if dataset.normalization_type == "min_max":
-        if hasattr(dataset, 'global_min') and hasattr(dataset, 'global_max'):
-             # Ensure indices are valid
-             if global_start_idx < 0: return state_tensor
-                 
-             g_min = dataset.global_min[global_start_idx:].to(state_tensor.device)
-             g_max = dataset.global_max[global_start_idx:].to(state_tensor.device)
-             
-             # FlexibleDataset uses: (val - min) / (max - min) -> [0, 1]
-             # Denorm = val * (max - min) + min
-             denom = g_max - g_min
-             denom[denom < 1e-6] = 1.0 
-             
-             return state_tensor * denom + g_min
-             
-    else: # mean_std
-        if hasattr(dataset, 'global_mean') and hasattr(dataset, 'global_std'):
-            if global_start_idx < 0: return state_tensor
-            
-            g_mean = dataset.global_mean[global_start_idx:].to(state_tensor.device)
-            g_std = dataset.global_std[global_start_idx:].to(state_tensor.device)
-            
-            return state_tensor * g_std + g_mean
-
-    return state_tensor
-
-def decompose_state(state, dataset, feature_dims):
-    """Decomposes the flattened state vector back into its components."""
-    obs_dim = dataset.num_observations
-    total_dim = dataset.num_features
-    
-    feature_indices = {}
-    curr_idx = 0
-    ordered_features = []
-    
-    for key in dataset.feature_order:
-        if key not in feature_dims: continue
-        dim = feature_dims[key]
-        feature_indices[key] = (curr_idx, curr_idx + dim)
-        curr_idx += dim
-        ordered_features.append(key)
+        g_min = dataset.global_min.to(future_tensor.device)
+        g_max = dataset.global_max.to(future_tensor.device)
+        denom = g_max - g_min
+        denom[denom < 1e-6] = 1.0 
+        future_denorm = future_tensor * denom + g_min
+    else:
+        g_mean = dataset.global_mean.to(future_tensor.device)
+        g_std = dataset.global_std.to(future_tensor.device)
+        future_denorm = future_tensor * g_std + g_mean
         
-    total_indices = curr_idx
-    state_start_idx = total_indices - obs_dim
-    
-    decomposed = {}
-    for key in ordered_features:
-        f_start, f_end = feature_indices[key]
-        overlap_start = max(f_start, state_start_idx)
-        overlap_end = min(f_end, total_indices)
-        
-        if overlap_start < overlap_end:
-            rel_start = overlap_start - state_start_idx
-            rel_end = overlap_end - state_start_idx
-            
-            if state.ndim == 1:
-                decomposed[key] = state[rel_start:rel_end]
-            elif state.ndim == 2:
-                 decomposed[key] = state[:, rel_start:rel_end]
-            
-    return decomposed
+    # Reconstruct world state directly from the full feature vector
+    ref_pos = anchor["ref_pos"].flatten()
+    ref_quat = anchor["ref_quat"].flatten()
+    base_pose_world = np.concatenate([ref_pos, ref_quat], axis=-1)[None, ...]
 
-def apply_noise_to_components(components, dataset):
-    """Applies noise to each component using dataset._add_obs_noise"""
-    noisy_components = {}
-    noise_mags = {}
-
-    for key, val in components.items():
-        val_noisy = dataset._add_obs_noise(val, key)
-        noisy_components[key] = val_noisy
-        diff = val_noisy - val
-        mag = torch.norm(diff)
-        noise_mags[key] = mag.item()
-        
-    return noisy_components, noise_mags
-
-def reconstruct_state(components, dataset, feature_dims, base_tensor):
-    """Reassembles the state vector by overwriting the base_tensor with components."""
-    reconstructed = base_tensor.clone() # Use the clean state as the canvas!
+    future_traj = future_denorm.unsqueeze(0).cpu().numpy() # (1, T, D)
     
-    obs_dim = dataset.num_observations
-    curr_idx = 0
-    feature_limit_indices = {}
+    robot_w, obj_w, _, _ = reconstruct_sbto_trajectory(base_pose_world, future_traj)
     
-    for key in dataset.feature_order:
-        if key not in feature_dims: continue
-        dim = feature_dims[key]
-        feature_limit_indices[key] = (curr_idx, curr_idx + dim)
-        curr_idx += dim
-        
-    state_start_idx = curr_idx - obs_dim
+    # We want the 'history_size' frame as the current state!
+    ref_idx = dataset.history_size - 1
     
-    for key, val in components.items():
-        f_start, f_end = feature_limit_indices[key]
-        overlap_start = max(f_start, state_start_idx)
-        overlap_end = min(f_end, curr_idx)
-        
-        if overlap_start < overlap_end:
-            rel_start = overlap_start - state_start_idx
-            rel_end = overlap_end - state_start_idx
-            
-            if reconstructed.ndim == 1:
-                reconstructed[rel_start:rel_end] = val
-            else:
-                reconstructed[:, rel_start:rel_end] = val
-                
-    return reconstructed
+    curr_robot = robot_w[0, ref_idx]
+    curr_obj = obj_w[0, ref_idx]
 
-def denormalize_state(state_tensor, dataset):
-    """Denormalizes a partial state vector using the global stats."""
+    q = np.zeros(43) # Assuming H1 (36) + Object (7) layout from sbto_utils length mappings
     
-    # We are denormalizing the *State*, which is a subset of the *Full Window*.
-    # The global stats (mean/std/min/max) are concatenated for the *Full Feature Vector*.
-    # We need to slice them to align with the state (last N observations).
+    # Robot: Base pos (3), Base quat (4), Joints (29)
+    q[0:7] = curr_robot[:7]
+    q[7:36] = curr_robot[7:36]
     
-    obs_dim = dataset.num_observations
-    total_dim = dataset.num_features
-    # State corresponds to the LAST obs_dim elements of the full feature vector
-    start_idx = total_dim - obs_dim
-
-    if dataset.normalization_type == "min_max":
-        if hasattr(dataset, 'global_min') and hasattr(dataset, 'global_max'):
-             g_min = dataset.global_min[start_idx:].to(state_tensor.device)
-             g_max = dataset.global_max[start_idx:].to(state_tensor.device)
-             
-             # FlexibleDataset uses: scalar * (val - min) / (max - min)
-             # Wait, usually MinMax is (val - min)/(max - min) -> [0, 1]
-             # OR 2*(...) - 1 -> [-1, 1].
-             # Let's check FlexibleWindowDataset._normalize:
-             # norm = (val - min_v) / denom. Result is [0, 1].
-             
-             # So Denorm = val * denom + min_v
-             denom = g_max - g_min
-             denom[denom < 1e-6] = 1.0 # Though global stats probably don't have this issue if computed well
-             
-             return state_tensor * denom + g_min
-             
-    else: # mean_std
-        if hasattr(dataset, 'global_mean') and hasattr(dataset, 'global_std'):
-            g_mean = dataset.global_mean[start_idx:].to(state_tensor.device)
-            g_std = dataset.global_std[start_idx:].to(state_tensor.device)
-            
-            return state_tensor * g_std + g_mean
-
-    return state_tensor
+    # Object: Base pos (3), Base quat (4)
+    q[36:43] = curr_obj[:7]
+    return q
 
 
 # ===============================
@@ -212,40 +89,42 @@ def main():
     # Load config
     model_cfg, data_cfg, training_cfg, scheduler_cfg = load_config("config/config.yaml")
     
+    # Ensure noise config is properly handled
     obs_noise_cfg = training_cfg.get("state_conditioning_noise_level", {})
     if not obs_noise_cfg:
         print("Warning: 'state_conditioning_noise_level' not found in config. Using defaults.")
-        obs_noise_cfg = {
+        # Update training_cfg so dataset initializes it properly
+        training_cfg["state_conditioning_noise_level"] = {
             "joints": 0.01, "body_z": 0.01, "body_rot6d": 0.01,
             "obj_rel_pos": 0.01, "obj_rel_rot6d": 0.01, "task_params": 0.01
         }
-    
+        
+    training_cfg["add_obs_noise"] = True # We force true so FlexibleDataset creates the noise
+    data_cfg["augmentation"]["mirror_symmetry"]["enabled"] = False # Disable mirroring for clean comparison
+
     data_path = get_data_path(data_cfg)
     norm_path = get_norm_path(model_cfg, training_cfg, data_cfg)
 
     print("Loading dataset...")
-    # Clean dataset to start
     data_buff = preload_dataset(data_cfg, data_path)
     dataset = FlexibleWindowDataset(
         data_buffer=data_buff, config=data_cfg, norm_path=norm_path,
         calculate_stats=False, training_cfg=training_cfg,
     )
     
-    feature_dims = get_feature_dims(dataset)
-    
     xml_path = "./unitree_g1/mj_model.xml"
     if not os.path.exists(xml_path):
          print(f"Warning: {xml_path} not found. Visualization might fail.")
     visualizer = MjVisualizer(xml_path)
     
-    # Inject the clean_request dict if it wasn't added to the class yet (safety fallback)
+    # Inject the clean_request dict if it wasn't added to the class yet
     if not hasattr(visualizer, "clean_request"):
         visualizer.clean_request = {"active": False}
 
     print("\n" + "="*40)
     print("CONTROLS:")
     print("  SPACE: Generate NEW noise and apply it to current state")
-    print("  'C' Key: Revert to Clean (Original) state")
+    print("  'C' Key: Toggle Clean (Original) vs Noisy state")
     print("  RIGHT ARROW: Next Timestep")
     print("  ESC: Quit")
     print("="*40 + "\n")
@@ -338,52 +217,42 @@ def main():
                 
                 # Reset visualizer triggers for the new step
                 visualizer.paused["active"] = False 
-                visualizer.clean_request["active"] = False
                 visualizer.step_request["delta"] = 0
                 
-                print(f"\nStep {step_offset + 1}/{args.steps}: Mode = CLEAN (Index {current_idx})")
+                print(f"\nStep {step_offset + 1}/{args.steps}: (Index {current_idx})")
+                last_clean_state = None
 
                 while True:
-                    # --- CHECK SPACEBAR (Generate New Noise) ---
-                    if visualizer.paused["active"]:
-                        visualizer.paused["active"] = False # Consume toggle
-                        
-                        # 1. Safely CLONE the state to prevent PyTorch in-place mutation bugs
-                        # Take the WHOLE history window to add noise consistently
-                        clean_state_t = clean_state.clone()
-                        
-                        # 2. Decompose and add noise
-                        clean_comps_t = decompose_state(clean_state_t, dataset, feature_dims)
-                        noisy_comps_t, noise_mags = apply_noise_to_components(clean_comps_t, dataset)
-                        
-                        # 3. Reconstruct using the cloned clean state as the base tensor
-                        noisy_state_t = reconstruct_state(noisy_comps_t, dataset, feature_dims, base_tensor=clean_state_t)
-                        
-                        # 4. Denormalize and map back to viewer
-                        noisy_state_denorm_t = denormalize_state(noisy_state_t, dataset)
-                        noisy_denorm_comps_t = decompose_state(noisy_state_denorm_t, dataset, feature_dims)
-                        
-                        # Update display state (visualize the last frame of the noisy history)
-                        q_show = get_qpos_from_comps(noisy_denorm_comps_t, t_idx_to_show)
-                        print(f"  -> Space pressed: Generated NEW noise. Mode = NOISY")
+                    # React to Mode toggles for UI prints
+                    is_clean = getattr(visualizer.clean_request, "get", lambda k,d: visualizer.clean_request[k])("active", False) if isinstance(visualizer.clean_request, dict) else False
 
-                    # --- CHECK 'C' KEY (Revert to Clean) ---
-                    if getattr(visualizer, "clean_request", {}).get("active", False):
-                        visualizer.clean_request["active"] = False # Consume toggle
-                        q_show = q_clean.copy()
-                        print(f"  -> 'C' pressed: Reverted. Mode = CLEAN")
+                    if is_clean != last_clean_state:
+                         print(f"  -> Mode = {'CLEAN' if is_clean else 'NOISY'}")
+                         last_clean_state = is_clean
 
-                    # --- CHECK RIGHT ARROW (Next Step) ---
-                    if visualizer.step_request["delta"] > 0:
-                        visualizer.step_request["delta"] -= 1 # Consume toggle
-                        # Move to next index in the outer loop
+                    # Regenerate Noisy
+                    if getattr(visualizer.paused, "get", lambda k,d: visualizer.paused[k])("active", False) if isinstance(visualizer.paused, dict) else False:
+                         if isinstance(visualizer.paused, dict):
+                            visualizer.paused["active"] = False
+                         if not is_clean:
+                              q_noisy = get_reconstructed_qpos(dataset, current_idx, force_clean=False)
+                              print(f"  -> Space pressed: Generated NEW noise.")
+                         else:
+                              print(f"  -> Space pressed: Ignored (In CLEAN mode). Toggle 'C' first.")
+
+                    q_show = q_clean if is_clean else q_noisy
+                    
+                    # Next Step
+                    if getattr(visualizer.step_request, "get", lambda k,d: visualizer.step_request[k])("delta", 0) > 0 if isinstance(visualizer.step_request, dict) else False:
+                        if isinstance(visualizer.step_request, dict):
+                            visualizer.step_request["delta"] -= 1
                         break 
 
-                    # Check Exit
-                    if getattr(visualizer, "exit_request", {}).get("active", False):
+                    # Quit
+                    if getattr(visualizer.exit_request, "get", lambda k,d: visualizer.exit_request[k])("active", False) if isinstance(visualizer.exit_request, dict) else False:
                             return
 
-                    # Push state to mujoco
+                    # Sync viewer
                     visualizer.update_data(q_show)
                     time.sleep(0.02)
                     

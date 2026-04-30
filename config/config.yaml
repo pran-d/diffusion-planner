@@ -8,14 +8,14 @@ data:
   num_task_params: 4
   num_observations: 45
   start_timestep: 0
-  num_timesteps: 40
-  state_history: 2
+  num_timesteps: 50
+  state_history: 5
   stride: 2
   normalize_goal_vec: True
   max_obj_displacement: 1.0
   downsample: 1
   rot_type: quat
-  raw_dt: 0.01
+  raw_dt: 0.03
   feature_order:
     - delta_xy
     - delta_yaw

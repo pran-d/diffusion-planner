@@ -16,7 +16,7 @@ def load_env_and_data():
     model_cfg, data_cfg, training_cfg, noise_cfg = load_config("config/config.yaml")
 
     # For this visualizer, only load canonical per-task trajectory files.
-    data_cfg["file_names"] = ["best_trajectory.npz"]
+    # data_cfg["file_names"] = ["best_trajectory.npz"]
 
     data_path = get_data_path(data_cfg)
     norm_path = get_norm_path(model_cfg, training_cfg, data_cfg)
