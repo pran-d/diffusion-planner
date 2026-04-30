@@ -13,7 +13,7 @@ from einops.layers.torch import Rearrange
 import numpy as np
 from utils.configcls import Config
 
-from utils.math.sbto_utils import build_feature_layout, get_feature_indices
+from utils.math.sbto_utils import build_feature_layout
 
 # =========================
 # Conditioning Embeddings
@@ -64,6 +64,48 @@ class MLP(nn.Module):
         return self.net(x)
 
 
+class HistoryAggregator(nn.Module):
+    """Compress (B, H, D) history embeddings into (B, 1, D).
+
+    Supports two modes:
+      - ``"attn"`` (default): learned attention pooling — a single-head
+        attention query that attends to all H frames.  Most expressive
+        and order-aware.
+      - ``"mean"``: simple mean pooling over the time axis.  Parameter-free,
+        useful as a lightweight baseline.
+
+    When ``H == 1`` both modes reduce to an identity reshape.
+    """
+
+    def __init__(self, hidden_dim: int, mode: str = "attn"):
+        super().__init__()
+        self.mode = mode
+        if mode == "attn":
+            # Learned query vector that attends to the H history tokens
+            self.query = nn.Parameter(torch.randn(1, 1, hidden_dim) * 0.02)
+            self.attn = nn.MultiheadAttention(
+                embed_dim=hidden_dim, num_heads=1, batch_first=True,
+            )
+        elif mode != "mean":
+            raise ValueError(f"Unknown history aggregation mode: {mode!r}")
+
+    def forward(self, h: torch.Tensor) -> torch.Tensor:
+        """
+        Args:
+            h: (B, H, D) embedded history frames.
+        Returns:
+            (B, 1, D) aggregated conditioning token.
+        """
+        if h.shape[1] == 1:
+            return h  # no-op when H == 1
+        if self.mode == "mean":
+            return h.mean(dim=1, keepdim=True)
+        # attn: query (B, 1, D) attends to h (B, H, D)
+        query = self.query.expand(h.shape[0], -1, -1)
+        out, _ = self.attn(query, h, h)  # (B, 1, D)
+        return out
+
+
 class DFoTTrajectory(nn.Module):
     def __init__(self, model_config, data_config, noise_scheduler_config=None, training_config=None):
         super().__init__()
@@ -75,16 +117,28 @@ class DFoTTrajectory(nn.Module):
         self.x_shape = torch.Size([data_config['num_features']])
         self.state_condition = model_config.get("state_condition", False)
         self.task_condition = model_config.get("task_condition", False)
+        # self.style_condition = model_config.get("style_condition", False)
         
         self.state_dim = model_config['hidden_size'] if self.state_condition else 0
         self.task_dim = model_config.get("hidden_size", 64) if self.task_condition else 0
+        # self.style_dim = model_config.get("hidden_size", 64) if self.style_condition else 0
 
         self.external_cond_dim = self.state_dim + self.task_dim
+        # + self.style_dim
+
+        self.history_size = data_config.get("state_history", 1)
             
         if self.state_condition:
             self.state_embedding = MLP(
                 in_dim=data_config.get("num_observations", 86),
                 out_dim=model_config.get("hidden_size", 64)
+            )
+            # Aggregate multi-frame history (B, H, hidden) → (B, 1, hidden)
+            # When H == 1 the aggregator is a no-op reshape.
+            agg_mode = model_config.get("history_aggregation", "attn")
+            self.history_aggregator = HistoryAggregator(
+                hidden_dim=model_config.get("hidden_size", 64),
+                mode=agg_mode,
             )
 
         if self.task_condition:
@@ -92,6 +146,12 @@ class DFoTTrajectory(nn.Module):
                 in_dim=data_config.get("num_task_params", 10),
                 out_dim=model_config.get("hidden_size", 64) 
             )
+
+        # if self.style_condition:
+        #     self.style_embedding = MLP(
+        #         in_dim=data_config.get("num_styles", 3),
+        #         out_dim=model_config.get("hidden_size", 64)
+        #     )
   
         # Backbone config
         backbone_type = model_config.get("backbone_type", "dit1d")
@@ -577,6 +637,135 @@ class DFoTTrajectory(nn.Module):
 
         return loss
 
+    # ------------------------------------------------------------------
+    # Auxiliary losses (computed on predicted clean trajectory x_pred)
+    # ------------------------------------------------------------------
+
+    def compute_auxiliary_losses(
+        self, x_pred: torch.Tensor, x_gt: torch.Tensor, masks: torch.Tensor
+    ) -> dict:
+        """Compute optional auxiliary losses on the predicted clean trajectory.
+
+        All losses are returned as *scalar* tensors (already reduced) so they
+        can be summed into the main objective with per-loss weight coefficients.
+
+        Args:
+            x_pred: (B, T, D) predicted clean x0 in feature space.
+            x_gt:   (B, T, D) ground-truth trajectory.
+            masks:  (B, T) boolean validity mask.
+
+        Returns:
+            dict  {loss_name: scalar tensor}  (empty if nothing is enabled).
+        """
+        aux = {}
+        tcfg = self.training_config or {}
+        fim = self.feature_index_map  # e.g. {"joints": slice(6,35), ...}
+
+        # Helper: frame-pair mask for consecutive-frame losses (B, T-1)
+        if masks is not None and masks.shape[1] > 1:
+            pair_mask = (masks[:, :-1] & masks[:, 1:]).float()   # (B, T-1)
+        else:
+            pair_mask = None
+
+        # ---- 1. Temporal smoothness loss ----
+        # Penalise large frame-to-frame changes in x_pred (encourages smooth
+        # trajectories).  Applied to all features by default, but can be
+        # restricted to specific groups via config.
+        w_smooth = tcfg.get("smoothness_loss_weight", 0.0)
+        if w_smooth > 0.0 and x_pred.shape[1] > 1:
+            diff_pred = x_pred[:, 1:] - x_pred[:, :-1]  # (B, T-1, D)
+            diff_gt   = x_gt[:, 1:]   - x_gt[:, :-1]
+
+            smooth_groups = tcfg.get("smoothness_feature_groups", None)
+            if smooth_groups and fim:
+                # Only apply to listed groups
+                slices = [fim[g] for g in smooth_groups if g in fim]
+                if slices:
+                    sel = torch.cat(
+                        [diff_pred[..., s] for s in slices], dim=-1
+                    )
+                    sel_gt = torch.cat(
+                        [diff_gt[..., s] for s in slices], dim=-1
+                    )
+                else:
+                    sel, sel_gt = diff_pred, diff_gt
+            else:
+                sel, sel_gt = diff_pred, diff_gt
+
+            # MSE between predicted and true consecutive differences
+            smooth_loss = F.mse_loss(sel, sel_gt, reduction="none")
+            if pair_mask is not None:
+                smooth_loss = smooth_loss * pair_mask.unsqueeze(-1)
+                smooth_loss = smooth_loss.sum() / (pair_mask.sum() * sel.shape[-1] + 1e-8)
+            else:
+                smooth_loss = smooth_loss.mean()
+            aux["smoothness"] = w_smooth * smooth_loss
+
+        # ---- 2. Object grasping consistency loss ----
+        # During carry phases (object close to body), obj_rel_pos should stay
+        # stable.  We penalise large frame-to-frame changes in obj_rel_pos
+        # weighted by a soft "grasp gate" = sigmoid(-dist + threshold).
+        w_grasp = tcfg.get("grasp_consistency_loss_weight", 0.0)
+        if w_grasp > 0.0 and "obj_rel_pos" in fim and x_pred.shape[1] > 1:
+            rel_sl = fim["obj_rel_pos"]                          # slice(42, 45)
+            pred_rel = x_pred[..., rel_sl]                       # (B, T, 3)
+            gt_rel   = x_gt[..., rel_sl]
+
+            # Grasp gate: use GT relative distance so the gate is stable
+            dist_gt = gt_rel.norm(dim=-1, keepdim=True)          # (B, T, 1)
+            grasp_thresh = tcfg.get("grasp_distance_threshold", 0.35)
+            # Soft gate: 1 when object is close, 0 when far
+            gate = torch.sigmoid(5.0 * (grasp_thresh - dist_gt)) # (B, T, 1)
+
+            delta_pred = pred_rel[:, 1:] - pred_rel[:, :-1]     # (B, T-1, 3)
+            delta_gt   = gt_rel[:, 1:]   - gt_rel[:, :-1]
+            gate_pairs = torch.minimum(gate[:, 1:], gate[:, :-1]) # conservative
+
+            grasp_loss = F.mse_loss(delta_pred, delta_gt, reduction="none") * gate_pairs
+            if pair_mask is not None:
+                grasp_loss = grasp_loss * pair_mask.unsqueeze(-1)
+                denom = (pair_mask.unsqueeze(-1) * gate_pairs).sum() + 1e-8
+                grasp_loss = grasp_loss.sum() / denom
+            else:
+                grasp_loss = (grasp_loss.sum()) / (gate_pairs.sum() + 1e-8)
+            aux["grasp_consistency"] = w_grasp * grasp_loss
+
+        # ---- 3. Feet-sliding proxy loss ----
+        # Without differentiable FK we use a joint-velocity proxy: penalise
+        # large ankle-joint velocity in the prediction when the GT also has
+        # low ankle velocity (i.e., stance phases).
+        # Ankle indices inside the 29-joint block:
+        #   left ankle  pitch/roll → 4, 5
+        #   right ankle pitch/roll → 10, 11
+        w_feet = tcfg.get("feet_sliding_loss_weight", 0.0)
+        if w_feet > 0.0 and "joints" in fim and x_pred.shape[1] > 1:
+            j_sl = fim["joints"]  # slice(6, 35)
+            ankle_local = [4, 5, 10, 11]  # indices within 29-joint block
+            ankle_global = [j_sl.start + i for i in ankle_local]
+
+            pred_ankles = x_pred[..., ankle_global]              # (B, T, 4)
+            gt_ankles   = x_gt[..., ankle_global]
+
+            vel_pred = pred_ankles[:, 1:] - pred_ankles[:, :-1]  # (B, T-1, 4)
+            vel_gt   = gt_ankles[:, 1:]   - gt_ankles[:, :-1]
+
+            # Stance gate: GT ankle velocity is small → foot likely on ground
+            vel_gt_mag = vel_gt.abs()
+            stance_thresh = tcfg.get("stance_velocity_threshold", 0.02)
+            stance_gate = (vel_gt_mag < stance_thresh).float()   # (B, T-1, 4)
+
+            # Penalise predicted ankle velocity during GT stance
+            feet_loss = (vel_pred ** 2) * stance_gate
+            if pair_mask is not None:
+                feet_loss = feet_loss * pair_mask.unsqueeze(-1)
+                denom = (pair_mask.unsqueeze(-1) * stance_gate).sum() + 1e-8
+                feet_loss = feet_loss.sum() / denom
+            else:
+                feet_loss = feet_loss.sum() / (stance_gate.sum() + 1e-8)
+            aux["feet_sliding"] = w_feet * feet_loss
+
+        return aux
+
     def forward(self, x, model_cond=None, masks=None, timesteps=None):
         """
         Forward pass for training.
@@ -608,12 +797,16 @@ class DFoTTrajectory(nn.Module):
                     state_cond = model_cond
                 elif self.task_condition:
                     task_cond = model_cond
+                # elif self.style_condition:
+                #     style_cond = model_cond
         
         cond_list = []
         if self.state_condition and state_cond is not None:
             s_cond = self.state_embedding(state_cond) 
             if s_cond.ndim == 2:
-                s_cond = s_cond.unsqueeze(1)
+                s_cond = s_cond.unsqueeze(1)            # (B, 1, hidden)
+            # Aggregate multi-frame history → single conditioning token
+            s_cond = self.history_aggregator(s_cond)    # (B, 1, hidden)
             s_cond = apply_condition_dropout(
                 s_cond, 
                 self.training_config.get("condition_dropout_prob", {}).get("state", 0.0),
@@ -746,16 +939,25 @@ class DFoTTrajectory(nn.Module):
             if len(flat_cond) > idx and self.task_condition:
                 task_cond = flat_cond[idx]
                 idx += 1
+            # if len(flat_cond) > idx and self.style_condition:
+            #     style_cond = flat_cond[idx]
+            #     idx += 1
         else:
             if self.state_condition:
                 state_cond_input = model_cond
             elif self.task_condition:
                 task_cond = model_cond
+            # elif self.style_condition:
+            #     style_cond = model_cond
 
         cond_list = []
         if self.state_condition and state_cond_input is not None:
             self.state_cond = state_cond_input
-            s_cond = self.state_embedding(state_cond_input) # (B, C)
+            s_cond = self.state_embedding(state_cond_input) # (B, H, hidden) or (B, hidden)
+            if s_cond.ndim == 2:
+                s_cond = s_cond.unsqueeze(1)                # (B, 1, hidden)
+            # Aggregate multi-frame history → single conditioning token
+            s_cond = self.history_aggregator(s_cond)         # (B, 1, hidden)
             if no_state_cond:
                 s_cond = apply_condition_dropout(
                     s_cond, 
