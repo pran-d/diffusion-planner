@@ -1,4 +1,4 @@
-from typing import Optional, Tuple, Literal
+from typing import Optional, Tuple, Literal, Dict, List
 import numpy as np
 import torch
 from torch import nn
@@ -78,6 +78,64 @@ class SinusoidalPositionalEmbedding(nn.Module):
         return x + self.pos_emb[:, :seq_len]
 
 
+class GroupWiseInputEmbedder(nn.Module):
+    """Per-semantic-group linear projections whose outputs are summed.
+
+    Each feature group (e.g. *delta_xy*, *joints*, *body_rot6d*) gets its own
+    ``nn.Linear(group_dim, hidden_size)``.  The outputs are summed element-wise
+    to produce a single ``(B, T, hidden_size)`` embedding, giving the model an
+    inductive bias that respects the heterogeneous structure of the feature
+    vector.
+
+    Falls back to a single ``nn.Linear`` when no group slices are provided.
+    """
+
+    def __init__(
+        self,
+        in_channels: int,
+        hidden_size: int,
+        group_slices: Dict[str, slice],
+    ):
+        super().__init__()
+        self.in_channels = in_channels
+        self.hidden_size = hidden_size
+        self.group_slices = group_slices  # e.g. {"delta_xy": slice(0,2), ...}
+
+        # Build one linear projection per group
+        self.group_names: List[str] = []
+        self.group_projs = nn.ModuleDict()
+        covered = set()
+        for name, sl in group_slices.items():
+            dim = sl.stop - sl.start
+            if dim <= 0:
+                continue
+            self.group_names.append(name)
+            self.group_projs[name] = nn.Linear(dim, hidden_size)
+            covered.update(range(sl.start, sl.stop))
+
+        # Catch any feature indices not covered by a named group
+        uncovered = sorted(set(range(in_channels)) - covered)
+        if uncovered:
+            self._uncovered_indices = uncovered
+            self.group_names.append("_residual")
+            self.group_projs["_residual"] = nn.Linear(len(uncovered), hidden_size)
+        else:
+            self._uncovered_indices = []
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """x: (B, T, in_channels) → (B, T, hidden_size)"""
+        out = torch.zeros(
+            *x.shape[:-1], self.hidden_size, device=x.device, dtype=x.dtype
+        )
+        for name in self.group_names:
+            if name == "_residual":
+                xi = x[..., self._uncovered_indices]
+            else:
+                xi = x[..., self.group_slices[name]]
+            out = out + self.group_projs[name](xi)
+        return out
+
+
 class DiT1D(BaseBackbone):
 
     def __init__(
@@ -96,6 +154,13 @@ class DiT1D(BaseBackbone):
             use_causal_mask,
         )
 
+        if use_causal_mask:
+            self.use_causal_mask = True
+        else:
+            self.use_causal_mask = False
+
+        self.mask_token = nn.Parameter(torch.randn(1, 1, cfg.hidden_size))
+
         hidden_size = cfg.hidden_size
         in_channels = x_shape[0]
         out_channels = x_shape[0]
@@ -106,6 +171,7 @@ class DiT1D(BaseBackbone):
         pos_emb_type = cfg.pos_emb_type
 
         self.input_embedder = nn.Linear(in_channels, hidden_size)
+        self._group_wise = False  # may be replaced by set_group_wise_embedder()
         
         self.out_channels = out_channels # Assuming learn_sigma=False based on DiT1D.init
         self.hidden_size = hidden_size
@@ -145,11 +211,33 @@ class DiT1D(BaseBackbone):
     def in_channels(self) -> int:
         return self.x_shape[0]
 
+    def set_group_wise_embedder(self, group_slices: Dict[str, slice]) -> None:
+        """Replace the flat input_embedder with per-group projections.
+
+        Call this after __init__ (and before training) to switch to
+        group-wise input embedding.  The old ``nn.Linear`` is discarded.
+        """
+        self.input_embedder = GroupWiseInputEmbedder(
+            in_channels=self.in_channels,
+            hidden_size=self.hidden_size,
+            group_slices=group_slices,
+        )
+        self._group_wise = True
+        # Re-initialise the new projections
+        self._input_embedder_init(self.input_embedder)
+        n_groups = len(self.input_embedder.group_names)
+        print(f"  → Group-wise input embedding enabled ({n_groups} groups)")
+
     @staticmethod
     def _input_embedder_init(embedder) -> None:
         # Initialize input_embedder like nn.Linear:
-        nn.init.xavier_uniform_(embedder.weight)
-        nn.init.zeros_(embedder.bias)
+        if isinstance(embedder, GroupWiseInputEmbedder):
+            for proj in embedder.group_projs.values():
+                nn.init.xavier_uniform_(proj.weight)
+                nn.init.zeros_(proj.bias)
+        else:
+            nn.init.xavier_uniform_(embedder.weight)
+            nn.init.zeros_(embedder.bias)
 
     def initialize_weights(self) -> None:
         self._input_embedder_init(self.input_embedder)
@@ -188,10 +276,15 @@ class DiT1D(BaseBackbone):
         noise_levels: torch.Tensor,
         external_cond: Optional[torch.Tensor] = None,
         external_cond_mask: Optional[torch.Tensor] = None,
+        mask: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         # 1. Input Embedding
         # x is (B, T, C)
         x = self.input_embedder(x) # (B, T, hidden)
+
+        if mask is not None:
+            # mask: (B, T) boolean tensor where True means masked
+            x = torch.where(mask.unsqueeze(-1), self.mask_token, x)
 
         # 2. Condition Embedding
         c = self.noise_level_pos_embedding(noise_levels)

@@ -222,6 +222,23 @@ class DFoTTrajectory(nn.Module):
         self.group_keep_probs = partial_cfg.get("group_keep_prob", {})
         self.waypoint_noise_fraction = self.inbetweening_cfg.get("waypoint_noise_fraction", 0.25)
 
+        # Optional: group-wise input embeddings for the DiT1D backbone.
+        # Instead of a single nn.Linear(D, hidden) the backbone uses per-group
+        # projections whose outputs are summed → hidden, giving the model an
+        # inductive bias about the heterogeneous feature structure.
+        if model_config.get("group_wise_embedding", False) and backbone_type == "dit1d":
+            # Use the canonical feature_order groups (not the partial masking
+            # groups which merge multiple keys).  This gives one projection per
+            # semantic feature (delta_xy, delta_yaw, joints, …).
+            gw_slices = {
+                k: v for k, v in self.feature_index_map.items()
+                if k not in ("joints_lower", "joints_upper")  # avoid sub-slices
+            }
+            self.diffusion_model.model.set_group_wise_embedder(gw_slices)
+            # Recount params after replacement
+            total_params = sum(p.numel() for p in self.diffusion_model.model.parameters())
+            print(f"  Updated param count: {total_params/1e6:.2f}M parameters.")
+
         # Waypoint indicator embedding: projects per-feature binary mask (D) into
         # the backbone's hidden space so the model knows which features are constrained.
         # Added to token embeddings after input_embedder + pos_emb, before transformer blocks.
