@@ -114,10 +114,10 @@ class RobotDiffuser():
                 goal_cond = torch.from_numpy(goal_cond).to(self.device).to(sample.dtype)
             cond_list.append(goal_cond)
 
-        # if getattr(self.model, 'style_condition', False) and style_cond is not None:
-        #     if isinstance(style_cond, np.ndarray):
-        #         style_cond = torch.from_numpy(style_cond).to(self.device).to(sample.dtype)
-        #     cond_list.append(style_cond)
+        if getattr(self.model, 'style_condition', False) and style_cond is not None:
+            if isinstance(style_cond, np.ndarray):
+                style_cond = torch.from_numpy(style_cond).to(self.device).to(sample.dtype)
+            cond_list.append(style_cond)
 
 
         # tuple containing state cond, goal cond    

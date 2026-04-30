@@ -313,8 +313,8 @@ def parse_args(argv=None):
                         help="Classifier-free guidance weight")
     parser.add_argument("--task_params", nargs="+", type=float, default=None,
                         help="Override goal as local-frame displacement (e.g. --task_params 0.5 -0.2)")
-    # parser.add_argument("--style", type=str, default=None, choices=["pick", "push", "kick"],
-    #                     help="Optional style command for style-conditioned model")
+    parser.add_argument("--style", type=str, default=None, choices=["pick", "push", "kick"],
+                        help="Optional style command for style-conditioned model")
     parser.add_argument("--end_error_threshold", type=float, default=0.1,
                         help="XY-plane radius (m) for goal-reached check")
     parser.add_argument("--end_ground_num_frames", type=int, default=5,
@@ -476,7 +476,7 @@ def main():
     result, real_lengths = mg.generate_trajectory(
         initial_condition=initial_condition,
         goal_condition=goal_local,
-        # style_condition=args.style,
+        style_condition=args.style,
         target_traj_length=args.target_traj_length,
         stitch_steps=args.stitch_steps,
         num_samples=args.num_samples,

@@ -20,7 +20,7 @@ from models.model import RobotDiffuser
 from datasets.flexible_dataset import FlexibleWindowDataset
 from utils.math.sbto_utils import reconstruct_sbto_trajectory, compute_task_params
 from utils.math.math_tools import yaw_from_quat, yaw_to_rot_matrix
-# from utils.data.style_conditioning import one_hot_style, style_name_to_id
+from utils.data.style_conditioning import one_hot_style, style_name_to_id
 from utils.physics_limits import apply_physics_clamp
 from utils.inference_utils import build_inference_waypoints
 from diffusers import EMAModel
@@ -188,7 +188,7 @@ class MotionGenerator:
         save_path: str = None,
         checkpoint: Optional[str] = None,
         calc_stats: bool = True,
-        # motion_styles: Optional[Union[List[str], List[int]]] = None,
+        motion_styles: Optional[Union[List[str], List[int]]] = None,
     ):
 
         """
@@ -234,7 +234,7 @@ class MotionGenerator:
             calculate_stats=calc_stats, 
             norm_path=norm_path,
             training_cfg=self.training_cfg,
-            # motion_styles=motion_styles,
+            motion_styles=motion_styles,
         )
 
         # Task Density Balancing
@@ -297,7 +297,7 @@ class MotionGenerator:
         
         state_condition = self.model_cfg.get("state_condition", False)
         task_condition = self.model_cfg.get("task_condition", False)
-        # style_condition = self.model_cfg.get("style_condition", False)
+        style_condition = self.model_cfg.get("style_condition", False)
         dropout_probs = self.training_cfg.get("condition_dropout_prob", {})
         
         print(f"Starting training for {epochs} epochs...")
@@ -329,7 +329,7 @@ class MotionGenerator:
 
                 state_cond = None
                 task_cond = None
-                # style_cond = None
+                style_cond = None
             
                 batch_data = list(batch)
                 prediction_target = batch_data[0].to(self.device)
@@ -343,16 +343,16 @@ class MotionGenerator:
                     task_cond = batch_data[idx].to(self.device)
                     idx += 1
 
-                # if style_condition:
-                #     if idx < len(batch_data) and isinstance(batch_data[idx], torch.Tensor):
-                #         style_cond = batch_data[idx].to(self.device)
-                #         idx += 1
+                if style_condition:
+                    if idx < len(batch_data) and isinstance(batch_data[idx], torch.Tensor):
+                        style_cond = batch_data[idx].to(self.device)
+                        idx += 1
                 
                 # Construct cond (matches train.py)
                 cond = []
                 if state_cond is not None: cond.append(state_cond)
                 if task_cond is not None: cond.append(task_cond)
-                # if style_cond is not None: cond.append(style_cond)
+                if style_cond is not None: cond.append(style_cond)
                 
                 model_cond = tuple(cond) if len(cond) > 0 else None
                 if len(cond) == 1: model_cond = cond[0]
@@ -588,7 +588,7 @@ class MotionGenerator:
     def generate_trajectory(self, 
                             initial_condition: Dict, 
                             goal_condition: Union[Dict, np.ndarray],
-                            # style_condition: Optional[Union[str, np.ndarray, list]] = None,
+                            style_condition: Optional[Union[str, np.ndarray, list]] = None,
                             target_traj_length: int = None,
                             stitch_steps: int = None, 
                             num_samples: int = 1,
@@ -735,25 +735,25 @@ class MotionGenerator:
         curr_state_tens = curr_state_tens.to(self.device)
         effective_batch = curr_state_tens.shape[0]
 
-        # style_cond_tens = None
-        # if self.model_cfg.get("style_condition", False):
-        #     num_styles = int(self.data_cfg.get("num_styles", 3))
-        #     if style_condition is None:
-        #         style_cond_np = np.tile(one_hot_style(style_name_to_id("push"), num_styles=num_styles), (effective_batch, 1))
-        #     elif isinstance(style_condition, str):
-        #         sid = style_name_to_id(style_condition)
-        #         style_cond_np = np.tile(one_hot_style(sid, num_styles=num_styles), (effective_batch, 1))
-        #     else:
-        #         sc = np.asarray(style_condition)
-        #         if sc.ndim == 1 and sc.shape[0] == effective_batch:
-        #             style_cond_np = np.stack([one_hot_style(int(v), num_styles=num_styles) for v in sc], axis=0)
-        #         elif sc.ndim == 2 and sc.shape[1] == num_styles:
-        #             style_cond_np = sc.astype(np.float32)
-        #             if style_cond_np.shape[0] == 1 and effective_batch > 1:
-        #                 style_cond_np = np.repeat(style_cond_np, effective_batch, axis=0)
-        #         else:
-        #             raise ValueError(f"Unsupported style_condition shape={sc.shape}")
-        #     style_cond_tens = torch.from_numpy(style_cond_np.astype(np.float32)).to(self.device)
+        style_cond_tens = None
+        if self.model_cfg.get("style_condition", False):
+            num_styles = int(self.data_cfg.get("num_styles", 3))
+            if style_condition is None:
+                style_cond_np = np.tile(one_hot_style(style_name_to_id("push"), num_styles=num_styles), (effective_batch, 1))
+            elif isinstance(style_condition, str):
+                sid = style_name_to_id(style_condition)
+                style_cond_np = np.tile(one_hot_style(sid, num_styles=num_styles), (effective_batch, 1))
+            else:
+                sc = np.asarray(style_condition)
+                if sc.ndim == 1 and sc.shape[0] == effective_batch:
+                    style_cond_np = np.stack([one_hot_style(int(v), num_styles=num_styles) for v in sc], axis=0)
+                elif sc.ndim == 2 and sc.shape[1] == num_styles:
+                    style_cond_np = sc.astype(np.float32)
+                    if style_cond_np.shape[0] == 1 and effective_batch > 1:
+                        style_cond_np = np.repeat(style_cond_np, effective_batch, axis=0)
+                else:
+                    raise ValueError(f"Unsupported style_condition shape={sc.shape}")
+            style_cond_tens = torch.from_numpy(style_cond_np.astype(np.float32)).to(self.device)
 
         # Physics-check thresholds
         _FLOOR_Z        = -0.1   # m — pelvis/object z below this → ground penetration
@@ -849,7 +849,7 @@ class MotionGenerator:
                     num_trajectories=effective_batch,
                     state_cond=curr_state_tens,
                     goal_cond=task_cond,
-                    # style_cond=style_cond_tens,
+                    style_cond=style_cond_tens,
                     deterministic=self.noise_cfg.get("deterministic_inference", False),
                     cfg_w=cfg_w,
                     waypoint_values=wv,

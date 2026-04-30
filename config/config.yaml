@@ -5,15 +5,17 @@ data:
   dataset_class: "flexible"
   batch_size: 1024
   num_features: 51
-  num_task_params: 3
+  num_task_params: 4
   num_observations: 45
   start_timestep: 0
-  num_timesteps: 10
-  state_history: 1
+  num_timesteps: 40
+  state_history: 2
   stride: 2
   normalize_goal_vec: True
   max_obj_displacement: 1.0
-
+  downsample: 1
+  rot_type: quat
+  raw_dt: 0.01
   feature_order:
     - delta_xy
     - delta_yaw
@@ -31,12 +33,26 @@ data:
     joint_pos: "dof_pos"
     object_pos_w: "object_pos"
     object_quat_w: "object_rot"
+  
+  augmentation:
+    mirror_symmetry:
+      enabled: True
+      prob: 0.5
+  
+  num_styles: 3
+  style_conditioning:
+    enabled: False
+    detection_mode: motion_then_text
+    num_styles: 3
+    seed: 42
+    tasks_file: ./test_datasets/tasks.yml
 
 model:
   type: "dfot"
   inpaint: True
   backbone_type: "dit1d"
   state_condition: True
+  style_condition: False
   task_condition: True
   external_cond_dropout: 0.05
   hidden_size: 256
@@ -44,18 +60,26 @@ model:
   num_heads: 4
   mlp_ratio: 4.0
   pos_emb_type: "learned_1d"
+  group_wise_embedding: True
+  history_aggregation: "attn"
 
 training:
-  suffix: "_partial_masking_abs_z"
-  num_epochs: 750
+  suffix: _style_condition
+  num_epochs: 20
   balance_task_density: False
   learning_rate: 0.0005
   save_every: 50
   condition_dropout_prob: 
     state: 0.1
+    style: 0.05
     task: 0.2
   add_obs_noise: True
   add_goal_noise: True
+  smoothness_loss_weight: 0.1
+  grasp_consistency_loss_weight: 0.25
+  feet_sliding_loss_weight: 0.0
+  grasp_distance_threshold: 0.35
+  stance_velocity_threshold: 0.02
   state_conditioning_noise_level:
     joints: 0.025
     body_rot6d: 0.005
@@ -63,22 +87,29 @@ training:
     obj_rel_rot6d: 0.005
     task_params: 0.025
     task_magnitude: 0.0
+  density_sigma: 0.2
+  ema_decay: 0.9995
+  ema_update_after_step: 0
+  batches_per_epoch: null
 
   # In-betweening (waypoint-masked trajectory completion)
   inbetweening:
     enabled: True
-    resample_steps: 2      # number of times to re-mask and re-predict waypoints during training
-    min_keyframes: 0        # minimum number of unmasked keyframes per window
-    max_keyframes: 3        # maximum number of unmasked keyframes per window
-    always_keep_first: True # always keep t=0 as a full keyframe
-    keep_last_partial: True # always keep t=T-1 as a keyframe
-    waypoint_noise_fraction: 0.5  # max noise level for partial waypoint frames (fraction of total timesteps)
-    arrival_ratio: 0.85            # object reaches target in this fraction of remaining time
+    resample_steps: 2
+    min_keyframes: 0
+    max_keyframes: 3
+    always_keep_first: True
+    keep_last_partial: True
+    waypoint_noise_fraction: 0.5
+    arrival_ratio: 0.85
+    force_all_known_prob: 0.0
+    force_near_empty_prob: 0.0
+
     partial_masking:
       enabled: True
-      prob: 1.0             # probability a waypoint is partial (vs full)
-      joints_split: 12      # first 12 joints = lower body (6L + 6R leg DOFs); rest = upper body
-      feature_groups:       # named groups of features for partial masking
+      prob: 1.0
+      joints_split: 12
+      feature_groups:
         locomotion: [obj_delta_xy]
         pick_place: [obj_z]
         object_pos: [obj_rel_pos, obj_rel_rot6d]
@@ -86,7 +117,7 @@ training:
         upper_body: [joints_upper]   # waist + shoulder / elbow / wrist joints (indices 12-28)
         pose: [body_rot6d]
         robot_pos: [body_z, delta_xy, delta_yaw]
-      group_keep_prob:      # per-group probability of being kept clean in a partial waypoint
+      group_keep_prob:
         locomotion: 0.5
         pick_place: 0.2
         lower_body: 0.15
@@ -94,7 +125,10 @@ training:
         object_pos: 0.0
         pose: 0.0
         robot_pos: 0.0
-
+      per_group_noise_fractions:
+        default: 1.0
+        obj_delta_xy: 0.5
+        obj_z: 0.5
 noise_scheduler:
   deterministic_inference: True
   train_timesteps: 200
@@ -103,3 +137,5 @@ noise_scheduler:
   beta_schedule: "sigmoid" 
   noise_level: "random_uniform"
   scheduling_matrix: "full_sequence"
+  use_fourier_noise_embedding: False
+  noise_level_conditioning_reduce: "max"

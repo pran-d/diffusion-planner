@@ -247,7 +247,7 @@ else:
 
 state_condition = model_cfg.get("state_condition", False)
 task_condition = model_cfg.get("task_condition", False)
-# style_condition = model_cfg.get("style_condition", False)
+style_condition = model_cfg.get("style_condition", False)
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
@@ -407,7 +407,7 @@ for epoch in range(starting_epoch, num_epochs):
 
         state_cond = None
         task_cond = None    
-        # style_cond = None
+        style_cond = None
 
         # Unpack batch
         batch_data = list(batch)
@@ -423,16 +423,16 @@ for epoch in range(starting_epoch, num_epochs):
             task_cond = batch_data[idx].to(device)
             idx += 1
 
-        # if style_condition:
-        #     if idx < len(batch_data) and isinstance(batch_data[idx], torch.Tensor):
-        #         style_cond = batch_data[idx].to(device)
-        #         idx += 1
+        if style_condition:
+            if idx < len(batch_data) and isinstance(batch_data[idx], torch.Tensor):
+                style_cond = batch_data[idx].to(device)
+                idx += 1
             
         # Construct cond for model
         cond = []
         if state_cond is not None: cond.append(state_cond)
         if task_cond is not None: cond.append(task_cond)
-        # if style_cond is not None: cond.append(style_cond)
+        if style_cond is not None: cond.append(style_cond)
     
         model_cond = tuple(cond) if len(cond) > 0 else None
         if len(cond) == 1: model_cond = cond[0]

@@ -117,14 +117,13 @@ class DFoTTrajectory(nn.Module):
         self.x_shape = torch.Size([data_config['num_features']])
         self.state_condition = model_config.get("state_condition", False)
         self.task_condition = model_config.get("task_condition", False)
-        # self.style_condition = model_config.get("style_condition", False)
+        self.style_condition = model_config.get("style_condition", False)
         
         self.state_dim = model_config['hidden_size'] if self.state_condition else 0
         self.task_dim = model_config.get("hidden_size", 64) if self.task_condition else 0
-        # self.style_dim = model_config.get("hidden_size", 64) if self.style_condition else 0
+        self.style_dim = model_config.get("hidden_size", 64) if self.style_condition else 0
 
-        self.external_cond_dim = self.state_dim + self.task_dim
-        # + self.style_dim
+        self.external_cond_dim = self.state_dim + self.task_dim + self.style_dim
 
         self.history_size = data_config.get("state_history", 1)
             
@@ -147,11 +146,11 @@ class DFoTTrajectory(nn.Module):
                 out_dim=model_config.get("hidden_size", 64) 
             )
 
-        # if self.style_condition:
-        #     self.style_embedding = MLP(
-        #         in_dim=data_config.get("num_styles", 3),
-        #         out_dim=model_config.get("hidden_size", 64)
-        #     )
+        if self.style_condition:
+            self.style_embedding = MLP(
+                in_dim=data_config.get("num_styles", 3),
+                out_dim=model_config.get("hidden_size", 64)
+            )
   
         # Backbone config
         backbone_type = model_config.get("backbone_type", "dit1d")
@@ -866,7 +865,7 @@ class DFoTTrajectory(nn.Module):
         
         state_cond = None
         task_cond = None
-        # style_cond = None
+        style_cond = None
 
         if model_cond is not None:
             if isinstance(model_cond, (list, tuple)):
@@ -877,9 +876,9 @@ class DFoTTrajectory(nn.Module):
                 if self.task_condition:
                     if len(model_cond) > idx: task_cond = model_cond[idx]
                     idx += 1
-                # if self.style_condition:
-                #     if len(model_cond) > idx: style_cond = model_cond[idx]
-                #     idx += 1
+                if self.style_condition:
+                    if len(model_cond) > idx: style_cond = model_cond[idx]
+                    idx += 1
 
             else:
                 # Single condition provided
@@ -887,8 +886,8 @@ class DFoTTrajectory(nn.Module):
                     state_cond = model_cond
                 elif self.task_condition:
                     task_cond = model_cond
-                # elif self.style_condition:
-                #     style_cond = model_cond
+                elif self.style_condition:
+                    style_cond = model_cond
         
         cond_list = []
         if self.state_condition and state_cond is not None:
@@ -911,15 +910,15 @@ class DFoTTrajectory(nn.Module):
                 self.training_config.get("condition_dropout_prob", {}).get("task", 0.0),
             )
             cond_list.append(t_cond)
-        # if self.style_condition and style_cond is not None:
-        #     st_cond = self.style_embedding(style_cond)
-        #     if st_cond.ndim == 2:
-        #         st_cond = st_cond.unsqueeze(1)
-        #     st_cond = apply_condition_dropout(
-        #         st_cond,
-        #         self.training_config.get("condition_dropout_prob", {}).get("style", 0.0),
-        #     )
-        #     cond_list.append(st_cond)
+        if self.style_condition and style_cond is not None:
+            st_cond = self.style_embedding(style_cond)
+            if st_cond.ndim == 2:
+                st_cond = st_cond.unsqueeze(1)
+            st_cond = apply_condition_dropout(
+                st_cond,
+                self.training_config.get("condition_dropout_prob", {}).get("style", 0.0),
+            )
+            cond_list.append(st_cond)
 
         ext_cond = None
         if cond_list:
@@ -1036,7 +1035,7 @@ class DFoTTrajectory(nn.Module):
         """
         state_cond_input = None
         task_cond = None
-        # style_cond = None
+        style_cond = None
 
         if isinstance(model_cond, (list, tuple)):
             # Flatten list if nested
@@ -1054,16 +1053,16 @@ class DFoTTrajectory(nn.Module):
             if len(flat_cond) > idx and self.task_condition:
                 task_cond = flat_cond[idx]
                 idx += 1
-            # if len(flat_cond) > idx and self.style_condition:
-            #     style_cond = flat_cond[idx]
-            #     idx += 1
+            if len(flat_cond) > idx and self.style_condition:
+                style_cond = flat_cond[idx]
+                idx += 1
         else:
             if self.state_condition:
                 state_cond_input = model_cond
             elif self.task_condition:
                 task_cond = model_cond
-            # elif self.style_condition:
-            #     style_cond = model_cond
+            elif self.style_condition:
+                style_cond = model_cond
 
         cond_list = []
         if self.state_condition and state_cond_input is not None:
@@ -1083,9 +1082,9 @@ class DFoTTrajectory(nn.Module):
             self.task_cond = task_cond
             t_cond = self.task_embedding(task_cond) # (B, D)
             cond_list.append(t_cond)
-        # if self.style_condition and style_cond is not None:
-        #     st_cond = self.style_embedding(style_cond)
-        #     cond_list.append(st_cond)
+        if self.style_condition and style_cond is not None:
+            st_cond = self.style_embedding(style_cond)
+            cond_list.append(st_cond)
         
         # If we have external conditions (init_cond), pass them as conditions
         conditions = None

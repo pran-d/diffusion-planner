@@ -93,33 +93,6 @@ training:
   ema_update_after_step: 0
   batches_per_epoch: null        # null = use full dataloader length
 
-  # State conditioning masking (randomly mask parts of state input)
-  # Groups match the 5-part joint anatomy + pose/object groups in obs space.
-  # Each group is dropped independently with its own probability, subject to
-  # the top-level 'prob' gate (per-sample Bernoulli).
-  state_conditioning_masking:
-    enabled: False
-    prob: 0.25                       # probability of masking state conditioning per sample
-    locomotion_dropout_prob: 0.30    # coupled training: object_pose masked + locomotion_only waypoint schema
-    masked_obj_loss_scale: 0.0       # deweight object losses when object conditioning is dropped
-    feature_groups:
-      robot_pose:   [body_z, body_rot6d]
-      robot_joints: [joints]
-      object_pose:  [obj_rel_pos, obj_rel_rot6d]
-    group_drop_prob:
-      robot_pose:   0.25
-      robot_joints: 0.25
-      object_pose:  0.25
-
-  # Stitched rollouts (multi-window training for long-horizon)
-  stitched_rollouts:
-    enabled: False
-    num_windows: 2
-    overlap: 1
-    start_epoch: 50
-    end_epoch: 300
-    max_prob: 0.5
-    detach: True
 
   # In-betweening (waypoint-masked trajectory completion)
   inbetweening:
@@ -133,26 +106,7 @@ training:
     arrival_ratio: 0.85            # object reaches target in this fraction of remaining time
     force_all_known_prob: 0.1      # prob of forcing all frames fully known
     force_near_empty_prob: 0.1     # prob of near-empty conditioning (one group, one frame)
-    waypoint_schemas:
-      full:
-        prob: 0.15
-        pinned:
-          first: [all]
-          intermediate: [all]
-          last: [all]
-      box_only:
-        prob: 0.45
-        pinned:
-          first: [all]
-          intermediate: [delta_xy, delta_yaw]
-          last: [obj_delta_xy, obj_z]
-      locomotion_only:
-        prob: 0.40
-        pinned:
-          first: []
-          intermediate: []
-          last: []
-        ignore_features: [obj_delta_xy, obj_z, obj_rel_pos, obj_rel_rot6d]
+   
     partial_masking:
       enabled: True
       prob: 1.0             # probability a waypoint is partial (vs full)
@@ -188,17 +142,3 @@ noise_scheduler:
   scheduling_matrix: "full_sequence"
   use_fourier_noise_embedding: False
   noise_level_conditioning_reduce: "max"  # reduce (B,T,D) -> (B,T) for timestep embedding
-
-  hierarchical_noise:
-    enabled: False
-    # Phase 1 (root/object planning) uses lower noise than phase 2.
-    phase1_feature_keys: [delta_xy, delta_yaw, obj_delta_xy, obj_z, obj_rel_pos, obj_rel_rot6d]
-    phase2_feature_keys: [joints, body_z, body_rot6d]
-    phase1_max_ratio: 0.5   # max k for phase1 as fraction of train_timesteps
-    phase2_min_ratio: 0.0   # min k for phase2 as fraction of train_timesteps
-
-  hierarchical_schedule:
-    enabled: False
-    # If enabled (or scheduling_matrix == hierarchical_two_phase),
-    # phase1 features reach clean state earlier than phase2.
-    phase1_end_ratio: 0.5
