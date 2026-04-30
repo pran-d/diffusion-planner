@@ -1,0 +1,101 @@
+# Centralized defaults for inference/evaluation scripts.
+# CLI args always override these values.
+
+common:
+  device: cuda
+  cfg_w: 1.0
+  use_fp16: false
+  torch_compile: false
+  scheduling_matrix: full_sequence
+  hierarchical_schedule:
+    enabled: false
+    phase1_end_ratio: 0.5
+
+inference_mg:
+  epoch: null
+  phase1_checkpoint: null
+  phase2_checkpoint: null
+  ema: true
+  num_samples: 1
+  stitch_steps: null
+  target_traj_length: null
+  save_path: results/inference_mg.npz
+  metrics_log_path: results/inference_metrics.jsonl
+  task_params: null
+  style: null
+  end_error_threshold: 0.1
+  end_ground_num_frames: 5
+  end_ground_z_tol: 0.05
+  goal_multiplier: 1.0
+  enable_goal_stop: true
+  disable_goal_stop: false
+  enable_phys_stop: false
+  enable_phys_clamp: true
+  last_frame_waypoint: true
+  arrival_ratio: 0.85
+  lift_height: 0.5
+  lift_start: 0.0
+  lift_end: 0.20
+  walk_start_z: 0.80
+  no_lower_dist: 0.4
+  no_visualize: false
+  video: false
+  video_path: null
+
+batch_goal_sweep:
+  epoch: null
+  ema: true
+  style: null
+  random_styles: false
+  num_goals: 12
+  goal_spread: 5
+  goal_z_offset: 0.0
+  goal_multiplier: 1.0
+  include_original: false
+  seed: 42
+  stitch_steps: 150
+  batch_size: null
+  enable_goal_stop: true
+  goal_stop_threshold: 0.2
+  enable_physics_stop: false
+  enable_phys_clamp: true
+  last_frame_waypoint: false
+  arrival_ratio: 0.85
+  lift_height: 0.5
+  lift_start: 0.0
+  lift_end: 0.20
+  walk_start_z: 0.80
+  no_lower_dist: 0.4
+  save_dir: results/goal_sweep
+  metrics_log_path: results/inference_metrics.jsonl
+  visualize: false
+  video: false
+  video_path: null
+
+evaluate_ablations:
+  ablations_folder: null
+  epoch: 200
+  ema: true
+  num_goals: 12
+  goal_spread: 5
+  goal_z_offset: 0.0
+  goal_multiplier: 1.0
+  include_original: false
+  seed: 42
+  stitch_steps: 150
+  batch_size: null
+  enable_goal_stop: true
+  goal_stop_threshold: 0.2
+  enable_physics_stop: false
+  enable_phys_clamp: true
+  last_frame_waypoint: false
+  arrival_ratio: 0.85
+  lift_height: 0.5
+  lift_start: 0.0
+  lift_end: 0.20
+  walk_start_z: 0.80
+  no_lower_dist: 0.4
+  output_root: results/ablation_eval
+  visualize: false
+  video: true
+  video_path: null

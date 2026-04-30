@@ -4,7 +4,12 @@ logs/
 runs/
 results/
 test_datasets/
+ablations/
 *.png
 *.npy
 *.npz
 config/paths.yaml
+ablations/
+unitree_g1/
+uv.lock
+reports/

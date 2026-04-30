@@ -15,10 +15,14 @@ def load_env_and_data():
     # Use config from file
     model_cfg, data_cfg, training_cfg, noise_cfg = load_config("config/config.yaml")
 
+    # For this visualizer, only load canonical per-task trajectory files.
+    data_cfg["file_names"] = ["best_trajectory.npz"]
+
     data_path = get_data_path(data_cfg)
     norm_path = get_norm_path(model_cfg, training_cfg, data_cfg)
     
     print("Loading dataset...")
+    print(f"Filtering dataset files by name: {data_cfg['file_names']}")
     # Initialize dataset
     data_buffer = preload_dataset(data_cfg, data_path)
     dataset = FlexibleWindowDataset(
@@ -71,10 +75,17 @@ def main():
             raise ValueError(f"Target indices {target} (Trajectory {args.traj_idx}, Batch {args.batch_idx}) not present in valid window list.")
 
 
-    for i in range(args.start_idx, len(unique_trajs)):
+    print("Controls: Space=pause/play, Left/Right=step, Esc=next trajectory, N=next file @ batch 0")
+
+    i = args.start_idx
+    while i < len(unique_trajs):
         file_idx, batch_idx = unique_trajs[i]
+        file_meta = dataset.ram_cache[file_idx] if 0 <= file_idx < len(dataset.ram_cache) else {}
+        source_folder = file_meta.get("source_folder_name", "unknown")
+        source_file = os.path.basename(file_meta.get("source_file_path", ""))
         
         print(f"\n[{i}/{len(unique_trajs)}] Visualizing File {file_idx}, Batch {batch_idx}")
+        print(f"  Source: folder='{source_folder}' file='{source_file or 'unknown'}'")
         
         # Get Full Raw Trajectory
         raw_traj = dataset._get_single_traj(file_idx, batch_idx)
@@ -184,6 +195,25 @@ def main():
             overlay_paths=current_overlay if args.overlay else None,
             markers=ee_global_paths if args.show_ee and 'ee_rel_pos' in raw_traj else None
         )
+
+        # 'N' requests jump to the next file's batch 0 trajectory.
+        if getattr(visualizer, "next_file_batch0_request", {}).get("active", False):
+            visualizer.next_file_batch0_request["active"] = False
+            next_i = None
+            for j in range(i + 1, len(unique_trajs)):
+                next_file_idx, next_batch_idx = unique_trajs[j]
+                if next_file_idx > file_idx and next_batch_idx == 0:
+                    next_i = j
+                    break
+
+            if next_i is None:
+                print("No later (file_idx, batch_idx=0) found. Exiting viewer.")
+                break
+
+            i = next_i
+            continue
+
+        i += 1
 
 if __name__ == "__main__":
     main()
