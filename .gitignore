@@ -3,11 +3,11 @@
 logs/
 runs/
 results/
-test_datasets/
 ablations/
 *.png
 *.npy
 *.npz
+*.zip
 config/paths.yaml
 ablations/
 unitree_g1/
