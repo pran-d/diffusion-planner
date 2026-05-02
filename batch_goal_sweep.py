@@ -615,6 +615,7 @@ def run_goal_sweep(mg, dataset, args):
     batch_size = getattr(args, 'batch_size', None) or N  # default: all at once
     all_trajs, all_real_lengths = [], []
     per_goal_time_s = []
+    max_window_gen_time = 0.0
 
     for b_start in range(0, N, batch_size):
         b_end = min(b_start + batch_size, N)
@@ -628,7 +629,7 @@ def run_goal_sweep(mg, dataset, args):
         }
 
         t0 = time.perf_counter()
-        traj, rl = mg.generate_trajectory(
+        traj, rl, timing_stats = mg.generate_trajectory(
             initial_condition=ic_batch,
             goal_condition=goals_local[b_start:b_end],  # (bs, D)
             style_condition=(goal_style_ids[b_start:b_end] if goal_style_ids is not None else None),
@@ -648,14 +649,16 @@ def run_goal_sweep(mg, dataset, args):
             no_lower_dist=getattr(args, 'no_lower_dist', 0.4),
             use_fp16=bool(getattr(args, 'use_fp16', False)),
             compile_model=bool(getattr(args, 'torch_compile', False)),
+            return_timing_stats=True,
         )
         elapsed = time.perf_counter() - t0
-        per_traj_elapsed = elapsed
+        per_window_gen_time = timing_stats["per_window_gen_time_s"]
         # traj: (bs, T, 43),  rl: (bs,)
         for j in range(bs):
             all_trajs.append(traj[j])
             all_real_lengths.append(int(rl[j]))
-            per_goal_time_s.append(float(per_traj_elapsed))
+            per_goal_time_s.append(np.mean(per_window_gen_time))
+            max_window_gen_time = max(max_window_gen_time, np.max(per_window_gen_time))
 
     full_traj = np.stack(all_trajs)  # (N, T, 43)
     real_lengths = np.array(all_real_lengths)
@@ -681,6 +684,7 @@ def run_goal_sweep(mg, dataset, args):
         "errors": np.array(errors),
         "real_lengths": real_lengths,
         "per_goal_time_s": np.array(per_goal_time_s, dtype=np.float64),
+        "max_window_gen_time_s": max_window_gen_time,
         "ref_obj_pos": ref_obj_pos,
         "desired_displacements": np.array(desired_displacements),
         "achieved_displacements": np.array(achieved_displacements),
@@ -730,11 +734,12 @@ def main():
     ref_obj_pos = result["ref_obj_pos"]
     N = len(goals_world)
     per_goal_time_s = np.asarray(result.get("per_goal_time_s", np.zeros(N, dtype=np.float64)), dtype=np.float64)
+    max_window_gen_time_s = result.get("max_window_gen_time_s", 0.0)
     goal_style_ids = result.get("goal_style_ids", None)
     goal_style_names = result.get("goal_style_names", None)
     stitch_steps = int(max(1, result.get("stitch_steps", 1)))
     planning_horizon_s = float(result.get("planning_horizon_s", 0.0))
-    avg_window_generation_time_s = float(np.mean(per_goal_time_s) / stitch_steps) if len(per_goal_time_s) else 0.0
+    avg_window_generation_time_s = float(np.mean(per_goal_time_s)) if len(per_goal_time_s) else 0.0
 
     # -- 4. Print summary --------------------------------------------------
     print(f"\nRef obj pos: {ref_obj_pos}")
@@ -753,6 +758,7 @@ def main():
     print(f"\n  Mean error: {np.mean(errors):.4f}m  "
           f"Median: {np.median(errors):.4f}m  Max: {np.max(errors):.4f}m")
     print(f"  Avg window generation time: {avg_window_generation_time_s:.4f}s/window")
+    print(f"  Max window generation time: {max_window_gen_time_s:.4f}s/window")
     print(f"  Planning horizon per window: {planning_horizon_s:.4f}s/window")
     print("=" * 70)
 

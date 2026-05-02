@@ -4,7 +4,7 @@ import matplotlib.pyplot as plt
 import os
 import sys
 # Add current dir to path if needed for module imports
-sys.path.append(os.getcwd())
+sys.path.insert(0, os.getcwd())
 
 from tqdm import tqdm
 
@@ -102,26 +102,59 @@ def main():
     if args.dataset_paths:
         datasets_and_labels = []
         for dp in args.dataset_paths:
-            label = os.path.basename(os.path.normpath(dp.replace(".npz", "")))
+            label = os.path.basename(os.path.normpath(dp.replace(".npz", "").replace(".npy", "")))
             model_cfg, data_cfg, training_cfg, noise_cfg = load_config("config/config.yaml")
             norm_path = get_norm_path(model_cfg, training_cfg, data_cfg)
-            # If it's a .npz file, pass its parent dir and let the dataset find it
+            # If it's a .npz or .npy file, pass its parent dir and let the dataset find it
             # But we need to bypass task_list logic
-            data_cfg_copy = dict(data_cfg)
-            data_cfg_copy.pop("task_list_path", None)  # Don't use task list for explicit paths
-            data_buf = preload_dataset(data_cfg_copy, dp)
-            ds = BufferDataset(
-                data_buffer=data_buf,
-                config=data_cfg_copy,
-                norm_path=norm_path,
-                calculate_stats=False,
-            )
-            datasets_and_labels.append((ds, label))
+            if dp.endswith(".npy"):
+                arr = np.load(dp)
+                if arr.ndim == 3:
+                    data_buf = []
+                    for i in range(arr.shape[0]):
+                        d = {}
+                        if arr.shape[-1] >= 43:
+                            d['base'] = arr[i, :, 0:7]
+                            d['joints'] = arr[i, :, 7:36]
+                            d['obj'] = arr[i, :, 36:43]
+                        else:
+                            d['full_state'] = arr[i]
+                        data_buf.append(d)
+                elif arr.ndim == 2:
+                    d = {}
+                    if arr.shape[-1] >= 43:
+                        d['base'] = arr[:, 0:7]
+                        d['joints'] = arr[:, 7:36]
+                        d['obj'] = arr[:, 36:43]
+                    else:
+                        d['full_state'] = arr
+                    data_buf = [d]
+                else:
+                    raise ValueError(f"Unsupported npy shape: {arr.shape}")
+                # We can just wrap it in a mock dataset to avoid BufferDataset transforming things
+                class MockDataset:
+                    def __init__(self, buf):
+                        self.buf = buf
+                        self.indices = [(0, i, 0) for i in range(len(buf))]
+                    def _get_single_traj(self, f_idx, b_idx):
+                        return self.buf[b_idx]
+                ds = MockDataset(data_buf)
+            else:
+                data_cfg_copy = dict(data_cfg)
+                data_cfg_copy.pop("task_list_path", None)  # Don't use task list for explicit paths
+                data_buf = preload_dataset(data_cfg_copy, dp)
+                ds = BufferDataset(
+                    data_buffer=data_buf,
+                    config=data_cfg_copy,
+                    norm_path=norm_path,
+                    calculate_stats=False,
+                )
+            datasets_and_labels.append((ds, label, dp))
     else:
         dataset = load_dataset()
         # Group file_paths by parent folder name
         # For a single dataset, each file_idx maps to a file_path
-        datasets_and_labels = [(dataset, "default")]
+        datasets_and_labels = [(dataset, "default", None)]
 
     if args.obj_disp:
         _plot_obj_disp(args, datasets_and_labels)
@@ -158,9 +191,19 @@ def _plot_obj_disp(args, datasets_and_labels):
     color_idx = 0
     legend_handles = {}
     
-    for dataset, ds_label in datasets_and_labels:
+    for dataset, ds_label, dp in datasets_and_labels:
         unique_trajs, idxs_to_plot = _get_unique_trajs_and_indices(dataset, args)
         print(f"[{ds_label}] Plotting {len(idxs_to_plot)} trajectories...")
+        
+        goals = None
+        if dp:
+            dp_dir = os.path.dirname(dp)
+            for gf in ["goals_global.npy", "goals_world.npy", "goals_local.npy"]:
+                g_path = os.path.join(dp_dir, gf)
+                if os.path.exists(g_path):
+                    goals = np.load(g_path)
+                    print(f"[{ds_label}] Loaded goals from {gf}")
+                    break
         
         # Group trajectories by file_idx for colouring
         file_groups = {}
@@ -213,6 +256,15 @@ def _plot_obj_disp(args, datasets_and_labels):
                     # Mark end
                     plt.plot(disp_rot[-1, 0], disp_rot[-1, 1], 'x', color=color, markersize=5, alpha=0.7)
                     
+                    # Plot Goal
+                    if goals is not None and bi < len(goals):
+                        goal_pos = goals[bi]
+                        # Displace relative to initial object position
+                        g_disp = goal_pos[:3] - obj_pos[0:1, :3].flatten()
+                        # Rotate into pelvis frame
+                        g_disp_rot = R_inv @ g_disp
+                        plt.plot(g_disp_rot[0], g_disp_rot[1], '*', color=color, markersize=10, alpha=0.9)
+                    
                 except Exception as e:
                     print(f"  Error loading traj {idx_i} ({fi}, {bi}): {e}")
             
@@ -240,11 +292,11 @@ def _plot_xy(args, datasets_and_labels):
     feat_y = args.features[1]
     
     plt.figure(figsize=(10, 10))
-    color_cycle = plt.cm.tab10.colors
+    color_cycle = list(plt.cm.tab20.colors) + list(plt.cm.tab20b.colors) + list(plt.cm.tab20c.colors)
     color_idx = 0
     legend_handles = {}
     
-    for dataset, ds_label in datasets_and_labels:
+    for dataset, ds_label, dp in datasets_and_labels:
         unique_trajs, idxs_to_plot = _get_unique_trajs_and_indices(dataset, args)
         
         file_groups = {}
@@ -258,11 +310,10 @@ def _plot_xy(args, datasets_and_labels):
             if len(datasets_and_labels) > 1:
                 file_label = ds_label
             else:
-                file_label = _get_file_label(dataset, f_idx) or ds_label
-            
-            color = color_cycle[color_idx % len(color_cycle)]
+                file_label = f"file_{f_idx}" if ds_label == "default" else ds_label
             
             for idx_i, fi, bi in group:
+                color = color_cycle[color_idx % len(color_cycle)]
                 try:
                     raw = dataset._get_single_traj(fi, bi)
                     vx = get_feature(raw, feat_x)
@@ -275,8 +326,8 @@ def _plot_xy(args, datasets_and_labels):
                         legend_handles[file_label] = line
                 except Exception as e:
                     print(f"Error loading {fi}, {bi}: {e}")
-            
-            color_idx += 1
+                
+                color_idx += 1
     
     plt.xlabel(feat_x)
     plt.ylabel(feat_y)
@@ -316,7 +367,7 @@ def _plot_timeseries(args, datasets_and_labels):
                 if len(datasets_and_labels) > 1:
                     file_label = ds_label
                 else:
-                    file_label = _get_file_label(dataset, f_idx) or ds_label
+                    file_label = f"file_{f_idx}" if ds_label == "default" else ds_label
                 
                 color = color_cycle[color_idx % len(color_cycle)]
                 

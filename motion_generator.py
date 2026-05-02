@@ -782,11 +782,12 @@ class MotionGenerator:
             "forward_time_s": 0.0,
             "reconstruction_time_s": 0.0,
             "total_time_s": 0.0,
-            "num_steps": int(stitch_steps),
+            "num_steps": 0.0,
             "avg_forward_time_s": 0.0,
             "avg_reconstruction_time_s": 0.0,
             "avg_step_time_s": 0.0,
             "gpu_peak_mb": 0.0,
+            "per_window_gen_time_s": [],
         }
         _t_total_start = time.perf_counter()
         if self.device.type == "cuda":
@@ -856,6 +857,8 @@ class MotionGenerator:
                     waypoint_mask=wm,
                 )  # (B, T, D_out)
                 timing_stats["forward_time_s"] += (time.perf_counter() - _t_forward_start)
+                timing_stats["per_window_gen_time_s"].append((time.perf_counter() - _t_forward_start))
+                timing_stats["num_steps"] += 1
                 
                 # D. Denormalize
                 denorm_btc = self.dataset.denormalize_global(normalized_sample)

@@ -64,11 +64,11 @@ model:
   history_aggregation: "attn"
 
 training:
-  suffix: _style_condition
-  num_epochs: 20
+  suffix: _sbtobest_batched_nonoise
+  num_epochs: 100
   balance_task_density: False
   learning_rate: 0.0005
-  save_every: 50
+  save_every: 5
   condition_dropout_prob: 
     state: 0.1
     style: 0.05
@@ -122,9 +122,9 @@ training:
         pick_place: 0.2
         lower_body: 0.15
         upper_body: 0.15
-        object_pos: 0.0
-        pose: 0.0
-        robot_pos: 0.0
+        object_pos: 0.1
+        pose: 0.1
+        robot_pos: 0.1
       per_group_noise_fractions:
         default: 1.0
         obj_delta_xy: 0.5

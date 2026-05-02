@@ -4,7 +4,7 @@ data:
   normalization_type: "min_max"
   dataset_class: "flexible"
   batch_size: 1024
-  num_features: 51
+  num_features: 48
   num_task_params: 4
   num_observations: 45
   start_timestep: 0
@@ -20,8 +20,6 @@ data:
   feature_order:
     - delta_xy
     - delta_yaw
-    - obj_delta_xy
-    - obj_z
     - joints
     - body_z
     - body_rot6d
@@ -62,10 +60,10 @@ model:
 
 training:
   suffix: ""
-  num_epochs: 200
+  num_epochs: 100
   balance_task_density: False
   learning_rate: 0.0005
-  save_every: 50
+  save_every: 25
   condition_dropout_prob: 
     state: 0.1
     task: 0.2

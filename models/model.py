@@ -97,12 +97,12 @@ class RobotDiffuser():
         if unexpected:
             print(f"  [Warning] Unexpected keys (ignored): {unexpected}")
 
-    def getSample(self, num_trajectories=1, state_cond=None, goal_cond=None, deterministic=False, cfg_w=1.0, guidance_wt=0.0, guidance_goal=None, no_state_cond=False, waypoint_values=None, waypoint_mask=None):
+    def getSample(self, num_trajectories=1, state_cond=None, goal_cond=None, style_cond=None, deterministic=False, cfg_w=1.0, guidance_wt=0.0, guidance_goal=None, no_state_cond=False, waypoint_values=None, waypoint_mask=None):
         """
         Run reverse diffusion to generate trajectories.
         """
         sample = torch.randn(num_trajectories, self.num_channels, self.input_size).to(self.device)
-        
+        ff
         cond_list = []
         if getattr(self.model, 'state_condition', False) and state_cond is not None:
             if isinstance(state_cond, np.ndarray):

@@ -69,6 +69,9 @@ def _load_paths(config_path: str) -> dict:
     config_dir = os.path.dirname(os.path.abspath(config_path))
     paths_file = os.path.join(config_dir, "paths.yaml")
     if not os.path.exists(paths_file):
+        paths_file = _PATHS_FILE
+        
+    if not os.path.exists(paths_file):
         return {}
     with open(paths_file, "r") as f:
         raw = yaml.safe_load(f) or {}
@@ -91,13 +94,20 @@ def load_config(config_path: str, auto_conf: bool = False) -> dict:
     # ── Inject machine-local paths from paths.yaml as defaults ──────────
     paths = _load_paths(config_path)
     # Data paths
-    data_cfg.setdefault("dir_path", paths.get("data_dir", "./"))
-    data_cfg.setdefault("train_path", paths.get("train_path", ""))
-    data_cfg.setdefault("task_list_path", paths.get("task_list_path", ""))
-    data_cfg.setdefault("file_names", paths.get("file_names", None))
+    if data_cfg.get("dir_path") is None:
+        data_cfg["dir_path"] = paths.get("data_dir", "./")
+    if data_cfg.get("train_path") is None:
+        data_cfg["train_path"] = paths.get("train_path", "")
+    if data_cfg.get("task_list_path") is None:
+        data_cfg["task_list_path"] = paths.get("task_list_path", "")
+    if data_cfg.get("file_names") is None:
+        data_cfg["file_names"] = paths.get("file_names", None)
+                
     # Training / run paths
-    training_cfg.setdefault("save_dir", paths.get("save_dir", "./runs/"))
-    training_cfg.setdefault("log_dir", paths.get("log_dir", "./logs/"))
+    if training_cfg.get("save_dir") is None:
+        training_cfg["save_dir"] = paths.get("save_dir", "./runs/")
+    if training_cfg.get("log_dir") is None:
+        training_cfg["log_dir"] = paths.get("log_dir", "./logs/")
 
     # Propagate root-level keys to training_cfg for backward compatibility / convenience
     for key in ['save_dir', 'log_dir', 'suffix']:

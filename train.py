@@ -6,7 +6,7 @@ import torch
 import numpy as np
 from torch import cond, nn, optim
 from torch.nn import functional as F
-from torch.utils.data import DataLoader, WeightedRandomSampler
+from torch.utils.data import DataLoader, WeightedRandomSampler, RandomSampler
 from torch.utils.tensorboard import SummaryWriter
 from torch.amp import GradScaler
 from matplotlib import pyplot as plt
@@ -338,6 +338,10 @@ if training_cfg.get("balance_task_density", True): # Default to True as requeste
         sampler = WeightedRandomSampler(weights, len(weights), generator=dl_generator)
         shuffle = False
         print("WeightedRandomSampler activated (Balance Task Density).")
+if training_cfg.get("repeat_trajs_for_batch", False):
+    sampler = RandomSampler(dataset, replacement=True, generator=dl_generator)
+    shuffle = False
+    print("RandomSampler with replacement activated (Repeat Trajectories for Batch).")
 
 train_dataloader = DataLoader(
     dataset, 

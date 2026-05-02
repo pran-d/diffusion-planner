@@ -10,11 +10,11 @@ import yaml
 # ---------------------------------------------------------------------------
 AUG_CONFIG = {
     "qpos": {
-        "robot_quat": {"dims": slice(0, 4), "std": 0.000, "renormalize": True},
-        "robot_xyz":  {"dims": slice(4, 7), "std": 0.000},
-        "joints":     {"dims": slice(19, 36), "std": 0.01},
-        "obj_quat":   {"dims": slice(36, 40), "std": 0.001, "renormalize": True},
-        "obj_xyz":    {"dims": slice(40, 43), "std": 0.002},
+        "robot_quat": {"dims": slice(0, 4), "std": 0.004, "renormalize": True},
+        "robot_xyz":  {"dims": slice(4, 7), "std": 0.005},
+        "joints":     {"dims": slice(7, 36), "std": 0.025},
+        "obj_quat":   {"dims": slice(36, 40), "std": 0.0025, "renormalize": True},
+        "obj_xyz":    {"dims": slice(40, 43), "std": 0.001},
     },
     "base": {
         "xyz":  {"dims": slice(0, 3), "std": 0.02},   # position: 2x above floor (~0.013)
@@ -29,10 +29,6 @@ AUG_CONFIG = {
         "quat": {"dims": slice(3, 7), "std": 0.002,
                  "renormalize": True},
     },
-    "actuator_pos": {
-        "all":  {"dims": slice(None), "std": 0.05},
-    },
-    
 }
 
 def smooth_noise(shape: tuple, std: float, cutoff_ratio: float = 0.05) -> np.ndarray:
@@ -310,8 +306,8 @@ if __name__ == "__main__":
     import argparse
 
     parser = argparse.ArgumentParser()
-    parser.add_argument("--input_dir",  default="./test_datasets/SBTO_OmniRetarget_Dataset")
-    parser.add_argument("--output_dir", default="./test_datasets/batched_sbto_omniretarget")
+    parser.add_argument("--input_dir",  default="/scratch/project/eu-26-32/diffusion-planner/test_datasets/omniretarget_cleanup")
+    parser.add_argument("--output_dir", default="/scratch/project/eu-26-32/diffusion-planner/test_datasets/batched_omniretarget")
     parser.add_argument("--paths_config", default="./config/paths.yaml",
                         help="Path to config/paths.yaml used to resolve file_names and task_list_path.")
     parser.add_argument("--task_list",  default=None,

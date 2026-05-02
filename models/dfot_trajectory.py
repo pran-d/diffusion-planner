@@ -352,6 +352,12 @@ class DFoTTrajectory(nn.Module):
                 noise_levels = rand_fn((batch_size, n_tokens))
             elif self.noise_level == "random_uniform":  # uniform noise levels (Typical Video Diffusion)
                 noise_levels = rand_fn((batch_size, 1)).repeat(1, n_tokens)
+            elif self.noise_level == "stratified":
+                bucket_size = max(1, self.timesteps // batch_size)
+                buckets = torch.arange(batch_size, device=xs.device) * bucket_size
+                offsets = torch.randint(0, bucket_size, (batch_size,), device=xs.device)
+                t = (buckets + offsets).clamp(0, self.timesteps - 1)  # (batch_size,)
+                noise_levels = t.unsqueeze(1).repeat(1, n_tokens)     # (batch_size, n_tokens)
             else:
                 raise ValueError(f"Unknown noise level mode: {self.noise_level}")
 
