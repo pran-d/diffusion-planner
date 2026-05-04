@@ -167,6 +167,51 @@ class DFoTTrajectory(nn.Module):
                 "use_gradient_checkpointing": False,
                 "external_cond_dropout": model_config.get("external_cond_dropout", 0.1),
             })
+        elif backbone_type == "dit1d_dual":
+            # Build a temporary feature_index_map here so we can derive branch indices
+            # before the full map is constructed later in __init__.
+            _layout = build_feature_layout()
+            _tmp_fim = {}
+            _fidx = 0
+            for _key in data_config.get("feature_order", []):
+                _dim = _layout.get(_key, 0)
+                if _dim > 0:
+                    _tmp_fim[_key] = slice(_fidx, _fidx + _dim)
+                    _fidx += _dim
+
+            _default_b1 = ["delta_xy", "delta_yaw", "obj_delta_xy", "obj_z", "obj_rel_pos", "obj_rel_rot6d"]
+            _default_b2 = ["joints", "body_z", "body_rot6d"]
+            b1_names = model_config.get("branch1_features", _default_b1)
+            b2_names = model_config.get("branch2_features", _default_b2)
+
+            def _indices_from_names(names, fim):
+                idx = []
+                for name in names:
+                    sl = fim.get(name)
+                    if sl is not None:
+                        idx.extend(range(sl.start, sl.stop))
+                return idx
+
+            b1_idx = _indices_from_names(b1_names, _tmp_fim)
+            b2_idx = _indices_from_names(b2_names, _tmp_fim)
+            assert len(b1_idx) + len(b2_idx) == data_config["num_features"], (
+                f"Branch indices ({len(b1_idx)} + {len(b2_idx)}) do not cover all "
+                f"{data_config['num_features']} features. Check branch1_features / branch2_features."
+            )
+
+            backbone_cfg = Config({
+                "name": "dit1d_dual",
+                "hidden_size": model_config.get("hidden_size", 256),
+                "branch1_depth": model_config.get("branch1_depth", 8),
+                "branch2_depth": model_config.get("branch2_depth", 6),
+                "num_heads": model_config.get("num_heads", 4),
+                "mlp_ratio": model_config.get("mlp_ratio", 4.0),
+                "pos_emb_type": model_config.get("pos_emb_type", "learned_1d"),
+                "use_gradient_checkpointing": model_config.get("use_gradient_checkpointing", False),
+                "external_cond_dropout": model_config.get("external_cond_dropout", 0.1),
+                "branch1_indices": b1_idx,
+                "branch2_indices": b2_idx,
+            })
         elif backbone_type == "unet1d":
             backbone_cfg = Config({
                 "name": "unet1d",
@@ -302,7 +347,7 @@ class DFoTTrajectory(nn.Module):
         # Instead of a single nn.Linear(D, hidden) the backbone uses per-group
         # projections whose outputs are summed → hidden, giving the model an
         # inductive bias about the heterogeneous feature structure.
-        if model_config.get("group_wise_embedding", False) and backbone_type == "dit1d":
+        if model_config.get("group_wise_embedding", False) and backbone_type == "dit1d":  # noqa: dit1d_dual has its own per-branch projections
             # Use the canonical feature_order groups (not the partial masking
             # groups which merge multiple keys).  This gives one projection per
             # semantic feature (delta_xy, delta_yaw, joints, …).
@@ -582,37 +627,23 @@ class DFoTTrajectory(nn.Module):
         waypoint_mask=None,
     ):
         """
-        Run model predictions while injecting the waypoint indicator embedding
-        into the backbone's hidden representation.
+        Run model predictions while injecting the waypoint indicator embedding.
+
+        Works for both DiT1D and DiT1DDual: the backbone's forward() accepts
+        an optional `indicator` kwarg.  For DiT1DDual, the indicator is injected
+        into Branch 1 only (see DiT1DDual.forward).
         """
         from diffusion_forcing_transformer.discrete_diffusion import ModelPrediction
 
-        backbone = self.diffusion_model.model  # DiT1D
-
-        # 1. Input embedding + positional embedding (standard DiT1D path)
-        h = backbone.input_embedder(x)          # (B, T, hidden)
-        h = backbone.pos_emb(h)
-
-        # 2. Inject waypoint indicator
-        if waypoint_mask is not None:
-            # waypoint_mask: (B, T, D) bool -> float -> project to hidden
-            indicator = self.waypoint_indicator_proj(waypoint_mask.float().to(x.device))  # (B, T, hidden)
-            h = h + indicator
-
-        # 3. Condition embedding (same as DiT1D.forward)
+        backbone = self.diffusion_model.model
         model_k = self.diffusion_model.get_model_noise_levels(k)
-        c = backbone.noise_level_pos_embedding(model_k)
-        if external_cond is not None:
-            c = c + backbone.external_cond_embedding(external_cond, external_cond_mask)
 
-        # 4. Transformer blocks
-        for block in backbone.blocks:
-            h = backbone._checkpoint(block, h, c)
+        indicator = None
+        if waypoint_mask is not None:
+            indicator = self.waypoint_indicator_proj(waypoint_mask.float().to(x.device))
 
-        # 5. Final layer
-        model_output = backbone.final_layer(h, c)
+        model_output = backbone(x, model_k, external_cond, external_cond_mask, indicator=indicator)
 
-        # 6. Convert to predictions (same logic as DiscreteDiffusion.model_predictions)
         dm = self.diffusion_model
         if dm.objective == "pred_noise":
             pred_noise = torch.clamp(model_output, -dm.clip_noise, dm.clip_noise)

@@ -4,7 +4,7 @@ data:
   normalization_type: "min_max"
   dataset_class: "flexible"
   batch_size: 1024
-  num_features: 51
+  num_features: 48
   num_task_params: 4
   num_observations: 45
   start_timestep: 0
@@ -19,8 +19,8 @@ data:
   feature_order:
     - delta_xy
     - delta_yaw
-    - obj_delta_xy
-    - obj_z
+    # - obj_delta_xy
+    # - obj_z
     - joints
     - body_z
     - body_rot6d
@@ -50,25 +50,41 @@ data:
 model:
   type: "dfot"
   inpaint: True
-  backbone_type: "dit1d"
+  backbone_type: "dit1d_dual"
   state_condition: True
   style_condition: False
   task_condition: True
   external_cond_dropout: 0.05
   hidden_size: 256
+  # dit1d-only depth (kept for backward compat when backbone_type: dit1d)
   depth: 8
+  # # dit1d_dual branch depths
+  branch1_depth: 8    # World branch (delta_xy, obj pose, …)
+  branch2_depth: 6    # Body branch  (joints, body_z, body_rot6d)
+  # Feature groups for each branch (must cover all 51 dims, no overlap)
+  branch1_features:
+    - delta_xy
+    - delta_yaw
+    # - obj_delta_xy
+    # - obj_z
+    - body_z
+    - obj_rel_pos
+    - obj_rel_rot6d
+  branch2_features:
+    - joints
+    - body_rot6d
   num_heads: 4
   mlp_ratio: 4.0
   pos_emb_type: "learned_1d"
-  group_wise_embedding: True
+  group_wise_embedding: True # only used for dit1d 
   history_aggregation: "attn"
 
 training:
-  suffix: _sbtobest_batched_nonoise
-  num_epochs: 100
+  suffix: _omniretarget_rollout_dual
+  num_epochs: 200
   balance_task_density: False
   learning_rate: 0.0005
-  save_every: 5
+  save_every: 10
   condition_dropout_prob: 
     state: 0.1
     style: 0.05
@@ -118,10 +134,10 @@ training:
         pose: [body_rot6d]
         robot_pos: [body_z, delta_xy, delta_yaw]
       group_keep_prob:
-        locomotion: 0.5
+        locomotion: 0.2
         pick_place: 0.2
-        lower_body: 0.15
-        upper_body: 0.15
+        lower_body: 0.2
+        upper_body: 0.2
         object_pos: 0.1
         pose: 0.1
         robot_pos: 0.1
@@ -129,6 +145,7 @@ training:
         default: 1.0
         obj_delta_xy: 0.5
         obj_z: 0.5
+
 noise_scheduler:
   deterministic_inference: True
   train_timesteps: 200

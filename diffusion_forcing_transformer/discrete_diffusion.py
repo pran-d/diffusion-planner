@@ -5,6 +5,7 @@ from torch import nn
 from torch.nn import functional as F
 from einops import rearrange, reduce
 from .dit1d import DiT1D
+from .dit1d_dual import DiT1DDual
 from models.unet1d import UNet1D
 from .noise_schedule import make_beta_schedule
 
@@ -73,6 +74,8 @@ class DiscreteDiffusion(nn.Module):
         match self.backbone_cfg.name:
             case "dit1d":
                 model_cls = DiT1D
+            case "dit1d_dual":
+                model_cls = DiT1DDual
             case "unet1d":
                 model_cls = UNet1D
             case _:

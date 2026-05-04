@@ -209,6 +209,108 @@ class DiTBlock(nn.Module):
         return x
 
 
+class CrossAttentionLayer(nn.Module):
+    """Cross-attention with AdaLN-Zero gating. Q from x, K/V from context."""
+
+    def __init__(self, hidden_size: int, num_heads: int) -> None:
+        super().__init__()
+        assert hidden_size % num_heads == 0
+        self.num_heads = num_heads
+        self.head_dim = hidden_size // num_heads
+
+        self.norm = AdaLayerNormZero(hidden_size)
+        self.q_proj = nn.Linear(hidden_size, hidden_size, bias=True)
+        self.k_proj = nn.Linear(hidden_size, hidden_size, bias=True)
+        self.v_proj = nn.Linear(hidden_size, hidden_size, bias=True)
+        self.out_proj = nn.Linear(hidden_size, hidden_size, bias=False)
+
+        for m in [self.q_proj, self.k_proj, self.v_proj, self.out_proj]:
+            nn.init.xavier_uniform_(m.weight)
+            if m.bias is not None:
+                nn.init.zeros_(m.bias)
+
+    def forward(
+        self, x: torch.Tensor, c: torch.Tensor, context: torch.Tensor
+    ) -> torch.Tensor:
+        """
+        Args:
+            x:       (B, T, H) query stream
+            c:       (B, T, H) AdaLN conditioning
+            context: (B, S, H) key/value stream
+        Returns:
+            (B, T, H) gate * cross_attn_output  (add to x residually)
+        """
+        x_norm, gate = self.norm(x, c)
+        B, T, H = x_norm.shape
+        S = context.shape[1]
+
+        q = self.q_proj(x_norm).reshape(B, T, self.num_heads, self.head_dim).transpose(1, 2)
+        k = self.k_proj(context).reshape(B, S, self.num_heads, self.head_dim).transpose(1, 2)
+        v = self.v_proj(context).reshape(B, S, self.num_heads, self.head_dim).transpose(1, 2)
+
+        attn_out = F.scaled_dot_product_attention(q, k, v)
+        attn_out = attn_out.transpose(1, 2).reshape(B, T, H)
+        return gate * self.out_proj(attn_out)
+
+
+class DiTBlockWithCrossAttn(nn.Module):
+    """DiTBlock with a branch cross-attention sublayer inserted between SA and MLP.
+
+    Forward:
+        x = x + gate_sa  * self_attn(AdaLN(x, c))
+        x = x + gate_ca  * cross_attn(AdaLN(x, c), context)
+        x = x + gate_mlp * mlp(AdaLN(x, c))
+    """
+
+    def __init__(
+        self,
+        hidden_size: int,
+        num_heads: int,
+        mlp_ratio: Optional[float] = 4.0,
+        **block_kwargs: dict,
+    ) -> None:
+        super().__init__()
+        self.norm1 = AdaLayerNormZero(hidden_size)
+        self.attn = Attention(hidden_size, num_heads=num_heads, qkv_bias=True, **block_kwargs)
+        self.cross_attn = CrossAttentionLayer(hidden_size, num_heads)
+        self.use_mlp = mlp_ratio is not None
+        if self.use_mlp:
+            self.norm2 = AdaLayerNormZero(hidden_size)
+            self.mlp = Mlp(
+                in_features=hidden_size,
+                hidden_features=int(hidden_size * mlp_ratio),
+                act_layer=partial(nn.GELU, approximate="tanh"),
+            )
+        self._init_weights()
+
+    def _init_weights(self) -> None:
+        def _basic_init(module: nn.Module):
+            if isinstance(module, nn.Linear):
+                nn.init.xavier_uniform_(module.weight)
+                if module.bias is not None:
+                    nn.init.zeros_(module.bias)
+        self.attn.apply(_basic_init)
+        if self.use_mlp:
+            self.mlp.apply(_basic_init)
+
+    def forward(
+        self, x: torch.Tensor, c: torch.Tensor, context: torch.Tensor
+    ) -> torch.Tensor:
+        """
+        Args:
+            x:       (B, T, H) branch hidden state
+            c:       (B, T, H) AdaLN conditioning
+            context: (B, T, H) key/value stream from the other branch
+        """
+        x, gate_sa = self.norm1(x, c)
+        x = x + gate_sa * self.attn(x)
+        x = x + self.cross_attn(x, c, context)
+        if self.use_mlp:
+            x, gate_mlp = self.norm2(x, c)
+            x = x + gate_mlp * self.mlp(x)
+        return x
+
+
 class DITFinalLayer(nn.Module):
     """
     The final layer of DiT.

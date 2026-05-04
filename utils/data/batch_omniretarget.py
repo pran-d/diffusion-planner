@@ -10,10 +10,10 @@ import yaml
 # ---------------------------------------------------------------------------
 AUG_CONFIG = {
     "qpos": {
-        "robot_quat": {"dims": slice(0, 4), "std": 0.004, "renormalize": True},
-        "robot_xyz":  {"dims": slice(4, 7), "std": 0.005},
-        "joints":     {"dims": slice(7, 36), "std": 0.025},
-        "obj_quat":   {"dims": slice(36, 40), "std": 0.0025, "renormalize": True},
+        "robot_quat": {"dims": slice(0, 4), "std": 0.002, "renormalize": True},
+        "robot_xyz":  {"dims": slice(4, 7), "std": 0.002},
+        "joints":     {"dims": slice(7, 36), "std": 0.01},
+        "obj_quat":   {"dims": slice(36, 40), "std": 0.001, "renormalize": True},
         "obj_xyz":    {"dims": slice(40, 43), "std": 0.001},
     },
     "base": {
@@ -168,8 +168,15 @@ def resolve_npz_files(input_dir, task_list_path=None, file_names=None):
         npz_files = []
         for task in _load_task_list(task_list_path):
             task_dir = os.path.join(input_dir, task)
+            
+            # Check if task is actually an .npz file
+            candidate_npz = task_dir if task_dir.endswith(".npz") else f"{task_dir}.npz"
+            if os.path.exists(candidate_npz) and os.path.isfile(candidate_npz):
+                npz_files.append(candidate_npz)
+                continue
+                
             if not os.path.isdir(task_dir):
-                print(f"Warning: task folder not found: {task_dir}")
+                print(f"Warning: task folder or .npz file not found: {task_dir}")
                 continue
 
             names_to_try = file_names or ["best_trajectory.npz"]
@@ -306,7 +313,7 @@ if __name__ == "__main__":
     import argparse
 
     parser = argparse.ArgumentParser()
-    parser.add_argument("--input_dir",  default="/scratch/project/eu-26-32/diffusion-planner/test_datasets/omniretarget_cleanup")
+    parser.add_argument("--input_dir",  default="/scratch/project/eu-26-32/diffusion-planner/test_datasets/OmniRetarget_Dataset/robot-object/")
     parser.add_argument("--output_dir", default="/scratch/project/eu-26-32/diffusion-planner/test_datasets/batched_omniretarget")
     parser.add_argument("--paths_config", default="./config/paths.yaml",
                         help="Path to config/paths.yaml used to resolve file_names and task_list_path.")

@@ -277,29 +277,30 @@ class DiT1D(BaseBackbone):
         external_cond: Optional[torch.Tensor] = None,
         external_cond_mask: Optional[torch.Tensor] = None,
         mask: Optional[torch.Tensor] = None,
+        indicator: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         # 1. Input Embedding
-        # x is (B, T, C)
-        x = self.input_embedder(x) # (B, T, hidden)
+        x = self.input_embedder(x)  # (B, T, hidden)
 
         if mask is not None:
-            # mask: (B, T) boolean tensor where True means masked
             x = torch.where(mask.unsqueeze(-1), self.mask_token, x)
 
         # 2. Condition Embedding
         c = self.noise_level_pos_embedding(noise_levels)
-
         if external_cond is not None:
             c = c + self.external_cond_embedding(external_cond, external_cond_mask)
-            
+
         # 3. Positional Embedding
         x = self.pos_emb(x)
-        
+
+        # 4. Optional waypoint indicator (injected after pos_emb)
+        if indicator is not None:
+            x = x + indicator
+
         # Transformer Blocks
         for block in self.blocks:
             x = self._checkpoint(block, x, c)
-            
+
         # Final Layer
         x = self.final_layer(x, c)
-        
         return x

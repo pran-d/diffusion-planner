@@ -102,7 +102,7 @@ class RobotDiffuser():
         Run reverse diffusion to generate trajectories.
         """
         sample = torch.randn(num_trajectories, self.num_channels, self.input_size).to(self.device)
-        ff
+        
         cond_list = []
         if getattr(self.model, 'state_condition', False) and state_cond is not None:
             if isinstance(state_cond, np.ndarray):
