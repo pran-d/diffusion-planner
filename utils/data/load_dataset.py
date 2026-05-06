@@ -47,19 +47,30 @@ def preload_dataset(config: dict, data_root: str) -> list:
                 tasks = list(tasks.keys())
             
         for t in tasks:
-            file_names = configured_file_names or default_task_file_names
-            # e.g. ["top_trajectories.npz", "motion.npz"]
-            
             file_found = False
-            for file_name in file_names:
-                p = os.path.join(data_root, t, file_name)
-                if os.path.exists(p):
-                    file_paths.append(p)
-                    file_found = True
-                    break
+            
+            # Check if t exists as an npz file directly
+            p_exact = os.path.join(data_root, t)
+            p_npz = os.path.join(data_root, f"{t}.npz")
+            
+            if os.path.isfile(p_exact) and p_exact.endswith('.npz'):
+                file_paths.append(p_exact)
+                file_found = True
+            elif os.path.isfile(p_npz):
+                file_paths.append(p_npz)
+                file_found = True
+            elif os.path.isdir(p_exact):
+                file_names = configured_file_names or default_task_file_names
+                # e.g. ["top_trajectories.npz", "motion.npz"]
+                for file_name in file_names:
+                    p = os.path.join(p_exact, file_name)
+                    if os.path.exists(p):
+                        file_paths.append(p)
+                        file_found = True
+                        break
             
             if not file_found:
-                print(f"Warning: Could not find any valid .npz files for task '{t}' in {os.path.join(data_root, t)}.")
+                print(f"Warning: Could not find any valid .npz files for task '{t}' in {p_exact}.")
                 
     elif data_root.endswith(".npz") and os.path.isfile(data_root):
         # Direct .npz file path

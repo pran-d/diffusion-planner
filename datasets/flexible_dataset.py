@@ -7,7 +7,7 @@ import yaml
 from torch.utils.data import Dataset
 from tqdm import tqdm
 
-from utils.math.sbto_utils import compute_sbto_components, yaw_to_rot_matrix, yaw_from_quat, rot6d_to_rot, quat_to_rot, compute_task_params, rot_to_6d, build_feature_layout
+from utils.math.sbto_utils import compute_sbto_components, yaw_to_rot_matrix, yaw_from_quat, rot6d_to_rot, quat_to_rot, compute_task_params, compute_task_params_reorient, rot_to_6d, build_feature_layout
 from utils.math.rotation_conversions import ( 
     axis_angle_to_quaternion, 
 )
@@ -46,6 +46,7 @@ class FlexibleWindowDataset(Dataset):
         self.start_timestep = config.get("start_timestep", 0)
         self.normalize_goal_vec = config.get("normalize_goal_vec", True)
         self.num_task_params = config.get("num_task_params", 2)
+        self.task_type = config.get("task_type", "pickplace")
         self.normalization_type = config.get("normalization_type", "mean_std")  # 'mean_std' or 'min_max'
         self.feature_order = config.get("feature_order", 
                 [
@@ -90,6 +91,21 @@ class FlexibleWindowDataset(Dataset):
         if self.mirror_enabled:
             print(f"Mirror symmetry augmentation enabled (prob={self.mirror_prob})")
 
+        # ── Carry-walk approach-phase augmentation ───────────────────
+        # Uses trajectories where the robot walks while holding the box.
+        # Robot pose is kept unchanged; the box is frozen at its final drop
+        # location throughout, making it look like the robot walks toward a
+        # stationary box and bends to interact with it.
+        approach_cfg = aug_cfg.get("approach_phase", {})
+        self.approach_aug_enabled = approach_cfg.get("enabled", False)
+        self.carry_walk_aug_prob  = float(approach_cfg.get("carry_walk_aug_prob", 0.5))
+        self._approach_rng = np.random.default_rng(int(approach_cfg.get("seed", 123)))
+        if self.approach_aug_enabled:
+            print(
+                f"Carry-walk approach augmentation enabled "
+                f"(prob={self.carry_walk_aug_prob})"
+            )
+
         self._raw_buffer = data_buffer
         self._task_params = task_params
         self._motion_styles = motion_styles
@@ -114,7 +130,7 @@ class FlexibleWindowDataset(Dataset):
         else:
             self._calculate_stats()
         
-        if self.max_obj_displacement is None:
+        if self.max_obj_displacement is None and self.task_type != "reorient":
             self.max_obj_displacement = self.stats.get("max_task_params")[-1]
             print("Using max_obj_displacement =", self.max_obj_displacement)
 
@@ -289,6 +305,7 @@ class FlexibleWindowDataset(Dataset):
         total_trajs = 0
         tp_offset = 0  # running offset into the flat task_params list
         style_offset = 0
+        aug_entries = []  # synthetic approach-phase trajectories accumulated here
 
         for raw_data in buf:
             if not raw_data:
@@ -356,11 +373,67 @@ class FlexibleWindowDataset(Dataset):
             self.ram_cache.append(processed)
             total_trajs += N_i
 
+            # ── Carry-walk approach-phase augmentation ───────────────────
+            if self.approach_aug_enabled:
+                # Derive per-trajectory real lengths in downsampled frames.
+                if 'traj_lengths' in raw_data:
+                    raw_lens = np.asarray(raw_data['traj_lengths'], dtype=int)
+                    real_lens_ds = np.maximum(1, (raw_lens - start_ts - 1) // ds + 1)
+                    if len(real_lens_ds) < N_i:
+                        real_lens_ds = np.full(N_i, processed['base'].shape[1], dtype=int)
+                elif 'traj_length' in raw_data:
+                    v = int(np.asarray(raw_data['traj_length']))
+                    real_lens_ds = np.full(N_i, max(1, (v - start_ts - 1) // ds + 1), dtype=int)
+                else:
+                    real_lens_ds = np.full(N_i, processed['base'].shape[1], dtype=int)
+
+                vel_keys = [k for k in ('base_vel', 'joints_vel', 'obj_vel', 'ee_rel_pos')
+                            if k in processed]
+
+                for b in range(N_i):
+                    if self._approach_rng.random() > self.carry_walk_aug_prob:
+                        continue
+
+                    if not self._is_carry_walk_trajectory(processed, b):
+                        continue
+
+                    T_real = min(int(real_lens_ds[b]), processed['base'].shape[1])
+                    base_b   = processed['base'][b,   :T_real]
+                    obj_b    = processed['obj'][b,    :T_real]
+                    joints_b = processed['joints'][b, :T_real]
+
+                    extras = {k: processed[k][b, :T_real] for k in vel_keys}
+
+                    aug = self._try_carry_approach_augmentation(
+                        base_b, obj_b, joints_b,
+                        extra_arrays=extras if extras else None,
+                    )
+                    if aug is None:
+                        continue
+
+                    if self.style_condition and 'style_id' in processed:
+                        src_sid = int(processed['style_id'][b])
+                        aug['style_id']     = np.array([src_sid], dtype=np.int64)
+                        aug['style_onehot'] = one_hot_style(
+                            src_sid, num_styles=self.num_styles
+                        )[np.newaxis].astype(np.float32)
+
+                    aug_entries.append(aug)
+
+        # Append augmented trajectories as individual single-traj ram_cache entries.
+        for aug_dict in aug_entries:
+            self.ram_cache.append(aug_dict)
+            total_trajs += 1
+
+        if aug_entries:
+            print(f"  Added {len(aug_entries)} synthetic approach-phase trajectories.")
+
         print(f"Loaded {len(self.ram_cache)} files ({total_trajs} total trajectories) into RAM cache.")
 
     # Keys that are non-temporal (no time dimension to pad)
     _NON_TEMPORAL_KEYS = {
         'goal_obj_world',
+        'goal_obj_quat',
         'fps',
         'source_file_path',
         'source_folder_name',
@@ -375,12 +448,20 @@ class FlexibleWindowDataset(Dataset):
 
         motion_style_id, motion_info = classify_style_from_motion(base, joints, obj)
 
-        folder = processed.get('source_folder_name', None)
-        if isinstance(folder, np.ndarray):
-            folder = folder.item() if folder.ndim == 0 else folder[traj_idx]
-        folder = str(folder) if folder is not None else None
-
-        task_text = self._task_text_by_folder.get(folder, "") if folder else ""
+        # Prefer file stem as lookup key (data may be flat .npz files).
+        task_text = ""
+        fpath = processed.get('source_file_path')
+        if isinstance(fpath, np.ndarray):
+            fpath = fpath.item() if fpath.ndim == 0 else fpath[traj_idx]
+        if fpath:
+            stem = os.path.splitext(os.path.basename(str(fpath)))[0]
+            task_text = self._task_text_by_folder.get(stem, "")
+        if not task_text:
+            folder = processed.get('source_folder_name')
+            if isinstance(folder, np.ndarray):
+                folder = folder.item() if folder.ndim == 0 else folder[traj_idx]
+            if folder:
+                task_text = self._task_text_by_folder.get(str(folder), "")
         text_style_id = classify_style_from_task_text(task_text, rng=self._style_rng)
 
         # Keep explicit mixed kick+pick random rule from task text when available.
@@ -564,29 +645,53 @@ class FlexibleWindowDataset(Dataset):
         if 'goal_obj_world' in raw_traj:
             goal_world = raw_traj['goal_obj_world']  # (3,)
             anchor["final_obj_pos"] = goal_world
-            features["task_params"], _ = compute_task_params(
-                current_robot_state=raw_traj['base'][read_start, 3:],
-                current_obj_state=raw_traj['obj'][read_start, :3],
-                desired_obj_pos=goal_world,
-                normalize_goal_vec=self.normalize_goal_vec,
-                num_task_params=self.num_task_params,
-                max_goal_dist=self.max_obj_displacement
-            )
+            goal_quat = raw_traj.get('goal_obj_quat', raw_traj['obj'][-1, 3:7])
+            if self.task_type == "reorient":
+                features["task_params"] = compute_task_params_reorient(
+                    current_robot_state=raw_traj['base'][read_start, 3:],
+                    current_obj_state=raw_traj['obj'][read_start, :7],
+                    desired_obj_z=goal_world[2],
+                    desired_obj_quat=goal_quat,
+                )
+            else:
+                features["task_params"], _ = compute_task_params(
+                    current_robot_state=raw_traj['base'][read_start, 3:],
+                    current_obj_state=raw_traj['obj'][read_start, :3],
+                    desired_obj_pos=goal_world,
+                    normalize_goal_vec=self.normalize_goal_vec,
+                    num_task_params=self.num_task_params,
+                    max_goal_dist=self.max_obj_displacement,
+                    current_obj_rot=raw_traj['obj'][read_start, 3:7],
+                    desired_obj_rot=goal_quat,
+                )
         else:
             anchor["final_obj_pos"] = raw_traj['obj'][-1, :3]
-            features["task_params"], _ = self._compute_task_params(raw_traj['base'], raw_traj['obj'], start_idx=read_start)
+            features["task_params"], _ = self._compute_task_params(
+                raw_traj['base'], raw_traj['obj'], start_idx=read_start,
+            )
 
         return features, anchor
 
-    def _compute_task_params(self, base_traj, obj_traj, start_idx=0):
-        # Default: Object X, Y displacement from start to end of trajectory
+    def _compute_task_params(self, base_traj, obj_traj, start_idx=0,
+                              desired_obj_quat=None, current_obj_quat=None):
+        if self.task_type == "reorient":
+            des_quat = desired_obj_quat if desired_obj_quat is not None else obj_traj[-1, 3:7]
+            tp = compute_task_params_reorient(
+                current_robot_state=base_traj[start_idx, 3:],
+                current_obj_state=obj_traj[start_idx, :7],
+                desired_obj_z=obj_traj[-1, 2],
+                desired_obj_quat=des_quat,
+            )
+            return tp, None
         return compute_task_params(
             current_robot_state=base_traj[start_idx, 3:],
             current_obj_state=obj_traj[start_idx, :3],
             desired_obj_pos=obj_traj[-1, :3],
             normalize_goal_vec=self.normalize_goal_vec,
             num_task_params=self.num_task_params,
-            max_goal_dist=self.max_obj_displacement
+            max_goal_dist=self.max_obj_displacement,
+            current_obj_rot=current_obj_quat if current_obj_quat is not None else obj_traj[start_idx, 3:7],
+            desired_obj_rot=desired_obj_quat if desired_obj_quat is not None else obj_traj[-1, 3:7],
         )
 
     def _normalize(self, key, val):
@@ -690,6 +795,88 @@ class FlexibleWindowDataset(Dataset):
         if key == "task_params" and self.noise_cfg.get("task_magnitude", 0) > 0:
             tensor[..., 2] *= torch.rand_like(tensor[..., 2]) * self.noise_cfg["task_magnitude"] # Large noise for goal distance to encourage generalization
         return tensor
+
+    # ────────────────────────────────────────────────────────────────
+    # Carry-walk approach-phase augmentation
+    # ────────────────────────────────────────────────────────────────
+    def _is_carry_walk_trajectory(self, processed: dict, traj_idx: int) -> bool:
+        """Return True if the trajectory involves walking while holding the box."""
+        # Data may be stored as flat .npz files (e.g. sub3_largebox_003_original.npz),
+        # so the meaningful lookup key is the file stem, not the parent folder name.
+        def _get_lookup_key(val):
+            if val is None:
+                return None
+            if isinstance(val, np.ndarray):
+                val = val.item() if val.ndim == 0 else val[traj_idx]
+            return str(val)
+
+        key = None
+        fpath = _get_lookup_key(processed.get('source_file_path'))
+        if fpath:
+            stem = os.path.splitext(os.path.basename(fpath))[0]
+            if stem in self._task_text_by_folder:
+                key = stem
+
+        if key is None:
+            folder = _get_lookup_key(processed.get('source_folder_name'))
+            if folder and folder in self._task_text_by_folder:
+                key = folder
+
+        if key is None:
+            return False
+
+        task_text = self._task_text_by_folder[key].lower()
+        has_carry = "carry" in task_text
+        has_hold_walk = "hold" in task_text and any(
+            d in task_text for d in ["forward", "to right", "to left"]
+        )
+        return has_carry or has_hold_walk
+
+    def _try_carry_approach_augmentation(self, base, obj, joints, extra_arrays=None):
+        """
+        Create a synthetic approach trajectory from a carry-while-walking trajectory.
+
+        The robot's base and joint trajectory are kept exactly as recorded.
+        The object is frozen at its final resting position (drop location)
+        for the entire trajectory, so the sequence reads as: robot walks toward
+        a stationary box, then bends down to interact with it.
+
+        Args:
+            base:         (T, 7)  world-frame pelvis [x, y, z, qw, qx, qy, qz]
+            obj:          (T, 7)  world-frame object [x, y, z, qw, qx, qy, qz]
+            joints:       (T, 29) joint positions
+            extra_arrays: optional dict of {key: (T, D)} velocity / ee arrays
+
+        Returns:
+            dict with (1, T, D) arrays and 'goal_obj_world' (1, 3), or None.
+        """
+        T = base.shape[0]
+        if T < 2:
+            return None
+
+        goal_obj_world = obj[-1, :3].copy()
+        goal_obj_quat  = obj[-1, 3:7].copy()
+
+        # Freeze object at final drop location for the entire trajectory.
+        obj_frozen = np.empty_like(obj)
+        obj_frozen[:] = obj[-1]
+
+        aug = {
+            'base':           base[np.newaxis].astype(np.float64),
+            'joints':         joints[np.newaxis].astype(np.float64),
+            'obj':            obj_frozen[np.newaxis].astype(np.float64),
+            'goal_obj_world': goal_obj_world[np.newaxis].astype(np.float64),
+            'goal_obj_quat':  goal_obj_quat[np.newaxis].astype(np.float64),
+        }
+
+        if extra_arrays:
+            for k_e, arr in extra_arrays.items():
+                if k_e == 'obj_vel':
+                    aug[k_e] = np.zeros_like(arr)[np.newaxis].astype(np.float64)
+                else:
+                    aug[k_e] = arr[np.newaxis].astype(np.float64)
+
+        return aug
 
     # ────────────────────────────────────────────────────────────────
     # G1 left/right mirror symmetry (C2 sagittal-plane reflection)
@@ -832,8 +1019,16 @@ class FlexibleWindowDataset(Dataset):
         self._mirror_obs_perm = obs_perm
         self._mirror_obs_sign = obs_sign
 
-        # Task params: [goal_x, goal_y, goal_dist] → negate y
-        self._mirror_task_sign = np.array([1.0, -1.0, 1.0], dtype=np.float32)
+        # Task param sign under L/R reflection depends on task type.
+        if self.task_type == "reorient":
+            # Layout: [delta_z, delta_roll, delta_yaw]
+            # delta_z: invariant; delta_roll: negates; delta_yaw: negates
+            _tp_sign_base = np.array([1.0, -1.0, -1.0], dtype=np.float32)
+        else:
+            # Layout: [goal_dir_x, goal_dir_y, goal_dir_z, goal_dist, (delta_yaw)]
+            # y-direction and yaw negate; x, z, dist unchanged.
+            _tp_sign_base = np.array([1.0, -1.0, 1.0, 1.0, -1.0], dtype=np.float32)
+        self._mirror_task_sign = _tp_sign_base[:self.num_task_params]
 
     def _build_mirror_norm_bias(self):
         """
@@ -930,13 +1125,14 @@ class FlexibleWindowDataset(Dataset):
         self._mirror_obs_bias = obs_bias.astype(np.float32)
 
         # ── task-params bias ────────────────────────────────────────
-        tp_bias = np.zeros(3, dtype=np.float32)
+        n_tp = len(self._mirror_task_sign)
+        tp_bias = np.zeros(n_tp, dtype=np.float32)
         if self.normalization_type == "min_max":
             lo = self.stats.get("min_task_params")
             hi = self.stats.get("max_task_params")
             if lo is not None and hi is not None:
-                lo_np = lo.numpy()
-                hi_np = hi.numpy()
+                lo_np = lo.numpy()[:n_tp]
+                hi_np = hi.numpy()[:n_tp]
                 denom = hi_np - lo_np
                 denom = np.where(np.abs(denom) < 1e-6, 1.0, denom)
                 tp_bias = np.where(
@@ -948,8 +1144,8 @@ class FlexibleWindowDataset(Dataset):
             mu  = self.stats.get("mean_task_params")
             sig = self.stats.get("std_task_params")
             if mu is not None and sig is not None:
-                mu_np  = mu.numpy()
-                sig_np = sig.numpy()
+                mu_np  = mu.numpy()[:n_tp]
+                sig_np = sig.numpy()[:n_tp]
                 sig_np = np.where(np.abs(sig_np) < 1e-6, 1.0, sig_np)
                 tp_bias = np.where(
                     self._mirror_task_sign == -1.0,
@@ -1365,12 +1561,16 @@ class FlexibleWindowDataset(Dataset):
 
         # 2. Simple flips (Negate Y or specific indices)
         # Lists of (key, indices_to_negate)
+        # task_params sign flip depends on task type:
+        #   pickplace: negate index 1 (y-direction)
+        #   reorient:  negate indices 1,2 (delta_roll, delta_yaw both flip under L/R mirror)
+        tp_negate = [1, 2] if self.task_type == "reorient" else [1]
         negate_tasks = [
             ("delta_xy", [1]),
             ("delta_yaw", [0]),
             ("obj_delta_xy", [1]),
             ("obj_rel_pos", [1]),
-            ("task_params", [1]), 
+            ("task_params", tp_negate),
             ("body_rot6d", [1, 3, 5]),
             # ("obj_rel_rot6d", [1, 3, 5]),  # Handled separately below with geom offset
         ]

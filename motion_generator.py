@@ -18,8 +18,11 @@ from scipy.ndimage import gaussian_filter1d
 from config.configure import load_config, get_data_path, get_save_path, get_norm_path
 from models.model import RobotDiffuser
 from datasets.flexible_dataset import FlexibleWindowDataset
-from utils.math.sbto_utils import reconstruct_sbto_trajectory, compute_task_params
-from utils.math.math_tools import yaw_from_quat, yaw_to_rot_matrix
+from utils.math.sbto_utils import reconstruct_sbto_trajectory, compute_task_params, compute_task_params_reorient
+from utils.math.math_tools import (
+    yaw_from_quat, yaw_to_rot_matrix, quat_to_rot, roll_yaw_from_rot,
+    normalize_angle, rot_to_quat_wxyz,
+)
 from utils.data.style_conditioning import one_hot_style, style_name_to_id
 from utils.physics_limits import apply_physics_clamp
 from utils.inference_utils import build_inference_waypoints
@@ -143,6 +146,7 @@ class MotionGenerator:
         self.model_cfg, self.data_cfg, self.training_cfg, self.noise_cfg = load_config(
             config_path, raw_config.get("auto_conf", False)
         )
+        self.task_type = self.data_cfg.get("task_type", "pickplace")
         
         self.device = torch.device(device if device else ("cuda" if torch.cuda.is_available() else "cpu"))
         
@@ -523,7 +527,7 @@ class MotionGenerator:
                 smoothed[..., sl] = q_vals / norm
         return smoothed
 
-    def _update_condition(self, robot_world_history, obj_world_history, final_obj_pos=None):
+    def _update_condition(self, robot_world_history, obj_world_history, final_obj_pos=None, final_obj_quat=None):
         """
         Update condition for next autoregressive step.
         Mirrors inference.py's update_condition().
@@ -533,7 +537,7 @@ class MotionGenerator:
 
         B, H, _ = robot_world_history.shape
         next_states = []
-        next_anchors = {'ref_pos': [], 'ref_quat': [], 'ref_obj_pos': [], 'final_obj_pos': []}
+        next_anchors = {'ref_pos': [], 'ref_quat': [], 'ref_obj_pos': [], 'ref_obj_quat': [], 'final_obj_pos': []}
 
         for b in range(B):
             r_slice = robot_world_history[b]  # (H, 36)
@@ -574,6 +578,7 @@ class MotionGenerator:
             next_anchors['ref_pos'].append(new_anch['ref_pos'])
             next_anchors['ref_quat'].append(new_anch['ref_quat'])
             next_anchors['ref_obj_pos'].append(new_anch['ref_obj_pos'])
+            next_anchors['ref_obj_quat'].append(o_slice[-1, 3:7])  # last history frame's obj quat
             next_anchors['final_obj_pos'].append(new_anch.get('final_obj_pos', np.zeros(3)))
 
         next_state_tens = torch.stack(next_states)
@@ -581,19 +586,22 @@ class MotionGenerator:
             'ref_pos': np.stack(next_anchors['ref_pos']),
             'ref_quat': np.stack(next_anchors['ref_quat']),
             'ref_obj_pos': np.stack(next_anchors['ref_obj_pos']),
+            'ref_obj_quat': np.stack(next_anchors['ref_obj_quat']),
             'final_obj_pos': np.stack(next_anchors['final_obj_pos']),
         }
         return next_state_tens, batched_anchor
 
-    def generate_trajectory(self, 
-                            initial_condition: Dict, 
+    def generate_trajectory(self,
+                            initial_condition: Dict,
                             goal_condition: Union[Dict, np.ndarray],
                             style_condition: Optional[Union[str, np.ndarray, list]] = None,
+                            goal_obj_rot: Optional[np.ndarray] = None,
                             target_traj_length: int = None,
-                            stitch_steps: int = None, 
+                            stitch_steps: int = None,
                             num_samples: int = 1,
                             cfg_w: float = 1.0,
                             end_error_threshold: float = 0.1,
+                            end_yaw_threshold: Optional[float] = None,
                             end_ground_num_frames: int = 2,
                             end_ground_z_tol: float = 0.05,
                             enable_goal_stop: bool = False,
@@ -638,6 +646,10 @@ class MotionGenerator:
             cfg_w: Classifier-free guidance weight.
             end_error_threshold: XY-plane radius (metres) around the goal within which
                                  the object must lie.  Only used when enable_goal_stop=True.
+            end_yaw_threshold: Optional angular tolerance (radians) for the object yaw
+                               at the goal.  When provided alongside goal_obj_rot, the
+                               stop condition also requires |obj_yaw - goal_yaw| < threshold.
+                               Set to None to ignore yaw when checking goal arrival.
             end_ground_num_frames: Minimum consecutive frames the object must be on
                                    the ground before the trajectory is considered done.
             end_ground_z_tol: Tolerance (metres) for the object z to be considered
@@ -645,7 +657,8 @@ class MotionGenerator:
             enable_goal_stop: If True, each trajectory independently stops generating and
                               pads once (a) the object XY is within end_error_threshold of
                               the goal AND (b) the object has been on the ground for at
-                              least end_ground_num_frames consecutive frames.
+                              least end_ground_num_frames consecutive frames.  When
+                              end_yaw_threshold is set, also checks yaw alignment.
                               Set to False to always run the full stitch_steps.
             enable_physics_stop: If True, truncate and pad when a physical consistency
                                  violation is detected (ground penetration / position spike).
@@ -708,22 +721,49 @@ class MotionGenerator:
         else:
              raise ValueError("Goal condition format not supported yet. Pass np.ndarray or list.")
         
-        # Convert from initial-pelvis-local frame to world frame.
-        # The goal encodes relative object *displacement* (final − initial)
-        # expressed in the robot's yaw-aligned local frame.  To recover the
-        # desired final object world position we rotate the displacement back
-        # into the world frame and add the *initial object position* (NOT the
-        # robot position).
+        # Convert goal_condition from local frame to world frame, task-type aware.
         init_base = r_hist[:, 0, :7]    # (B, 7) initial pelvis [x,y,z, qw,qx,qy,qz]
         init_obj_pos = o_hist[:, 0, :3]  # (B, 3) initial object position (world)
-        goal_world = np.zeros((B_input, 3), dtype=np.float64)
-        for b in range(B_input):
-            yaw = yaw_from_quat(init_base[b, 3:7])
-            R_local_to_world = yaw_to_rot_matrix(yaw)
-            goal_3d = np.zeros(3, dtype=np.float64)
-            n = min(gc_np.shape[-1], 3)
-            goal_3d[:n] = gc_np[b, :n]
-            goal_world[b] = (R_local_to_world @ goal_3d[:, None])[:, 0] + init_obj_pos[b]
+        init_obj_quat = o_hist[:, 0, 3:7]  # (B, 4) initial object quat [qw,qx,qy,qz]
+
+        goal_obj_quat_world = None  # only set for reorient
+
+        if self.task_type == "reorient":
+            # gc_np = [delta_z, delta_roll, delta_yaw] in initial robot yaw frame
+            delta_z    = gc_np[:, 0]
+            delta_roll = gc_np[:, 1]
+            delta_yaw  = gc_np[:, 2]
+
+            goal_world = np.zeros((B_input, 3), dtype=np.float64)
+            goal_world[:, :2] = init_obj_pos[:, :2]   # in-place: same XY
+            goal_world[:, 2]  = init_obj_pos[:, 2] + delta_z
+
+            # Derive desired world-frame quaternion from delta_roll / delta_yaw
+            goal_obj_quat_world = np.zeros((B_input, 4), dtype=np.float64)
+            for b in range(B_input):
+                yaw_b    = yaw_from_quat(init_base[b, 3:7])
+                R_rob    = yaw_to_rot_matrix(yaw_b)
+                R_rob_inv = yaw_to_rot_matrix(-yaw_b)
+                R_curr   = quat_to_rot(init_obj_quat[b])
+                R_in_rob = R_rob_inv @ R_curr
+                roll_c, yaw_c = roll_yaw_from_rot(R_in_rob)
+                roll_d = normalize_angle(roll_c + delta_roll[b])
+                yaw_d  = normalize_angle(yaw_c  + delta_yaw[b])
+                cr, sr = np.cos(roll_d), np.sin(roll_d)
+                Rx = np.array([[1, 0, 0], [0, cr, -sr], [0, sr, cr]], dtype=np.float64)
+                R_des_rob   = yaw_to_rot_matrix(yaw_d) @ Rx
+                R_des_world = R_rob @ R_des_rob
+                goal_obj_quat_world[b] = rot_to_quat_wxyz(R_des_world)
+        else:
+            # Pickplace: goal = local XYZ displacement → world position
+            goal_world = np.zeros((B_input, 3), dtype=np.float64)
+            for b in range(B_input):
+                yaw = yaw_from_quat(init_base[b, 3:7])
+                R_local_to_world = yaw_to_rot_matrix(yaw)
+                goal_3d = np.zeros(3, dtype=np.float64)
+                n = min(gc_np.shape[-1], 3)
+                goal_3d[:n] = gc_np[b, :n]
+                goal_world[b] = (R_local_to_world @ goal_3d[:, None])[:, 0] + init_obj_pos[b]
 
         # 3. Replicate for num_samples (when generating multiple samples per condition)
         if num_samples > 1 and curr_state_tens.shape[0] == 1:
@@ -731,6 +771,8 @@ class MotionGenerator:
             for k in current_anchors:
                 current_anchors[k] = np.repeat(current_anchors[k], num_samples, axis=0)
             goal_world = np.repeat(goal_world, num_samples, axis=0)
+            if goal_obj_quat_world is not None:
+                goal_obj_quat_world = np.repeat(goal_obj_quat_world, num_samples, axis=0)
         
         curr_state_tens = curr_state_tens.to(self.device)
         effective_batch = curr_state_tens.shape[0]
@@ -800,14 +842,29 @@ class MotionGenerator:
         with torch.no_grad():
             for step in range(stitch_steps):
                 # A. Compute per-step task params (world-frame goal → local displacement)
-                task_cond_np, actual_dist = compute_task_params(
-                    current_robot_state=current_anchors['ref_quat'],
-                    current_obj_state=current_anchors['ref_obj_pos'],
-                    desired_obj_pos=goal_world,
-                    normalize_goal_vec=self.data_cfg.get("normalize_goal_vec", True),
-                    num_task_params=self.data_cfg.get("num_task_params", 3),
-                    max_goal_dist=self.dataset.max_obj_displacement,
-                )
+                if self.task_type == "reorient":
+                    curr_obj_for_tp = np.concatenate([
+                        current_anchors['ref_obj_pos'],
+                        current_anchors['ref_obj_quat'],
+                    ], axis=-1)  # (B, 7)
+                    task_cond_np = compute_task_params_reorient(
+                        current_robot_state=current_anchors['ref_quat'],
+                        current_obj_state=curr_obj_for_tp,
+                        desired_obj_z=goal_world[:, 2],
+                        desired_obj_quat=goal_obj_quat_world,
+                    )
+                    actual_dist = None
+                else:
+                    task_cond_np, actual_dist = compute_task_params(
+                        current_robot_state=current_anchors['ref_quat'],
+                        current_obj_state=current_anchors['ref_obj_pos'],
+                        desired_obj_pos=goal_world,
+                        normalize_goal_vec=self.data_cfg.get("normalize_goal_vec", True),
+                        num_task_params=self.data_cfg.get("num_task_params", 3),
+                        max_goal_dist=self.dataset.max_obj_displacement,
+                        current_obj_rot=current_anchors.get('ref_obj_quat'),
+                        desired_obj_rot=goal_obj_rot,
+                    )
                 # task_actual uses the real (unclipped) distance for waypoint planning
                 task_actual = task_cond_np.copy()
                 if actual_dist is not None:
@@ -819,6 +876,7 @@ class MotionGenerator:
                 )
 
                 # B. Build waypoints (full keyframe at t=0 + optional last-frame partial wp)
+                # Last-frame waypoint uses a lift z-profile — only relevant for pick-place.
                 wv, wm = None, None
                 if getattr(self.diffuser.model, 'inbetweening_enabled', False):
                     model_feature_dim = int(getattr(self.diffuser.model, 'x_shape', torch.Size([self.data_cfg['num_features']]))[0])
@@ -826,10 +884,11 @@ class MotionGenerator:
                     _current_obj_z = torch.from_numpy(
                         current_anchors['ref_obj_pos'][:, 2].astype(np.float32)
                     )
+                    _use_last_wp = use_last_frame_wp and self.task_type != "reorient"
                     wv, wm = build_inference_waypoints(
                         curr_state_tens, task_actual, self.dataset,
                         model_feature_dim, window_size,
-                        use_last_frame_wp=use_last_frame_wp,
+                        use_last_frame_wp=_use_last_wp,
                         stitch_steps=stitch_steps,
                         remaining_steps=remaining,
                         arrival_ratio=arrival_ratio,
@@ -937,33 +996,87 @@ class MotionGenerator:
                     _trigger_frame = np.full(effective_batch, -1, dtype=np.int64)
                     _active = ~_goal_reached  # only check trajectories not yet reached
                     _goal_needs_ground = np.abs(goal_world[:, 2] - _rest_obj_z) < end_ground_z_tol
+                    # Pre-compute goal yaw (and roll for reorient) once per segment
+                    _eff_yaw_threshold = end_yaw_threshold
+                    if self.task_type == "reorient" and _eff_yaw_threshold is None:
+                        _eff_yaw_threshold = 0.1  # rad (~5.7 deg) default tolerance for reorient if none passed
+                        
+                    _check_yaw = (_eff_yaw_threshold is not None
+                                  and goal_obj_rot is not None
+                                  and segment_world.shape[-1] >= 43)
+                    
+                    if _check_yaw:
+                        _goal_quat = np.asarray(goal_obj_rot, dtype=np.float64).reshape(-1, 4)
+                        _goal_yaw = yaw_from_quat(_goal_quat).reshape(-1)
+                        if self.task_type == "reorient":
+                            _goal_rot_mat = quat_to_rot(_goal_quat)
+                            _goal_roll, _ = roll_yaw_from_rot(_goal_rot_mat)
+                            _goal_roll = _goal_roll.reshape(-1)
+                    else:
+                        _goal_yaw = None
+                        _goal_roll = None
+
                     for _t in range(_seg_T):
                         _obj_xyz_t = segment_world[:, _t, 36:39]  # (B, 3)
                         # Update ground counter: on-ground if |obj_z - rest_z| < tol
                         _on_ground = np.abs(_obj_xyz_t[:, 2] - _rest_obj_z) < end_ground_z_tol
                         _ground_counter = np.where(_on_ground, _ground_counter + 1, 0)
-                        # 3D distance to goal
-                        _goal_err = np.linalg.norm(
-                            _obj_xyz_t[:, :3] - goal_world[:, :3], axis=-1
-                        )  # (B,)
+                        
+                        if self.task_type == "reorient":
+                            # For reorient, we only care about z error (in position)
+                            _goal_err = np.abs(_obj_xyz_t[:, 2] - goal_world[:, 2])
+                        else:
+                            # 3D distance to goal
+                            _goal_err = np.linalg.norm(
+                                _obj_xyz_t[:, :3] - goal_world[:, :3], axis=-1
+                            )  # (B,)
+                            
                         _ground_ok = (~_goal_needs_ground) | (_ground_counter >= end_ground_num_frames)
 
-                        # Check goal and ground condition (if required)
+                        # Optional yaw check: |wrap(obj_yaw - goal_yaw)| < threshold
+                        if _check_yaw:
+                            _obj_quat_t = segment_world[:, _t, 39:43]  # (B, 4) [qw,qx,qy,qz]
+                            _obj_yaw = yaw_from_quat(_obj_quat_t)       # (B,)
+                            _yaw_err = np.abs(
+                                (_obj_yaw - _goal_yaw + np.pi) % (2.0 * np.pi) - np.pi
+                            )
+                            _yaw_ok = _yaw_err < _eff_yaw_threshold
+                            
+                            if self.task_type == "reorient":
+                                _obj_rot_mat = quat_to_rot(_obj_quat_t)
+                                _obj_roll, _ = roll_yaw_from_rot(_obj_rot_mat)
+                                _roll_err = np.abs(
+                                    (_obj_roll - _goal_roll + np.pi) % (2.0 * np.pi) - np.pi
+                                )
+                                _yaw_ok = _yaw_ok & (_roll_err < _eff_yaw_threshold)
+                        else:
+                            _yaw_ok = np.ones(effective_batch, dtype=bool)
+
+                        # Check goal, ground, and yaw conditions
                         _hit = (
                             _active & ~_newly
                             & (_goal_err < end_error_threshold)
                             & _ground_ok
+                            & _yaw_ok
                         )
                         if _hit.any():
                             for _ni in np.where(_hit)[0]:
                                 _goal_last_frame[_ni] = segment_world[_ni, _t, :]
                                 _trigger_frame[_ni] = _t
                             _newly |= _hit
+                            if _check_yaw:
+                                if self.task_type == "reorient":
+                                    _yaw_msg = f", yaw_err_deg={np.degrees(_yaw_err[_hit]).round(1).tolist()}, roll_err_deg={np.degrees(_roll_err[_hit]).round(1).tolist()}"
+                                else:
+                                    _yaw_msg = f", yaw_err_deg={np.degrees(_yaw_err[_hit]).round(1).tolist()}"
+                            else:
+                                _yaw_msg = ""
                             print(
                                 f"[goal] step {step+1}, frame {_t}: "
                                 f"sample {np.where(_hit)[0].tolist()} reached goal "
-                                f"(goal_err={_goal_err[_hit].round(4).tolist()}, "
-                                f"ground_frames={_ground_counter[_hit].astype(int).tolist()})"
+                                f"(pos_err={_goal_err[_hit].round(4).tolist()}, "
+                                f"ground_frames={_ground_counter[_hit].astype(int).tolist()}"
+                                f"{_yaw_msg})"
                             )
                     # Pad remainder of current segment for newly-reached trajectories
                     if _newly.any():
@@ -1021,8 +1134,9 @@ class MotionGenerator:
                     r_hist_new = r_world[:, -history_size:, :]
                     o_hist_new = o_world[:, -history_size:, :]
                     curr_state_tens, current_anchors = self._update_condition(
-                        r_hist_new, o_hist_new, 
+                        r_hist_new, o_hist_new,
                         final_obj_pos=goal_world,
+                        final_obj_quat=goal_obj_rot,
                     )
                     curr_state_tens = curr_state_tens.to(self.device)
         

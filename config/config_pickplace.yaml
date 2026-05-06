@@ -1,12 +1,12 @@
 auto_conf: False
 
 data:
-  task_type: "pickplace"    # "pickplace" | "reorient"  (see config_pickplace.yaml / config_reorient.yaml)
+  task_type: "pickplace"
   normalization_type: "min_max"
   dataset_class: "flexible"
   batch_size: 1024
   num_features: 48
-  num_task_params: 4        # pickplace: [goal_dir_x, goal_dir_y, goal_dir_z, goal_dist]
+  num_task_params: 4        # [goal_dir_x, goal_dir_y, goal_dir_z, goal_dist]
   num_observations: 45
   start_timestep: 0
   num_timesteps: 50
@@ -34,19 +34,23 @@ data:
     joint_pos: "dof_pos"
     object_pos_w: "object_pos"
     object_quat_w: "object_rot"
-  
+
   augmentation:
     mirror_symmetry:
       enabled: True
       prob: 0.5
     approach_phase:
-      # Uses carry-while-walking trajectories as synthetic approach phases.
-      # Robot pose is kept unchanged; the object is frozen at its final drop
-      # location so the trajectory reads as: walk toward stationary box, bend.
-      enabled: True
-      carry_walk_aug_prob: 0.5
+      enabled: False
+      prob: 0.4
+      move_threshold: 0.05
+      min_phase1_frames: 12
+      template_skip_start: 0.25
+      template_skip_end: 2
+      min_template_frames: 6
+      prepend_range: [10, 60]
+      join_blend_frames: 3
       seed: 123
-  
+
   num_styles: 3
   style_conditioning:
     enabled: False
@@ -64,17 +68,12 @@ model:
   task_condition: True
   external_cond_dropout: 0.05
   hidden_size: 256
-  # dit1d-only depth (kept for backward compat when backbone_type: dit1d)
   depth: 8
-  # # dit1d_dual branch depths
-  branch1_depth: 4    # World branch (delta_xy, obj pose, …)
-  branch2_depth: 4    # Body branch  (joints, body_z, body_rot6d)
-  # Feature groups for each branch (must cover all 51 dims, no overlap)
+  branch1_depth: 4
+  branch2_depth: 4
   branch1_features:
     - delta_xy
     - delta_yaw
-    # - obj_delta_xy
-    # - obj_z
     - body_z
     - obj_rel_pos
     - obj_rel_rot6d
@@ -84,16 +83,16 @@ model:
   num_heads: 4
   mlp_ratio: 4.0
   pos_emb_type: "learned_1d"
-  group_wise_embedding: True # only used for dit1d 
+  group_wise_embedding: True
   history_aggregation: "attn"
 
 training:
-  suffix: _pickplace_approachaug
+  suffix: _pickplace
   num_epochs: 500
   balance_task_density: False
   learning_rate: 0.0005
   save_every: 25
-  condition_dropout_prob: 
+  condition_dropout_prob:
     state: 0.1
     style: 0.05
     task: 0.2
@@ -116,7 +115,6 @@ training:
   ema_update_after_step: 0
   batches_per_epoch: null
 
-  # In-betweening (waypoint-masked trajectory completion)
   inbetweening:
     enabled: True
     resample_steps: 2
@@ -137,8 +135,8 @@ training:
         locomotion: [obj_delta_xy]
         pick_place: [obj_z]
         object_pos: [obj_rel_pos, obj_rel_rot6d]
-        lower_body: [joints_lower]   # hip / knee / ankle joints (indices 0-11)
-        upper_body: [joints_upper]   # waist + shoulder / elbow / wrist joints (indices 12-28)
+        lower_body: [joints_lower]
+        upper_body: [joints_upper]
         pose: [body_rot6d]
         robot_pos: [body_z, delta_xy, delta_yaw]
       group_keep_prob:
@@ -159,7 +157,7 @@ noise_scheduler:
   train_timesteps: 200
   inference_timesteps: 10
   prediction_type: "v_prediction"
-  beta_schedule: "sigmoid" 
+  beta_schedule: "sigmoid"
   noise_level: "random_uniform"
   scheduling_matrix: "full_sequence"
   use_fourier_noise_embedding: False

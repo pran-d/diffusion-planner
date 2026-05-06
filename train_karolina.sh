@@ -6,4 +6,11 @@
 #SBATCH --gpus 1
 #SBATCH --output logs/train_%j.out
 #SBATCH --error logs/train_%j.out
-uv run python -u train.py --no_tensorboard 
+
+conf_path="${CFGPATH:-config/config.yaml}"
+cfgpath="--config $conf_path"
+
+cmd=(uv run python -u train.py --config "$cfgpath" --no_tensorboard)
+
+cmd+=("$@")
+"${cmd[@]}"

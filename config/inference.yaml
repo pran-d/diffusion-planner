@@ -17,16 +17,19 @@ inference_mg:
   phase2_checkpoint: null
   ema: true
   num_samples: 1
+  start_time: 0
   stitch_steps: null
   target_traj_length: null
   save_path: results/inference_mg.npz
   metrics_log_path: results/inference_metrics.jsonl
   task_params: null
   style: null
-  end_error_threshold: 0.1
+  end_error_threshold: 0.01
+  end_yaw_threshold: null
   end_ground_num_frames: 5
   end_ground_z_tol: 0.05
   goal_multiplier: 1.0
+  init_obj_offset: [0.0, 2.0]
   enable_goal_stop: true
   disable_goal_stop: false
   enable_phys_stop: false

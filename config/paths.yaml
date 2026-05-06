@@ -5,9 +5,9 @@ paths:
   # Sub-path within data_dir that selects the active dataset split
   # train_path: trial/omniretarget_cleanup
   # train_path: batched_omniretarget
-  train_path: _merged_batched.npz
+  train_path: batched_omniretarget
 
-  # task_list_path: ./test_datasets/chosen_tasks_pickplace.yml
+  task_list_path: ./test_datasets/chosen_tasks_reorient.yml
 
   # Directory where checkpoints and norm stats are saved
   save_dir: /scratch/project/eu-26-32/diffusion-planner/results/runs/

@@ -14,6 +14,10 @@ uv sync && source .venv/bin/activate   # recommended
 # or: conda env create -f environment.yaml && conda activate diffusers
 ```
 
+[!NOTE]
+Never use commands like `python <command>`, always use `uv run python <command>`.
+
+
 ### Training
 ```bash
 python train.py                        # train from scratch

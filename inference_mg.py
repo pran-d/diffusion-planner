@@ -26,7 +26,11 @@ import torch
 from config.configure import get_data_path, get_norm_path, get_mj_xml_paths
 from datasets.flexible_dataset import FlexibleWindowDataset
 from utils.data.load_dataset import preload_dataset
-from utils.math.math_tools import yaw_from_quat, yaw_to_rot_matrix
+from utils.math.math_tools import (
+    yaw_from_quat, yaw_to_rot_matrix, rot_to_quat_wxyz,
+    quat_to_rot, roll_yaw_from_rot, normalize_angle,
+)
+from utils.math.sbto_utils import compute_task_params_reorient
 from motion_generator import MotionGenerator
 from utils.inference_config import load_inference_defaults
 from utils.inference_utils import DEFAULT_LIFT_HEIGHT
@@ -47,10 +51,12 @@ def _save_single_video_headless(
     fps=100,
     width=1280,
     height=720,
+    goal_obj_rot=None,
 ):
     """Save one trajectory video in a subprocess using offscreen MuJoCo rendering.
 
     This avoids GLFW initialization in headless environments.
+    goal_obj_rot: optional (4,) [qw, qx, qy, qz] — orients the goal marker.
     """
     x = np.asarray(trajectory)
     rl = int(real_length)
@@ -59,6 +65,9 @@ def _save_single_video_headless(
         raise ValueError(f"Expected trajectory shape (T, D), got {x.shape}")
     if gw.shape[0] < 3:
         raise ValueError(f"Expected goal_world with at least 3 dims, got {gw.shape}")
+    # Default identity quaternion when no goal rotation is specified
+    gr = np.asarray(goal_obj_rot, dtype=np.float64) if goal_obj_rot is not None \
+         else np.array([1.0, 0.0, 0.0, 0.0], dtype=np.float64)
 
     with tempfile.TemporaryDirectory(prefix="infer_mg_render_") as td:
         payload = os.path.join(td, "payload.npz")
@@ -67,6 +76,7 @@ def _save_single_video_headless(
             trajectory=x,
             real_length=np.array([rl], dtype=np.int64),
             goal_world=gw[:3],
+            goal_obj_rot=gr,
         )
 
         render_code = r'''
@@ -81,6 +91,7 @@ arr = np.load(payload)
 x = arr["trajectory"]
 real_length = int(arr["real_length"][0])
 goal_world = arr["goal_world"]
+goal_obj_rot = arr["goal_obj_rot"] if "goal_obj_rot" in arr.files else np.array([1.0, 0.0, 0.0, 0.0])
 
 if x.ndim != 2:
     raise ValueError(f"Expected trajectory shape (T, D), got {x.shape}")
@@ -167,10 +178,10 @@ try:
         for t in range(T_render):
             data.qpos[:] = x[t, :model.nq]
 
-            # Goal marker (fixed world position)
+            # Goal marker: fixed world position, oriented to show desired object yaw
             if goal_mocap_id >= 0:
                 data.mocap_pos[goal_mocap_id] = goal_world[:3]
-                data.mocap_quat[goal_mocap_id] = np.array([1.0, 0.0, 0.0, 0.0], dtype=np.float64)
+                data.mocap_quat[goal_mocap_id] = goal_obj_rot.astype(np.float64)
 
             # Guidance arrow from current object toward goal
             if arrow_mocap_id >= 0:
@@ -235,10 +246,9 @@ def extract_initial_condition(dataset, sample_idx, local_goal_dim=3):
 
     Returns:
         initial_condition: dict with 'robot' (H, 36) and 'obj' (H, 7)
-        goal_local:        (local_goal_dim,) — object displacement (final − initial)
-                           expressed in the yaw-rotated initial robot frame.
-                           Axes: (dx_forward, dy_left, dz_up) aligned with the
-                           pelvis at t=0 after stripping pitch/roll (yaw-only rotation).
+        goal_local:        task-type dependent goal vector —
+          pickplace: (local_goal_dim,) XYZ displacement in yaw-aligned robot frame.
+          reorient:  (3,) [delta_z, delta_roll, delta_yaw] in initial robot yaw frame.
         anchor:            dict with ref_pos, ref_quat, ref_obj_pos, final_obj_pos
         file_idx, batch_idx, start_time: dataset index triple
     """
@@ -262,24 +272,27 @@ def extract_initial_condition(dataset, sample_idx, local_goal_dim=3):
         'obj': obj_hist,
     }
 
-    # Task params: dataset already computes the anchor with final_obj_pos
     sample = dataset[sample_idx]
-    task_params_norm = sample[2]
     anchor = sample[-1]
 
-    # Recover the object displacement in the yaw-rotated initial robot frame.
-    # We rotate (final_obj_pos - init_obj_pos) from world frame into the frame
-    # aligned with the pelvis yaw at t=0 (pitch/roll stripped).
-    init_base_quat = raw_traj['base'][h_start, 3:7]
-    init_obj_pos = raw_traj['obj'][h_start, :3]
-    final_obj_pos = anchor['final_obj_pos']
+    task_type = getattr(dataset, 'task_type', 'pickplace')
 
-    yaw = yaw_from_quat(init_base_quat)
-    R_world_to_local = yaw_to_rot_matrix(-yaw)  # inverse of local-to-world
+    if task_type == "reorient":
+        # Compute [delta_z, delta_roll, delta_yaw] from the trajectory data
+        goal_local, _ = dataset._compute_task_params(
+            raw_traj['base'], raw_traj['obj'], start_idx=h_start,
+        )
+    else:
+        init_base_quat = raw_traj['base'][h_start, 3:7]
+        init_obj_pos   = raw_traj['obj'][h_start, :3]
+        final_obj_pos  = anchor['final_obj_pos']
 
-    delta_world = final_obj_pos[:3] - init_obj_pos[:3]
-    delta_local_3d = (R_world_to_local @ delta_world[:, None])[:, 0]
-    goal_local = delta_local_3d[:local_goal_dim]
+        yaw = yaw_from_quat(init_base_quat)
+        R_world_to_local = yaw_to_rot_matrix(-yaw)
+
+        delta_world    = final_obj_pos[:3] - init_obj_pos[:3]
+        delta_local_3d = (R_world_to_local @ delta_world[:, None])[:, 0]
+        goal_local     = delta_local_3d[:local_goal_dim]
 
     return initial_condition, goal_local, anchor, file_idx, batch_idx, start_time
 
@@ -288,6 +301,8 @@ def parse_args(argv=None):
     parser = argparse.ArgumentParser(
         description="Inference via MotionGenerator (unified pipeline)"
     )
+    parser.add_argument("--config", type=str, default="config/config.yaml",
+                        help="Path to model/training config YAML (e.g. config/config_reorient.yaml)")
     parser.add_argument("--inference_config", type=str, default="config/inference.yaml",
                         help="Path to inference defaults YAML")
     parser.add_argument("--epoch", type=str, default=None,
@@ -313,10 +328,21 @@ def parse_args(argv=None):
                         help="Classifier-free guidance weight")
     parser.add_argument("--task_params", nargs="+", type=float, default=None,
                         help="Override goal as local-frame displacement (e.g. --task_params 0.5 -0.2)")
+    parser.add_argument("--goal_obj_yaw", type=float, default=None,
+                        help="Pickplace: desired world-frame object yaw (rad). "
+                             "Reorient: desired delta_yaw in initial robot frame (rad).")
+    parser.add_argument("--goal_obj_roll", type=float, default=None,
+                        help="Reorient task only: desired delta_roll in initial robot frame (rad).")
+    parser.add_argument("--init_obj_offset", nargs="+", type=float, default=None,
+                        help="Shift initial box position in robot yaw-frame (dx_fwd, dy_left[, dz_up]). "
+                             "Applies on top of the dataset's initial object pose.")
     parser.add_argument("--style", type=str, default=None, choices=["pick", "push", "kick"],
                         help="Optional style command for style-conditioned model")
     parser.add_argument("--end_error_threshold", type=float, default=0.1,
                         help="XY-plane radius (m) for goal-reached check")
+    parser.add_argument("--end_yaw_threshold", type=float, default=None,
+                        help="Angular tolerance (rad) for object yaw at goal. "
+                             "Only active when --goal_obj_yaw is set. Default: no yaw check.")
     parser.add_argument("--end_ground_num_frames", type=int, default=5,
                         help="Consecutive on-ground frames required before stopping")
     parser.add_argument("--end_ground_z_tol", type=float, default=0.05,
@@ -371,8 +397,9 @@ def main():
         args.enable_goal_stop = False
 
     # ─── 1. Build MotionGenerator ──────────────────────────────────────────────
-    mg = MotionGenerator(config_path="config/config.yaml", device=args.device)
+    mg = MotionGenerator(config_path=args.config, device=args.device)
     data_cfg = mg.data_cfg
+    task_type = data_cfg.get("task_type", "pickplace")
 
     # ─── 2. Load weights ──────────────────────────────────────────────────────
     if args.epoch is None:
@@ -416,21 +443,55 @@ def main():
     local_goal_dim = min(3, num_task_params)
     initial_condition, goal_local, anchor, file_idx, batch_idx, start_time = \
         extract_initial_condition(dataset, sample_idx, local_goal_dim)
+    print(f"Task type: {task_type}")
+
+    init_base_quat = initial_condition['robot'][0, 3:7]
+
+    # Shift initial object position if requested (pickplace only — reorient is in-place)
+    if args.init_obj_offset is not None and task_type != "reorient":
+        yaw = yaw_from_quat(init_base_quat)
+        R_local_to_world = yaw_to_rot_matrix(yaw)
+        offset_local = np.zeros(3, dtype=np.float64)
+        offset_local[:len(args.init_obj_offset)] = args.init_obj_offset
+        offset_world = (R_local_to_world @ offset_local[:, None])[:, 0]
+        initial_condition['obj'][:, :3] += offset_world
+        print(f"Shifted initial obj by (local): {offset_local}  (world): {offset_world}")
+        print(f"New initial obj pos: {initial_condition['obj'][0, :3]}")
+
+        # The goal world position (anchor['final_obj_pos']) hasn't moved, but the
+        # object now starts farther away. Update goal_local so the model knows the
+        # true displacement from the new initial object position to the goal.
+        # goal_local = R_world_to_local @ (final_obj_pos - new_init_obj_pos)
+        #            = original_goal_local - R_world_to_local @ offset_world
+        #            = original_goal_local - offset_local  (they cancel exactly)
+        _orig_goal_local = goal_local.copy()
+        goal_local = goal_local - offset_local[:len(goal_local)]
+        print(f"Updated goal_local: {_orig_goal_local} → {goal_local}  "
+              f"(object starts {np.linalg.norm(offset_local[:2]):.2f}m farther in local XY)")
 
     # Override goal if provided via CLI
     if args.task_params is not None:
         goal_local = np.array(args.task_params, dtype=np.float64)
-        print(f"Using CLI goal (yaw-rotated robot frame): {goal_local}")
+        print(f"Using CLI goal: {goal_local}")
+    elif task_type == "reorient" and (args.goal_obj_roll is not None or args.goal_obj_yaw is not None):
+        # Patch roll/yaw components while keeping delta_z from dataset
+        if args.goal_obj_roll is not None:
+            goal_local[1] = float(args.goal_obj_roll)
+        if args.goal_obj_yaw is not None:
+            goal_local[2] = float(args.goal_obj_yaw)
+        print(f"Using CLI reorient goal [delta_z, delta_roll, delta_yaw]: {goal_local}")
 
     # Auto-compute stitch_steps from dataset trajectory length if not provided.
-    # When the user supplied --task_params we calibrate from the goal distance
-    # so the trajectory is long enough to actually reach it.
     if args.stitch_steps is None and args.target_traj_length is None:
         _eff = max(1, data_cfg["num_timesteps"] - data_cfg.get("state_history", 1))
         traj_len = dataset.traj_lengths[args.traj_idx]
         base_steps = max(1, math.ceil(traj_len / _eff))
 
-        if args.task_params is not None:
+        if task_type == "reorient":
+            # For reorient there is no XY distance metric; use trajectory length directly.
+            args.stitch_steps = base_steps
+            print(f"Auto stitch_steps={args.stitch_steps} from traj length {traj_len} (reorient)")
+        elif args.task_params is not None:
             # Calibrate speed from the *dataset* sample's original goal distance,
             # then use it to size steps for the user-supplied goal.
             orig_dist = np.linalg.norm(anchor['final_obj_pos'][:2] - anchor['ref_obj_pos'][:2])
@@ -444,7 +505,18 @@ def main():
                   f"{goal_dist:.2f}m (base={base_steps})")
         else:
             args.stitch_steps = base_steps
-            print(f"Auto stitch_steps={args.stitch_steps} from traj length {traj_len}")
+            if args.init_obj_offset is not None:
+                orig_dist = np.linalg.norm(anchor['final_obj_pos'][:2] - anchor['ref_obj_pos'][:2])
+                new_dist = np.linalg.norm(goal_local[:2])
+                if orig_dist > 1e-3:
+                    scale = max(1.0, new_dist / orig_dist)
+                    args.stitch_steps = max(base_steps, math.ceil(base_steps * scale))
+                    print(f"Auto stitch_steps={args.stitch_steps} (scaled ×{scale:.2f} "
+                          f"for obj offset; orig_dist={orig_dist:.2f}m new_dist={new_dist:.2f}m)")
+                else:
+                    print(f"Auto stitch_steps={args.stitch_steps} from traj length {traj_len}")
+            else:
+                print(f"Auto stitch_steps={args.stitch_steps} from traj length {traj_len}")
 
     # Scale goal if requested (AFTER auto-computing stitch_steps so we can scale them too)
     if args.goal_multiplier != 1.0:
@@ -460,6 +532,32 @@ def main():
     print(f"Initial obj pos:   {initial_condition['obj'][0, :3]}")
     print(f"Anchor final_obj_pos (world): {anchor['final_obj_pos']}")
 
+    # Compute goal object rotation for visualization marker
+    goal_obj_rot = None
+    if task_type == "reorient":
+        # Derive goal world-frame quaternion from [delta_roll, delta_yaw] in robot frame.
+        # Used only for visualization (goal marker orientation in MuJoCo).
+        _yaw_r    = float(yaw_from_quat(init_base_quat))
+        _R_rob    = yaw_to_rot_matrix(_yaw_r)
+        _R_rob_i  = yaw_to_rot_matrix(-_yaw_r)
+        _init_q   = initial_condition['obj'][0, 3:7]
+        _rc, _yc  = roll_yaw_from_rot(_R_rob_i @ quat_to_rot(_init_q))
+        _rd = normalize_angle(_rc + goal_local[1])
+        _yd = normalize_angle(_yc + goal_local[2])
+        _cr, _sr  = np.cos(_rd), np.sin(_rd)
+        _Rx = np.array([[1, 0, 0], [0, _cr, -_sr], [0, _sr, _cr]], dtype=np.float64)
+        _R_des_world = _R_rob @ (yaw_to_rot_matrix(_yd) @ _Rx)
+        goal_obj_rot = rot_to_quat_wxyz(_R_des_world)
+        print(f"Goal object quat (world): {goal_obj_rot}")
+    elif args.goal_obj_yaw is not None:
+        # Pickplace: construct quaternion from yaw angle
+        yaw = float(args.goal_obj_yaw)
+        qw = np.cos(yaw / 2.0)
+        qx, qy = 0.0, 0.0
+        qz = np.sin(yaw / 2.0)
+        goal_obj_rot = np.array([qw, qx, qy, qz], dtype=np.float64)
+        print(f"Goal object yaw: {yaw:.4f} rad → quat: {goal_obj_rot}")
+
     # Ensure stitch_steps is fully determined for logging
     if args.stitch_steps is None:
         _eff_gen = max(1, data_cfg["num_timesteps"] - data_cfg.get("state_history", 1))
@@ -467,7 +565,7 @@ def main():
             args.stitch_steps = max(1, math.ceil(args.target_traj_length / _eff_gen))
         else:
             args.stitch_steps = 1
-            
+
     _eff_horizon = max(1, data_cfg["num_timesteps"] - data_cfg.get("state_history", 1))
     planning_horizon_s = _eff_horizon * 0.01
 
@@ -476,12 +574,14 @@ def main():
     result, real_lengths = mg.generate_trajectory(
         initial_condition=initial_condition,
         goal_condition=goal_local,
+        goal_obj_rot=goal_obj_rot,
         style_condition=args.style,
         target_traj_length=args.target_traj_length,
         stitch_steps=args.stitch_steps,
         num_samples=args.num_samples,
         cfg_w=args.cfg_w,
         end_error_threshold=args.end_error_threshold,
+        end_yaw_threshold=args.end_yaw_threshold,
         end_ground_num_frames=args.end_ground_num_frames,
         end_ground_z_tol=args.end_ground_z_tol,
         enable_goal_stop=args.enable_goal_stop,
@@ -506,32 +606,59 @@ def main():
 
     # ─── 7. Compute goal world position from (possibly scaled) goal_local ───
     init_base_quat = initial_condition['robot'][0, 3:7]
-    init_obj_pos = initial_condition['obj'][0, :3]
-    yaw = yaw_from_quat(init_base_quat)
-    R_local_to_world = yaw_to_rot_matrix(yaw)
-    goal_3d = np.zeros(3, dtype=np.float64)
-    n_goal = min(len(goal_local), 3)
-    goal_3d[:n_goal] = goal_local[:n_goal]
-    goal_world = (R_local_to_world @ goal_3d[:, None])[:, 0] + init_obj_pos
-    print(f"Goal world position: {goal_world}")
+    init_obj_pos   = initial_condition['obj'][0, :3]
+    if task_type == "reorient":
+        # goal_local = [delta_z, delta_roll, delta_yaw]; XY stays at initial object pos
+        goal_world = init_obj_pos.copy()
+        goal_world[2] += goal_local[0]  # apply delta_z
+        print(f"Goal world position (reorient, z-target): {goal_world}")
+    else:
+        yaw = yaw_from_quat(init_base_quat)
+        R_local_to_world = yaw_to_rot_matrix(yaw)
+        goal_3d = np.zeros(3, dtype=np.float64)
+        n_goal = min(len(goal_local), 3)
+        goal_3d[:n_goal] = goal_local[:n_goal]
+        goal_world = (R_local_to_world @ goal_3d[:, None])[:, 0] + init_obj_pos
+        print(f"Goal world position: {goal_world}")
 
     # ─── 8. Report ────────────────────────────────────────────────────────────
     err = float("nan")
     desired = None
     achieved = None
     if full_trajectory.shape[-1] >= 43:
-        world_goal_dim = min(3, num_task_params)
-        start_obj = full_trajectory[0, 0, 36:36 + world_goal_dim]
         end_idx = int(real_lengths[0] - 1) if len(real_lengths) > 0 else -1
-        end_obj = full_trajectory[0, end_idx, 36:36 + world_goal_dim]
-        achieved = end_obj - start_obj
-        desired = (goal_world - init_obj_pos)[:world_goal_dim]
-        err = float(np.linalg.norm(desired - achieved))
-        print("-" * 40)
-        print(f"Desired displacement  (world): {desired}")
-        print(f"Achieved displacement (world): {achieved}")
-        print(f"L2 error: {err:.4f}")
-        print("-" * 40)
+        if task_type == "reorient":
+            start_obj_pos  = full_trajectory[0, 0, 36:39]
+            end_obj_pos    = full_trajectory[0, end_idx, 36:39]
+            end_obj_quat   = full_trajectory[0, end_idx, 39:43]
+            init_obj_quat  = initial_condition['obj'][0, 3:7]
+            robot_yaw      = float(yaw_from_quat(init_base_quat))
+            R_rob_inv      = yaw_to_rot_matrix(-robot_yaw)
+            roll_c, yaw_c  = roll_yaw_from_rot(R_rob_inv @ quat_to_rot(init_obj_quat))
+            roll_e, yaw_e  = roll_yaw_from_rot(R_rob_inv @ quat_to_rot(end_obj_quat))
+            delta_z_achieved    = float(end_obj_pos[2] - start_obj_pos[2])
+            delta_roll_achieved = float(normalize_angle(roll_e - roll_c))
+            delta_yaw_achieved  = float(normalize_angle(yaw_e - yaw_c))
+            desired  = goal_local[:3]
+            achieved = np.array([delta_z_achieved, delta_roll_achieved, delta_yaw_achieved])
+            err = float(np.linalg.norm(desired - achieved))
+            print("-" * 40)
+            print(f"Desired  [delta_z, delta_roll, delta_yaw] (robot frame): {np.round(desired, 4)}")
+            print(f"Achieved [delta_z, delta_roll, delta_yaw] (robot frame): {np.round(achieved, 4)}")
+            print(f"L2 error: {err:.4f}")
+            print("-" * 40)
+        else:
+            world_goal_dim = min(3, num_task_params)
+            start_obj = full_trajectory[0, 0, 36:36 + world_goal_dim]
+            end_obj   = full_trajectory[0, end_idx, 36:36 + world_goal_dim]
+            achieved  = end_obj - start_obj
+            desired   = (goal_world - init_obj_pos)[:world_goal_dim]
+            err = float(np.linalg.norm(desired - achieved))
+            print("-" * 40)
+            print(f"Desired displacement  (world): {desired}")
+            print(f"Achieved displacement (world): {achieved}")
+            print(f"L2 error: {err:.4f}")
+            print("-" * 40)
 
     np.savez_compressed(
         save_path,
@@ -602,6 +729,7 @@ def main():
                         fps=100,
                         width=1280,
                         height=720,
+                        goal_obj_rot=goal_obj_rot,
                     )
                     print(f"Saved video to {video_path}")
                 else:
@@ -611,6 +739,7 @@ def main():
                         t=t, x_traj=traj_0, repeat=True,
                         guidance_vec=guidance_vec,
                         goal_pos=goal_world,
+                        goal_quat=goal_obj_rot,
                     )
                     vis.close()
             else:

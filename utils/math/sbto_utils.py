@@ -11,6 +11,7 @@ from .math_tools import (
     rot_to_quat,
     batch_rotation,
     transpose,
+    roll_yaw_from_rot,
 )
 
 
@@ -801,22 +802,37 @@ def compute_guidance_vec(current_pos, target_pos, R_robot_yaw_inv, current_rot=N
 
     return np.concatenate([guidance_dir, dist], axis=-1).squeeze(1)
 
-def compute_task_params(current_robot_state, current_obj_state, desired_obj_pos, normalize_goal_vec=True, num_task_params=3, max_goal_dist=1.0):
+def compute_task_params(
+    current_robot_state,
+    current_obj_state,
+    desired_obj_pos,
+    normalize_goal_vec=True,
+    num_task_params=3,
+    max_goal_dist=None,
+    current_obj_rot=None,
+    desired_obj_rot=None,
+):
     """
     Computes the task parameters (local object displacement) for the diffusion model.
     Matches the normalization convention of FlexibleWindowDataset._compute_task_params.
 
+    Layout (num_task_params=4): [goal_dir_x, goal_dir_y, goal_dir_z, goal_dist]
+    Layout (num_task_params=5): [goal_dir_x, goal_dir_y, goal_dir_z, goal_dist, delta_yaw_obj]
+      where delta_yaw_obj = desired_obj_yaw - current_obj_yaw, wrapped to [-π, π].
+      Yaw is invariant to the robot's own yaw rotation (both are Z-axis rotations).
+
     Args:
-        current_robot_state (np.ndarray): Shape (7,) or (4,) [x, y, z, qx, qy, qz, qw]
-                                          representing the robot base pose (or quat).
-        current_obj_state (np.ndarray): Shape (3,) or (7,) [x, y, z, ...]
-                                        representing the current object position.
-        desired_obj_pos (np.ndarray): Shape (3,) [x, y, z] 
-                                      representing the GOAL object position in world frame.
-        max_goal_dist (float): Maximum allowed distance for the goal vector.
+        current_robot_state: (7,) or (B, 7) [x, y, z, qw, qx, qy, qz] robot base.
+        current_obj_state:   (3,) or (B, 3/7) current object position [x, y, z, ...].
+        desired_obj_pos:     (3,) or (B, 3)   desired object position in world frame.
+        current_obj_rot:     (4,) or (B, 4)   current object quaternion [qw, qx, qy, qz].
+                             Optional — required only when num_task_params >= 5.
+        desired_obj_rot:     (4,) or (B, 4)   desired object quaternion [qw, qx, qy, qz].
+                             Optional — required only when num_task_params >= 5.
+        max_goal_dist:       Maximum clipping distance for the goal magnitude.
 
     Returns:
-        np.ndarray: Shape (..., num_task_params).
+        (task_params, local_delta_norm) — np.ndarray shape (..., num_task_params).
     """
     current_robot_state = np.asarray(current_robot_state, dtype=np.float64)
     current_obj_state = np.asarray(current_obj_state, dtype=np.float64)
@@ -825,56 +841,131 @@ def compute_task_params(current_robot_state, current_obj_state, desired_obj_pos,
     # 1. Extract Positions
     curr_obj_pos = current_obj_state[..., :3]
     goal_obj_pos = desired_obj_pos[..., :3]
-    
+
     # 2. Calculate World Displacement
     world_delta = goal_obj_pos - curr_obj_pos
-    
+
     # 3. Extract Robot Yaw
     if current_robot_state.shape[-1] >= 7:
         quat = current_robot_state[..., 3:7]
     else:
         quat = current_robot_state
-    
-    # yaw_from_quat returns (N,) or ()
-    # yaw_to_rot_matrix returns (N, 3, 3) or (3, 3)
+
     yaw = -yaw_from_quat(quat)
     R_ref_inv = yaw_to_rot_matrix(yaw)
 
     # 4. Rotate into Robot Frame (Global -> Local)
-    # Ensure correct broadcasting for batch matrix multiplication
-    # world_delta is (N, 3) -> (N, 3, 1)
     if world_delta.ndim == 1:
         wd_col = world_delta[:, None]
     else:
         wd_col = world_delta[..., None]
-        
-    # Standard matrix multiplication (supports broadcasting if shapes align)
     local_delta = (R_ref_inv @ wd_col)[..., 0]
 
     local_delta_norm = None
-    if normalize_goal_vec:    
-        # Project to task dimensions (e.g. 2D plane)
-        vec_part = local_delta[..., :num_task_params-1]
-        
-        # Consistent norm calculation
+    if normalize_goal_vec:
+        # Position part: first 3 dims of local_delta → normalized direction + clipped magnitude
+        vec_part = local_delta[..., :3]
+
         norm = np.linalg.norm(vec_part, axis=-1, keepdims=True)
         local_delta_norm = norm
-        
-        # Vectorized normalization with safe division
-        mask = (norm > 1e-3)
+
+        mask = norm > 1e-3
         normalized_vec = np.zeros_like(vec_part)
-        
-        # Use np.divide with 'where' to handle zero norms safely and efficiently
         np.divide(vec_part, norm, out=normalized_vec, where=mask)
-        
-        # Clip distance magnitude
+
         norm_clipped = np.clip(norm, a_min=None, a_max=max_goal_dist)
-        
-        # Concatenate: [normalized_dir, clipped_magnitude]
-        # Ensure we concatenate along the last axis
         local_delta = np.concatenate([normalized_vec, norm_clipped], axis=-1)
-        
+        # local_delta is now [dir_x, dir_y, dir_z, dist] — 4 dims
+
+    # 5. Append object yaw delta when num_task_params >= 5
+    if num_task_params >= 5:
+        if current_obj_rot is not None and desired_obj_rot is not None:
+            cur_rot = np.asarray(current_obj_rot, dtype=np.float64)
+            des_rot = np.asarray(desired_obj_rot, dtype=np.float64)
+            yaw_cur = yaw_from_quat(cur_rot)
+            yaw_des = yaw_from_quat(des_rot)
+            delta_yaw = yaw_des - yaw_cur
+            # Wrap to [-π, π]
+            delta_yaw = (delta_yaw + np.pi) % (2.0 * np.pi) - np.pi
+        else:
+            # No rotation provided — zero encodes "no rotation change required"
+            ref_shape = local_delta.shape[:-1]
+            delta_yaw = np.zeros(ref_shape, dtype=np.float64)
+        # Ensure last dim is always 1
+        if delta_yaw.ndim < local_delta.ndim:
+            delta_yaw = delta_yaw[..., np.newaxis]
+        else:
+            delta_yaw = delta_yaw.reshape(local_delta.shape[:-1] + (1,))
+        local_delta = np.concatenate([local_delta, delta_yaw], axis=-1)
+
     return local_delta, local_delta_norm
+
+def compute_task_params_reorient(
+    current_robot_state,
+    current_obj_state,
+    desired_obj_z,
+    desired_obj_quat,
+):
+    """Compute task params for the reorient task: [delta_z, delta_roll, delta_yaw].
+
+    Roll and yaw goals are expressed as deltas relative to the initial object
+    orientation, measured in the robot's initial yaw frame (i.e. the robot's
+    heading at the start of the window defines the reference frame).
+
+    Layout: [delta_z, delta_roll, delta_yaw]
+      delta_z    – desired_z − current_z (world frame, z-axis is up)
+      delta_roll – change in object roll  in robot-yaw frame, wrapped to [-π, π]
+      delta_yaw  – change in object yaw   in robot-yaw frame, wrapped to [-π, π]
+
+    Args:
+        current_robot_state: (..., 7) [x, y, z, qw, qx, qy, qz] robot base, or (..., 4) quat only.
+        current_obj_state:   (..., 7) [x, y, z, qw, qx, qy, qz] object pose.
+        desired_obj_z:       (...,)   desired Z height of the object (world frame).
+        desired_obj_quat:    (..., 4) [qw, qx, qy, qz] desired object orientation.
+
+    Returns:
+        task_params: np.ndarray (..., 3)
+    """
+    current_robot_state = np.asarray(current_robot_state, dtype=np.float64)
+    current_obj_state   = np.asarray(current_obj_state,   dtype=np.float64)
+    desired_obj_z       = np.asarray(desired_obj_z,       dtype=np.float64)
+    desired_obj_quat    = np.asarray(desired_obj_quat,    dtype=np.float64)
+
+    # 1. delta_z
+    curr_z  = current_obj_state[..., 2]
+    delta_z = desired_obj_z - curr_z
+
+    # 2. Robot yaw → inverse rotation (projects world vectors into robot frame)
+    if current_robot_state.shape[-1] >= 7:
+        robot_quat = current_robot_state[..., 3:7]
+    else:
+        robot_quat = current_robot_state
+    yaw       = yaw_from_quat(robot_quat)
+    R_rob_inv = yaw_to_rot_matrix(-yaw)  # Rz(-yaw) = Rz(yaw)^T
+
+    # 3. Current object rotation in robot yaw frame
+    curr_obj_quat    = current_obj_state[..., 3:7]
+    R_curr           = quat_to_rot(curr_obj_quat)          # (..., 3, 3)
+    R_curr_in_rob    = R_rob_inv @ R_curr                   # (..., 3, 3)
+    roll_curr, yaw_curr = roll_yaw_from_rot(R_curr_in_rob)
+
+    # 4. Desired object rotation in robot yaw frame
+    R_des            = quat_to_rot(desired_obj_quat)
+    R_des_in_rob     = R_rob_inv @ R_des
+    roll_des, yaw_des = roll_yaw_from_rot(R_des_in_rob)
+
+    # 5. Angle deltas, wrapped to [-π, π]
+    delta_roll = normalize_angle(roll_des - roll_curr)
+    delta_yaw  = normalize_angle(yaw_des  - yaw_curr)
+
+    # 6. Stack into (..., 3)
+    if delta_z.ndim == 0:
+        return np.array([delta_z, delta_roll, delta_yaw], dtype=np.float64)
+
+    return np.stack(
+        [delta_z, delta_roll, delta_yaw], axis=-1
+    ).astype(np.float64)
+
 
 def get_feature_indices(feature_layout):
     """
