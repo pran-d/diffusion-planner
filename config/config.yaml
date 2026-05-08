@@ -16,7 +16,7 @@ data:
   max_obj_displacement: 1.0
   downsample: 1
   rot_type: quat
-  raw_dt: 0.03
+  raw_dt: 0.01
   feature_order:
     - delta_xy
     - delta_yaw
@@ -89,10 +89,10 @@ model:
 
 training:
   suffix: _pickplace_approachaug
-  num_epochs: 500
+  num_epochs: 50
   balance_task_density: False
   learning_rate: 0.0005
-  save_every: 25
+  save_every: 5
   condition_dropout_prob: 
     state: 0.1
     style: 0.05
@@ -122,8 +122,8 @@ training:
     resample_steps: 2
     min_keyframes: 0
     max_keyframes: 3
-    always_keep_first: True
-    keep_last_partial: True
+    always_keep_first: False
+    keep_last_partial: False
     waypoint_noise_fraction: 0.5
     arrival_ratio: 0.85
     force_all_known_prob: 0.0

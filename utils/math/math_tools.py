@@ -251,6 +251,28 @@ def roll_yaw_from_rot(R: np.ndarray):
     return roll, yaw
 
 
+def roll_pitch_yaw_from_rot(R: np.ndarray):
+    """Extract roll, pitch and yaw (ZYX Euler convention) from rotation matrix.
+
+    ZYX: R = Rz(yaw) @ Ry(pitch) @ Rx(roll)
+      roll  = atan2(R[2,1], R[2,2])
+      pitch = atan2(-R[2,0], sqrt(R[2,1]^2 + R[2,2]^2))
+      yaw   = atan2(R[1,0], R[0,0])
+
+    Args:
+        R: (..., 3, 3) rotation matrix
+
+    Returns:
+        roll:  (...,) roll  angles in radians
+        pitch: (...,) pitch angles in radians
+        yaw:   (...,) yaw   angles in radians
+    """
+    roll  = np.arctan2(R[..., 2, 1], R[..., 2, 2])
+    pitch = np.arctan2(-R[..., 2, 0], np.sqrt(R[..., 2, 1]**2 + R[..., 2, 2]**2))
+    yaw   = np.arctan2(R[..., 1, 0], R[..., 0, 0])
+    return roll, pitch, yaw
+
+
 def normalize_angle(angle: np.ndarray) -> np.ndarray:
     """Normalize angle to [-pi, pi].
     

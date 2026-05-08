@@ -270,7 +270,7 @@ def main():
     parser.add_argument("--fps",   type=int, default=33)
     parser.add_argument("--width", type=int, default=1280)
     parser.add_argument("--height",type=int, default=720)
-    parser.add_argument("--no_video_interactive", action="store_true",
+    parser.add_argument("--no_video_interactive", action="store_true", default=True,
                         help="When --video is given, skip the interactive viewer as well")
     args = parser.parse_args()
 
@@ -303,7 +303,18 @@ def main():
         except ValueError:
             print(f"Error: ({args.traj_idx}, {args.batch_idx}) not found.")
             sys.exit(1)
-        traj_list = [unique_trajs[start]]
+        # Collect carry-walk trajectories starting from the requested index
+        carry_trajs = [
+            (f, b) for f, b in unique_trajs[start:]
+            if dataset._is_carry_walk_trajectory(dataset.ram_cache[f], b)
+        ]
+        if not carry_trajs:
+            print(f"No carry-walk trajectory found at or after ({args.traj_idx}, {args.batch_idx}).")
+            sys.exit(1)
+        if carry_trajs[0] != (args.traj_idx, args.batch_idx):
+            print(f"  ({args.traj_idx}, {args.batch_idx}) is not carry-walk; "
+                  f"advancing to ({carry_trajs[0][0]}, {carry_trajs[0][1]})")
+        traj_list = carry_trajs[:args.num_trajs]
     else:
         # Only show carry-walk trajectories when iterating
         carry_trajs = [
@@ -319,13 +330,7 @@ def main():
         file_meta   = dataset.ram_cache[file_idx] if 0 <= file_idx < len(dataset.ram_cache) else {}
         source_file = os.path.basename(str(file_meta.get("source_file_path", "unknown")))
 
-        is_carry = dataset._is_carry_walk_trajectory(dataset.ram_cache[file_idx], batch_idx)
-        print(f"\n[{vis_idx+1}/{len(traj_list)}] file={file_idx}, batch={batch_idx}  "
-              f"({source_file})  carry={is_carry}")
-
-        if not is_carry:
-            print("  Skipping — not a carry-walk trajectory.")
-            continue
+        print(f"\n[{vis_idx+1}/{len(traj_list)}] file={file_idx}, batch={batch_idx}  ({source_file})")
 
         raw_traj = dataset._get_single_traj(file_idx, batch_idx)
         if raw_traj is None:

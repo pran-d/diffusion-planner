@@ -21,7 +21,7 @@ from datasets.flexible_dataset import FlexibleWindowDataset
 from utils.math.sbto_utils import reconstruct_sbto_trajectory, compute_task_params, compute_task_params_reorient
 from utils.math.math_tools import (
     yaw_from_quat, yaw_to_rot_matrix, quat_to_rot, roll_yaw_from_rot,
-    normalize_angle, rot_to_quat_wxyz,
+    roll_pitch_yaw_from_rot, normalize_angle, rot_to_quat_wxyz,
 )
 from utils.data.style_conditioning import one_hot_style, style_name_to_id
 from utils.physics_limits import apply_physics_clamp
@@ -722,36 +722,49 @@ class MotionGenerator:
              raise ValueError("Goal condition format not supported yet. Pass np.ndarray or list.")
         
         # Convert goal_condition from local frame to world frame, task-type aware.
-        init_base = r_hist[:, 0, :7]    # (B, 7) initial pelvis [x,y,z, qw,qx,qy,qz]
-        init_obj_pos = o_hist[:, 0, :3]  # (B, 3) initial object position (world)
-        init_obj_quat = o_hist[:, 0, 3:7]  # (B, 4) initial object quat [qw,qx,qy,qz]
+        init_base = r_hist[:, -1, :7]    # (B, 7) current pelvis [x,y,z, qw,qx,qy,qz]
+        init_obj_pos = o_hist[:, -1, :3]  # (B, 3) current object position (world)
+        init_obj_quat = o_hist[:, -1, 3:7]  # (B, 4) current object quat [qw,qx,qy,qz]
 
         goal_obj_quat_world = None  # only set for reorient
 
         if self.task_type == "reorient":
-            # gc_np = [delta_z, delta_roll, delta_yaw] in initial robot yaw frame
-            delta_z    = gc_np[:, 0]
-            delta_roll = gc_np[:, 1]
-            delta_yaw  = gc_np[:, 2]
+            # gc_np = [delta_x, delta_y, delta_z, delta_roll, delta_pitch, delta_yaw]
+            # in initial robot yaw frame
+            delta_x     = gc_np[:, 0]
+            delta_y     = gc_np[:, 1]
+            delta_z     = gc_np[:, 2]
+            delta_roll  = gc_np[:, 3]
+            delta_pitch = gc_np[:, 4]
+            delta_yaw   = gc_np[:, 5]
 
             goal_world = np.zeros((B_input, 3), dtype=np.float64)
-            goal_world[:, :2] = init_obj_pos[:, :2]   # in-place: same XY
-            goal_world[:, 2]  = init_obj_pos[:, 2] + delta_z
+            for b in range(B_input):
+                yaw_b = yaw_from_quat(init_base[b, 3:7])
+                R_rob = yaw_to_rot_matrix(yaw_b)
+                local_xy = np.array([delta_x[b], delta_y[b], 0.0], dtype=np.float64)
+                world_xy = (R_rob @ local_xy[:, None])[:, 0]
+                goal_world[b, 0] = init_obj_pos[b, 0] + world_xy[0]
+                goal_world[b, 1] = init_obj_pos[b, 1] + world_xy[1]
+                goal_world[b, 2] = init_obj_pos[b, 2] + delta_z[b]
 
-            # Derive desired world-frame quaternion from delta_roll / delta_yaw
+            # Derive desired world-frame quaternion from delta_roll / delta_pitch / delta_yaw
             goal_obj_quat_world = np.zeros((B_input, 4), dtype=np.float64)
             for b in range(B_input):
-                yaw_b    = yaw_from_quat(init_base[b, 3:7])
-                R_rob    = yaw_to_rot_matrix(yaw_b)
+                yaw_b     = yaw_from_quat(init_base[b, 3:7])
+                R_rob     = yaw_to_rot_matrix(yaw_b)
                 R_rob_inv = yaw_to_rot_matrix(-yaw_b)
-                R_curr   = quat_to_rot(init_obj_quat[b])
-                R_in_rob = R_rob_inv @ R_curr
-                roll_c, yaw_c = roll_yaw_from_rot(R_in_rob)
-                roll_d = normalize_angle(roll_c + delta_roll[b])
-                yaw_d  = normalize_angle(yaw_c  + delta_yaw[b])
-                cr, sr = np.cos(roll_d), np.sin(roll_d)
+                R_curr    = quat_to_rot(init_obj_quat[b])
+                R_in_rob  = R_rob_inv @ R_curr
+                roll_c, pitch_c, yaw_c = roll_pitch_yaw_from_rot(R_in_rob)
+                roll_d  = normalize_angle(roll_c  + delta_roll[b])
+                pitch_d = normalize_angle(pitch_c + delta_pitch[b])
+                yaw_d   = normalize_angle(yaw_c   + delta_yaw[b])
+                cr, sr = np.cos(roll_d),  np.sin(roll_d)
+                cp, sp = np.cos(pitch_d), np.sin(pitch_d)
                 Rx = np.array([[1, 0, 0], [0, cr, -sr], [0, sr, cr]], dtype=np.float64)
-                R_des_rob   = yaw_to_rot_matrix(yaw_d) @ Rx
+                Ry = np.array([[cp, 0, sp], [0, 1, 0], [-sp, 0, cp]], dtype=np.float64)
+                R_des_rob   = yaw_to_rot_matrix(yaw_d) @ Ry @ Rx
                 R_des_world = R_rob @ R_des_rob
                 goal_obj_quat_world[b] = rot_to_quat_wxyz(R_des_world)
         else:
@@ -850,8 +863,10 @@ class MotionGenerator:
                     task_cond_np = compute_task_params_reorient(
                         current_robot_state=current_anchors['ref_quat'],
                         current_obj_state=curr_obj_for_tp,
-                        desired_obj_z=goal_world[:, 2],
+                        desired_obj_pos=goal_world,
                         desired_obj_quat=goal_obj_quat_world,
+                        normalize_goal_vec=self.data_cfg.get("normalize_goal_vec", True),
+                        max_goal_dist=self.dataset.max_obj_displacement,
                     )
                     actual_dist = None
                 else:
@@ -1010,11 +1025,13 @@ class MotionGenerator:
                         _goal_yaw = yaw_from_quat(_goal_quat).reshape(-1)
                         if self.task_type == "reorient":
                             _goal_rot_mat = quat_to_rot(_goal_quat)
-                            _goal_roll, _ = roll_yaw_from_rot(_goal_rot_mat)
+                            _goal_roll, _goal_pitch, _ = roll_pitch_yaw_from_rot(_goal_rot_mat)
                             _goal_roll = _goal_roll.reshape(-1)
+                            _goal_pitch = _goal_pitch.reshape(-1)
                     else:
                         _goal_yaw = None
                         _goal_roll = None
+                        _goal_pitch = None
 
                     for _t in range(_seg_T):
                         _obj_xyz_t = segment_world[:, _t, 36:39]  # (B, 3)
@@ -1023,8 +1040,10 @@ class MotionGenerator:
                         _ground_counter = np.where(_on_ground, _ground_counter + 1, 0)
                         
                         if self.task_type == "reorient":
-                            # For reorient, we only care about z error (in position)
-                            _goal_err = np.abs(_obj_xyz_t[:, 2] - goal_world[:, 2])
+                            # For reorient, use full 3D position error
+                            _goal_err = np.linalg.norm(
+                                _obj_xyz_t[:, :3] - goal_world[:, :3], axis=-1
+                            )
                         else:
                             # 3D distance to goal
                             _goal_err = np.linalg.norm(
@@ -1044,11 +1063,14 @@ class MotionGenerator:
                             
                             if self.task_type == "reorient":
                                 _obj_rot_mat = quat_to_rot(_obj_quat_t)
-                                _obj_roll, _ = roll_yaw_from_rot(_obj_rot_mat)
+                                _obj_roll, _obj_pitch, _ = roll_pitch_yaw_from_rot(_obj_rot_mat)
                                 _roll_err = np.abs(
                                     (_obj_roll - _goal_roll + np.pi) % (2.0 * np.pi) - np.pi
                                 )
-                                _yaw_ok = _yaw_ok & (_roll_err < _eff_yaw_threshold)
+                                _pitch_err = np.abs(
+                                    (_obj_pitch - _goal_pitch + np.pi) % (2.0 * np.pi) - np.pi
+                                )
+                                _yaw_ok = _yaw_ok & (_roll_err < _eff_yaw_threshold) & (_pitch_err < _eff_yaw_threshold)
                         else:
                             _yaw_ok = np.ones(effective_batch, dtype=bool)
 
@@ -1066,7 +1088,7 @@ class MotionGenerator:
                             _newly |= _hit
                             if _check_yaw:
                                 if self.task_type == "reorient":
-                                    _yaw_msg = f", yaw_err_deg={np.degrees(_yaw_err[_hit]).round(1).tolist()}, roll_err_deg={np.degrees(_roll_err[_hit]).round(1).tolist()}"
+                                    _yaw_msg = f", yaw_err_deg={np.degrees(_yaw_err[_hit]).round(1).tolist()}, roll_err_deg={np.degrees(_roll_err[_hit]).round(1).tolist()}, pitch_err_deg={np.degrees(_pitch_err[_hit]).round(1).tolist()}"
                                 else:
                                     _yaw_msg = f", yaw_err_deg={np.degrees(_yaw_err[_hit]).round(1).tolist()}"
                             else:

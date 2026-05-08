@@ -6,14 +6,15 @@ data:
   dataset_class: "flexible"
   batch_size: 1024
   num_features: 48
-  num_task_params: 3        # [delta_z, delta_roll, delta_yaw] in robot-yaw frame
+  num_task_params: 7        # [dir_x, dir_y, dir_z, dist, delta_roll, delta_pitch, delta_yaw] in robot-yaw frame
   num_observations: 45
   start_timestep: 0
-  num_timesteps: 50
-  state_history: 5
+  num_timesteps: 20
+  state_history: 2
   stride: 2
-  normalize_goal_vec: False   # not used for reorient; rotation goals are angle deltas
-  max_obj_displacement: null  # not used for reorient
+  normalize_goal_vec: True    # encode position as unit-direction + clipped magnitude (matches pickplace)
+  max_obj_displacement: null  # set automatically from dataset stats on first pass
+  goal_frame_fractions: [1.0]  # one global-goal fraction; per-window rotation goals handled in _compute_transform
   downsample: 1
   rot_type: quat
   raw_dt: 0.03
@@ -38,16 +39,10 @@ data:
       enabled: True
       prob: 0.5
     approach_phase:
-      enabled: False
-      prob: 0.4
-      move_threshold: 0.05
-      min_phase1_frames: 12
-      template_skip_start: 0.25
-      template_skip_end: 2
-      min_template_frames: 6
-      prepend_range: [10, 60]
-      join_blend_frames: 3
+      enabled: True
+      carry_walk_aug_prob: 0.5
       seed: 123
+  
 
   num_styles: 3
   style_conditioning:
@@ -85,11 +80,11 @@ model:
   history_aggregation: "attn"
 
 training:
-  suffix: _reorient
-  num_epochs: 500
+  suffix: _reorient_sbto
+  num_epochs: 100
   balance_task_density: False
   learning_rate: 0.0005
-  save_every: 25
+  save_every: 10
   condition_dropout_prob:
     state: 0.1
     style: 0.05
@@ -103,9 +98,9 @@ training:
   stance_velocity_threshold: 0.02
   state_conditioning_noise_level:
     joints: 0.025
-    body_rot6d: 0.005
-    obj_rel_pos: 0.005
-    obj_rel_rot6d: 0.005
+    body_rot6d: 0.01
+    obj_rel_pos: 0.02
+    obj_rel_rot6d: 0.03
     task_params: 0.025
     task_magnitude: 0.0
   density_sigma: 0.2
@@ -118,8 +113,8 @@ training:
     resample_steps: 2
     min_keyframes: 0
     max_keyframes: 3
-    always_keep_first: True
-    keep_last_partial: True
+    always_keep_first: False
+    keep_last_partial: False
     waypoint_noise_fraction: 0.5
     arrival_ratio: 0.85
     force_all_known_prob: 0.0
@@ -138,13 +133,13 @@ training:
         pose: [body_rot6d]
         robot_pos: [body_z, delta_xy, delta_yaw]
       group_keep_prob:
-        locomotion: 0.2
-        pick_place: 0.2
-        lower_body: 0.2
-        upper_body: 0.2
-        object_pos: 0.1
-        pose: 0.1
-        robot_pos: 0.1
+        locomotion: 0.25
+        pick_place: 0.25
+        lower_body: 0.25
+        upper_body: 0.25
+        object_pos: 0.25
+        pose: 0.25
+        robot_pos: 0.25
       per_group_noise_fractions:
         default: 1.0
         obj_delta_xy: 0.5

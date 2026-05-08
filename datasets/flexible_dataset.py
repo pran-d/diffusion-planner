@@ -55,6 +55,7 @@ class FlexibleWindowDataset(Dataset):
                     "obj_rel_pos", "obj_rel_rot6d",
                 ]
         )
+        self.goal_frame_fractions = config.get("goal_frame_fractions", [1.0])
 
         self.key_mapping = config.get("key_mapping", {})
         style_cfg = config.get("style_conditioning", {})
@@ -130,9 +131,16 @@ class FlexibleWindowDataset(Dataset):
         else:
             self._calculate_stats()
         
-        if self.max_obj_displacement is None and self.task_type != "reorient":
-            self.max_obj_displacement = self.stats.get("max_task_params")[-1]
-            print("Using max_obj_displacement =", self.max_obj_displacement)
+        if self.max_obj_displacement is None:
+            mtp = self.stats.get("max_task_params")
+            if mtp is not None:
+                if self.task_type == "reorient" and self.normalize_goal_vec:
+                    # Position layout = [dir_x, dir_y, dir_z, dist, ...]; dist is index 3.
+                    self.max_obj_displacement = float(mtp[3])
+                elif self.task_type != "reorient":
+                    self.max_obj_displacement = float(mtp[-1])
+                if self.max_obj_displacement is not None:
+                    print("Using max_obj_displacement =", self.max_obj_displacement)
 
     @property
     def feature_dims(self):
@@ -576,14 +584,22 @@ class FlexibleWindowDataset(Dataset):
                     
                     if max_start >= 0:
                         starts = np.arange(0, max_start + 1, self.stride)
-                        for s in starts:
-                            self.indices.append((i, b, s))
+                        for frac in self.goal_frame_fractions:
+                            goal_idx = int(round(frac * (real_T - 1)))
+                            goal_idx = min(max(goal_idx, 0), real_T - 1)
+                            for s in starts:
+                                # Goal must be in the future relative to the window start
+                                # (s is in padded-index space; subtract pad_start to get real index)
+                                real_s = max(0, s - pad_start)
+                                if frac < 1.0 and real_s >= goal_idx:
+                                    continue
+                                self.indices.append((i, b, s, goal_idx))
 
             except Exception as e:
                 print(f"Error indexing file {i}: {e}")
         print(f"Indexed {len(self.indices)} windows.")
 
-    def _compute_transform(self, raw_traj, t_start):
+    def _compute_transform(self, raw_traj, t_start, goal_frame_idx: int = -1):
         # raw_traj contains full trajectory (downsampled)
         # t_start is the index of the start of the window
         
@@ -650,8 +666,10 @@ class FlexibleWindowDataset(Dataset):
                 features["task_params"] = compute_task_params_reorient(
                     current_robot_state=raw_traj['base'][read_start, 3:],
                     current_obj_state=raw_traj['obj'][read_start, :7],
-                    desired_obj_z=goal_world[2],
+                    desired_obj_pos=goal_world[:3],
                     desired_obj_quat=goal_quat,
+                    normalize_goal_vec=self.normalize_goal_vec,
+                    max_goal_dist=self.max_obj_displacement,
                 )
             else:
                 features["task_params"], _ = compute_task_params(
@@ -665,22 +683,47 @@ class FlexibleWindowDataset(Dataset):
                     desired_obj_rot=goal_quat,
                 )
         else:
-            anchor["final_obj_pos"] = raw_traj['obj'][-1, :3]
-            features["task_params"], _ = self._compute_task_params(
-                raw_traj['base'], raw_traj['obj'], start_idx=read_start,
-            )
+            anchor["final_obj_pos"] = raw_traj['obj'][goal_frame_idx, :3]
+            if self.task_type == "reorient":
+                # Use the window's own endpoint as the rotation goal so the
+                # model sees diverse, achievable per-window rotation deltas
+                # rather than always predicting toward the trajectory-global
+                # final frame (which concentrates the training distribution
+                # near-zero for early windows).  Inference is unaffected —
+                # motion_generator.py recomputes per-segment from current
+                # orientation → user-supplied global goal.
+                obj_traj = raw_traj['obj']
+                window_end_idx = min(read_start + self.window_size - 1, len(obj_traj) - 1)
+                local_goal_quat = obj_traj[window_end_idx, 3:7]
+                local_goal_pos  = obj_traj[window_end_idx, :3]
+                features["task_params"] = compute_task_params_reorient(
+                    current_robot_state=raw_traj['base'][read_start, 3:],
+                    current_obj_state=obj_traj[read_start, :7],
+                    desired_obj_pos=local_goal_pos,
+                    desired_obj_quat=local_goal_quat,
+                    normalize_goal_vec=self.normalize_goal_vec,
+                    max_goal_dist=self.max_obj_displacement,
+                )
+            else:
+                features["task_params"], _ = self._compute_task_params(
+                    raw_traj['base'], raw_traj['obj'], start_idx=read_start,
+                    goal_frame_idx=goal_frame_idx,
+                )
 
         return features, anchor
 
     def _compute_task_params(self, base_traj, obj_traj, start_idx=0,
-                              desired_obj_quat=None, current_obj_quat=None):
+                              desired_obj_quat=None, current_obj_quat=None,
+                              goal_frame_idx: int = -1):
         if self.task_type == "reorient":
-            des_quat = desired_obj_quat if desired_obj_quat is not None else obj_traj[-1, 3:7]
+            des_quat = desired_obj_quat if desired_obj_quat is not None else obj_traj[goal_frame_idx, 3:7]
             tp = compute_task_params_reorient(
                 current_robot_state=base_traj[start_idx, 3:],
                 current_obj_state=obj_traj[start_idx, :7],
-                desired_obj_z=obj_traj[-1, 2],
+                desired_obj_pos=obj_traj[goal_frame_idx, :3],
                 desired_obj_quat=des_quat,
+                normalize_goal_vec=self.normalize_goal_vec,
+                max_goal_dist=self.max_obj_displacement,
             )
             return tp, None
         return compute_task_params(
@@ -1021,9 +1064,13 @@ class FlexibleWindowDataset(Dataset):
 
         # Task param sign under L/R reflection depends on task type.
         if self.task_type == "reorient":
-            # Layout: [delta_z, delta_roll, delta_yaw]
-            # delta_z: invariant; delta_roll: negates; delta_yaw: negates
-            _tp_sign_base = np.array([1.0, -1.0, -1.0], dtype=np.float32)
+            if self.normalize_goal_vec:
+                # Layout: [dir_x, dir_y, dir_z, dist, delta_roll, delta_pitch, delta_yaw]
+                # dir_y, delta_roll, delta_yaw negate.
+                _tp_sign_base = np.array([1.0, -1.0, 1.0, 1.0, -1.0, 1.0, -1.0], dtype=np.float32)
+            else:
+                # Legacy 6-D: [delta_x, delta_y, delta_z, delta_roll, delta_pitch, delta_yaw]
+                _tp_sign_base = np.array([1.0, -1.0, 1.0, -1.0, 1.0, -1.0], dtype=np.float32)
         else:
             # Layout: [goal_dir_x, goal_dir_y, goal_dir_z, goal_dist, (delta_yaw)]
             # y-direction and yaw negate; x, z, dist unchanged.
@@ -1206,12 +1253,17 @@ class FlexibleWindowDataset(Dataset):
 
 
     def __getitem__(self, idx):
-        file_idx, batch_idx, t_start = self.indices[idx]
-        
+        index_entry = self.indices[idx]
+        if len(index_entry) == 4:
+            file_idx, batch_idx, t_start, goal_frame_idx = index_entry
+        else:
+            file_idx, batch_idx, t_start = index_entry
+            goal_frame_idx = -1
+
         # Use RAM-cached data
         raw_traj = self._get_single_traj(file_idx, batch_idx)
         # Compute features
-        features, anchor = self._compute_transform(raw_traj, t_start)
+        features, anchor = self._compute_transform(raw_traj, t_start, goal_frame_idx=goal_frame_idx)
 
         # Mirror symmetry augmentation (Raw Feature Space)
         if self.mirror_enabled and torch.rand(1).item() < self.mirror_prob:
@@ -1299,7 +1351,7 @@ class FlexibleWindowDataset(Dataset):
         # Group indices by file/batch to avoid repeated IO
         file_map = {}
         for idx in range(len(self.indices)):
-            file_idx, batch_idx, t_start = self.indices[idx]
+            file_idx, batch_idx, t_start, _ = self.indices[idx]
             key = (file_idx, batch_idx)
             if key not in file_map:
                 file_map[key] = []
@@ -1562,9 +1614,13 @@ class FlexibleWindowDataset(Dataset):
         # 2. Simple flips (Negate Y or specific indices)
         # Lists of (key, indices_to_negate)
         # task_params sign flip depends on task type:
-        #   pickplace: negate index 1 (y-direction)
-        #   reorient:  negate indices 1,2 (delta_roll, delta_yaw both flip under L/R mirror)
-        tp_negate = [1, 2] if self.task_type == "reorient" else [1]
+        #   pickplace:                  negate [1] (dir_y)
+        #   reorient (normalize=True):  negate [1, 4, 6] (dir_y, delta_roll, delta_yaw)
+        #   reorient (normalize=False): negate [1, 3, 5] (delta_y, delta_roll, delta_yaw)
+        if self.task_type == "reorient":
+            tp_negate = [1, 4, 6] if self.normalize_goal_vec else [1, 3, 5]
+        else:
+            tp_negate = [1]
         negate_tasks = [
             ("delta_xy", [1]),
             ("delta_yaw", [0]),

@@ -12,6 +12,7 @@ from .math_tools import (
     batch_rotation,
     transpose,
     roll_yaw_from_rot,
+    roll_pitch_yaw_from_rot,
 )
 
 
@@ -846,10 +847,11 @@ def compute_task_params(
     world_delta = goal_obj_pos - curr_obj_pos
 
     # 3. Extract Robot Yaw
-    if current_robot_state.shape[-1] >= 7:
+    # current_robot_state might be full 36d/7d state [x,y,z, q...] or sliced [q..., j...]
+    if current_robot_state.shape[-1] >= 36 or current_robot_state.shape[-1] == 7:
         quat = current_robot_state[..., 3:7]
-    else:
-        quat = current_robot_state
+    else: # e.g. base_traj[..., 3:] (length 33) or just quat (length 4)
+        quat = current_robot_state[..., :4]
 
     yaw = -yaw_from_quat(quat)
     R_ref_inv = yaw_to_rot_matrix(yaw)
@@ -903,68 +905,88 @@ def compute_task_params(
 def compute_task_params_reorient(
     current_robot_state,
     current_obj_state,
-    desired_obj_z,
+    desired_obj_pos,
     desired_obj_quat,
+    normalize_goal_vec=True,
+    max_goal_dist=None,
 ):
-    """Compute task params for the reorient task: [delta_z, delta_roll, delta_yaw].
+    """Compute task params for the reorient task.
 
-    Roll and yaw goals are expressed as deltas relative to the initial object
-    orientation, measured in the robot's initial yaw frame (i.e. the robot's
-    heading at the start of the window defines the reference frame).
+    Layout (7-D, mirrors pickplace position encoding then appends rotation deltas):
+      [dir_x, dir_y, dir_z, dist, delta_roll, delta_pitch, delta_yaw]
 
-    Layout: [delta_z, delta_roll, delta_yaw]
-      delta_z    – desired_z − current_z (world frame, z-axis is up)
-      delta_roll – change in object roll  in robot-yaw frame, wrapped to [-π, π]
-      delta_yaw  – change in object yaw   in robot-yaw frame, wrapped to [-π, π]
+    Position part (dir + dist) is the same encoding as ``compute_task_params``:
+    a unit direction vector in the robot yaw frame plus a clipped magnitude.
+    Rotation part is the desired object orientation expressed as roll/pitch/yaw
+    deltas in the robot yaw frame, wrapped to [-π, π].
+
+    When ``normalize_goal_vec`` is False, the position part is the raw
+    [delta_x, delta_y, delta_z] in the robot yaw frame (legacy 6-D layout).
 
     Args:
         current_robot_state: (..., 7) [x, y, z, qw, qx, qy, qz] robot base, or (..., 4) quat only.
         current_obj_state:   (..., 7) [x, y, z, qw, qx, qy, qz] object pose.
-        desired_obj_z:       (...,)   desired Z height of the object (world frame).
+        desired_obj_pos:     (..., 3) desired object position [x, y, z] in world frame.
         desired_obj_quat:    (..., 4) [qw, qx, qy, qz] desired object orientation.
+        normalize_goal_vec:  If True (default), encode position as dir+dist.
+        max_goal_dist:       Maximum clipping distance for the goal magnitude.
 
     Returns:
-        task_params: np.ndarray (..., 3)
+        task_params: np.ndarray (..., 7) when normalize_goal_vec else (..., 6).
     """
     current_robot_state = np.asarray(current_robot_state, dtype=np.float64)
     current_obj_state   = np.asarray(current_obj_state,   dtype=np.float64)
-    desired_obj_z       = np.asarray(desired_obj_z,       dtype=np.float64)
+    desired_obj_pos     = np.asarray(desired_obj_pos,     dtype=np.float64)
     desired_obj_quat    = np.asarray(desired_obj_quat,    dtype=np.float64)
 
-    # 1. delta_z
-    curr_z  = current_obj_state[..., 2]
-    delta_z = desired_obj_z - curr_z
-
-    # 2. Robot yaw → inverse rotation (projects world vectors into robot frame)
-    if current_robot_state.shape[-1] >= 7:
+    # 1. Robot yaw → inverse rotation (projects world vectors into robot frame)
+    if current_robot_state.shape[-1] >= 36 or current_robot_state.shape[-1] == 7:
         robot_quat = current_robot_state[..., 3:7]
     else:
-        robot_quat = current_robot_state
+        robot_quat = current_robot_state[..., :4]
     yaw       = yaw_from_quat(robot_quat)
-    R_rob_inv = yaw_to_rot_matrix(-yaw)  # Rz(-yaw) = Rz(yaw)^T
+    R_rob_inv = yaw_to_rot_matrix(-yaw)
+
+    # 2. Position displacement in robot yaw frame
+    curr_obj_pos  = current_obj_state[..., :3]
+    world_delta   = desired_obj_pos[..., :3] - curr_obj_pos
+    if world_delta.ndim == 1:
+        local_delta = (R_rob_inv @ world_delta[:, None])[:, 0]
+    else:
+        local_delta = (R_rob_inv @ world_delta[..., None])[..., 0]
+
+    if normalize_goal_vec:
+        norm = np.linalg.norm(local_delta, axis=-1, keepdims=True)
+        mask = norm > 1e-3
+        normalized_vec = np.zeros_like(local_delta)
+        np.divide(local_delta, norm, out=normalized_vec, where=mask)
+        norm_clipped = np.clip(norm, a_min=None, a_max=max_goal_dist)
+        pos_part = np.concatenate([normalized_vec, norm_clipped], axis=-1)  # (..., 4)
+    else:
+        pos_part = local_delta  # (..., 3)
 
     # 3. Current object rotation in robot yaw frame
-    curr_obj_quat    = current_obj_state[..., 3:7]
-    R_curr           = quat_to_rot(curr_obj_quat)          # (..., 3, 3)
-    R_curr_in_rob    = R_rob_inv @ R_curr                   # (..., 3, 3)
-    roll_curr, yaw_curr = roll_yaw_from_rot(R_curr_in_rob)
+    curr_obj_quat = current_obj_state[..., 3:7]
+    R_curr        = quat_to_rot(curr_obj_quat)
+    R_curr_in_rob = R_rob_inv @ R_curr
+    roll_curr, pitch_curr, yaw_curr = roll_pitch_yaw_from_rot(R_curr_in_rob)
 
     # 4. Desired object rotation in robot yaw frame
-    R_des            = quat_to_rot(desired_obj_quat)
-    R_des_in_rob     = R_rob_inv @ R_des
-    roll_des, yaw_des = roll_yaw_from_rot(R_des_in_rob)
+    R_des        = quat_to_rot(desired_obj_quat)
+    R_des_in_rob = R_rob_inv @ R_des
+    roll_des, pitch_des, yaw_des = roll_pitch_yaw_from_rot(R_des_in_rob)
 
     # 5. Angle deltas, wrapped to [-π, π]
-    delta_roll = normalize_angle(roll_des - roll_curr)
-    delta_yaw  = normalize_angle(yaw_des  - yaw_curr)
+    delta_roll  = normalize_angle(roll_des  - roll_curr)
+    delta_pitch = normalize_angle(pitch_des - pitch_curr)
+    delta_yaw   = normalize_angle(yaw_des   - yaw_curr)
 
-    # 6. Stack into (..., 3)
-    if delta_z.ndim == 0:
-        return np.array([delta_z, delta_roll, delta_yaw], dtype=np.float64)
+    if pos_part.ndim == 1:
+        rot_part = np.array([delta_roll, delta_pitch, delta_yaw], dtype=np.float64)
+        return np.concatenate([pos_part, rot_part], axis=-1)
 
-    return np.stack(
-        [delta_z, delta_roll, delta_yaw], axis=-1
-    ).astype(np.float64)
+    rot_part = np.stack([delta_roll, delta_pitch, delta_yaw], axis=-1)
+    return np.concatenate([pos_part, rot_part], axis=-1).astype(np.float64)
 
 
 def get_feature_indices(feature_layout):

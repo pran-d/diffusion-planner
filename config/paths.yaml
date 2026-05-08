@@ -5,7 +5,9 @@ paths:
   # Sub-path within data_dir that selects the active dataset split
   # train_path: trial/omniretarget_cleanup
   # train_path: batched_omniretarget
-  train_path: batched_omniretarget
+  train_path: SBTO_OmniRetarget_Dataset
+
+  file_names: ["top_trajectories.npz"]
 
   task_list_path: ./test_datasets/chosen_tasks_reorient.yml
 

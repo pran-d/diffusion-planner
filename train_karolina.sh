@@ -8,9 +8,8 @@
 #SBATCH --error logs/train_%j.out
 
 conf_path="${CFGPATH:-config/config.yaml}"
-cfgpath="--config $conf_path"
 
-cmd=(uv run python -u train.py --config "$cfgpath" --no_tensorboard)
+cmd=(uv run python -u train.py --config "$conf_path" --no_tensorboard)
 
 cmd+=("$@")
 "${cmd[@]}"

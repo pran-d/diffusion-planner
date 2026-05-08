@@ -17,7 +17,7 @@ inference_mg:
   phase2_checkpoint: null
   ema: true
   num_samples: 1
-  start_time: 0
+  start_time: 80
   stitch_steps: null
   target_traj_length: null
   save_path: results/inference_mg.npz
@@ -29,12 +29,12 @@ inference_mg:
   end_ground_num_frames: 5
   end_ground_z_tol: 0.05
   goal_multiplier: 1.0
-  init_obj_offset: [0.0, 2.0]
+  init_obj_offset: [0.0, 0.0]
   enable_goal_stop: true
   disable_goal_stop: false
   enable_phys_stop: false
   enable_phys_clamp: true
-  last_frame_waypoint: true
+  last_frame_waypoint: false
   arrival_ratio: 0.85
   lift_height: 0.5
   lift_start: 0.0

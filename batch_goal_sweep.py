@@ -545,7 +545,7 @@ def run_goal_sweep(mg, dataset, args):
 
     num_task_params = data_cfg.get("num_task_params", 3)
     local_goal_dim = min(3, num_task_params)
-    initial_condition, goal_local_orig, anchor, file_idx, _, _ = \
+    initial_condition, goal_local_orig, anchor, file_idx, _, _, _ = \
         extract_initial_condition(dataset, sample_idx, local_goal_dim)
 
     ref_obj_pos = initial_condition['obj'][0, :3].copy()
