@@ -179,7 +179,9 @@ class RobotDiffuser():
                 model_p.copy_(ema_p.detach())
 
         # ---- 3. Save model in this temporary EMA state ----
-        torch.save(self.model.state_dict(), path)
+        # Unwrap DataParallel so saved keys don't have 'module.' prefix
+        model_to_save = self.model.module if hasattr(self.model, 'module') else self.model
+        torch.save(model_to_save.state_dict(), path)
 
         # ---- 4. Restore the original parameters ----
         with torch.no_grad():

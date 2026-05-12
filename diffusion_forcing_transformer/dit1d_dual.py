@@ -209,7 +209,10 @@ class DiT1DDual(BaseBackbone):
         out2 = self.final_b2(h2, c)  # (B, T, branch2_dim)
 
         # 10. Reassemble in original feature order
-        out = torch.empty(B, T, D, device=x.device, dtype=x.dtype)
+        out_dtype = out1.dtype
+        out = torch.empty(B, T, D, device=x.device, dtype=out_dtype)
         out[..., self.branch1_indices] = out1
         out[..., self.branch2_indices] = out2
+        if out.dtype != x.dtype:
+            out = out.to(dtype=x.dtype)
         return out

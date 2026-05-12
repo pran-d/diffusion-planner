@@ -136,8 +136,9 @@ def compute_dataset_weights(dataset, sigma=0.2):
     return torch.tensor(sample_weights).double()
 
 class MotionGenerator:
-    def __init__(self, config_path: str = "config/config.yaml", device: str = None):
+    def __init__(self, config_path: str = "config/config.yaml", device: str = None, num_gpus: int = 1):
         self.config_path = config_path
+        self.num_gpus = num_gpus
         
         # Load Config
         with open(config_path, 'r') as file:
@@ -299,6 +300,14 @@ class MotionGenerator:
         
         self.diffuser.model.train()
         
+        # Wrap in DataParallel when training on multiple GPUs
+        _using_dp = False
+        if self.num_gpus > 1 and torch.cuda.device_count() >= self.num_gpus:
+            device_ids = list(range(self.num_gpus))
+            self.diffuser.model = torch.nn.DataParallel(self.diffuser.model, device_ids=device_ids)  # type: ignore[assignment]
+            _using_dp = True
+            print(f"  [DataParallel] Training diffusion model on {self.num_gpus} GPUs")
+        
         state_condition = self.model_cfg.get("state_condition", False)
         task_condition = self.model_cfg.get("task_condition", False)
         style_condition = self.model_cfg.get("style_condition", False)
@@ -411,7 +420,7 @@ class MotionGenerator:
                     ema_fpath = os.path.join(save_dir, f"ema_model_{epoch}.pth")
 
                 checkpoint = {
-                    "model": self.diffuser.model.state_dict(),
+                    "model": (self.diffuser.model.module if _using_dp else self.diffuser.model).state_dict(),  # type: ignore[union-attr]
                     "optimizer": optimizer.state_dict(),
                     "scaler": scaler.state_dict(),
                     "ema": ema.state_dict(),
@@ -420,6 +429,10 @@ class MotionGenerator:
                 torch.save(checkpoint, fpath)
                 self.diffuser.save_ema_weights(ema.shadow_params, ema_fpath)
                 last_ckpt_path = fpath
+
+        # Unwrap DataParallel before EMA / inference
+        if _using_dp:
+            self.diffuser.model = self.diffuser.model.module  # type: ignore[assignment]
 
         # Apply EMA weights to model for inference.
         # After training, self.diffuser.model holds the regular (non-EMA) weights.

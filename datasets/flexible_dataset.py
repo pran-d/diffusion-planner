@@ -385,13 +385,18 @@ class FlexibleWindowDataset(Dataset):
             if self.approach_aug_enabled:
                 # Derive per-trajectory real lengths in downsampled frames.
                 if 'traj_lengths' in raw_data:
-                    raw_lens = np.asarray(raw_data['traj_lengths'], dtype=int)
+                    raw_lens = np.atleast_1d(np.asarray(raw_data['traj_lengths'], dtype=int))
                     real_lens_ds = np.maximum(1, (raw_lens - start_ts - 1) // ds + 1)
                     if len(real_lens_ds) < N_i:
                         real_lens_ds = np.full(N_i, processed['base'].shape[1], dtype=int)
                 elif 'traj_length' in raw_data:
-                    v = int(np.asarray(raw_data['traj_length']))
-                    real_lens_ds = np.full(N_i, max(1, (v - start_ts - 1) // ds + 1), dtype=int)
+                    tl_arr = np.atleast_1d(np.asarray(raw_data['traj_length'], dtype=int))
+                    if tl_arr.size == N_i:
+                        # Per-trajectory lengths stored under singular key
+                        real_lens_ds = np.maximum(1, (tl_arr - start_ts - 1) // ds + 1)
+                    else:
+                        v = int(tl_arr.flat[0])
+                        real_lens_ds = np.full(N_i, max(1, (v - start_ts - 1) // ds + 1), dtype=int)
                 else:
                     real_lens_ds = np.full(N_i, processed['base'].shape[1], dtype=int)
 
