@@ -215,6 +215,22 @@ class FlexibleWindowDataset(Dataset):
 
             op = np.asarray(raw_data[op_key], dtype=np.float64)
             oq = np.asarray(raw_data[oq_key], dtype=np.float64)
+
+            # object_pos_w / object_quat_w may carry one or more extra body/object
+            # dimensions when tracking multiple bodies (handoff: (N,T,K,3) or (T,K,3)).
+            # Collapse every extra leading dimension by taking index 0 until the rank
+            # matches (base_ndim + 1) — the final +1 is the feature dimension.
+            base_ndim = len(processed['base'].shape)  # 2=(T,7) single, 3=(N,T,7) batched
+            while op.ndim > base_ndim + 1:
+                op = op[..., 0, :]
+            while oq.ndim > base_ndim + 1:
+                oq = oq[..., 0, :]
+            # Also handle a single extra dim (the common case)
+            if op.ndim == base_ndim + 1:
+                op = op[..., 0, :]
+            if oq.ndim == base_ndim + 1:
+                oq = oq[..., 0, :]
+
             processed['obj'] = np.concatenate([op, oq], axis=-1)
 
             # Velocity keys (RL / key-mapped RL)
@@ -279,12 +295,10 @@ class FlexibleWindowDataset(Dataset):
             return None
 
         # Pass through non-temporal metadata
-        if 'fps' in raw_data:
-            processed['fps'] = raw_data['fps']
-        if 'source_file_path' in raw_data:
-            processed['source_file_path'] = raw_data['source_file_path']
-        if 'source_folder_name' in raw_data:
-            processed['source_folder_name'] = raw_data['source_folder_name']
+        for meta_key in ('fps', 'source_file_path', 'source_folder_name',
+                         'traj_length', 'traj_lengths'):
+            if meta_key in raw_data:
+                processed[meta_key] = raw_data[meta_key]
 
         return processed
 
@@ -390,13 +404,8 @@ class FlexibleWindowDataset(Dataset):
                     if len(real_lens_ds) < N_i:
                         real_lens_ds = np.full(N_i, processed['base'].shape[1], dtype=int)
                 elif 'traj_length' in raw_data:
-                    tl_arr = np.atleast_1d(np.asarray(raw_data['traj_length'], dtype=int))
-                    if tl_arr.size == N_i:
-                        # Per-trajectory lengths stored under singular key
-                        real_lens_ds = np.maximum(1, (tl_arr - start_ts - 1) // ds + 1)
-                    else:
-                        v = int(tl_arr.flat[0])
-                        real_lens_ds = np.full(N_i, max(1, (v - start_ts - 1) // ds + 1), dtype=int)
+                    v = int(np.asarray(raw_data['traj_length']))
+                    real_lens_ds = np.full(N_i, max(1, (v - start_ts - 1) // ds + 1), dtype=int)
                 else:
                     real_lens_ds = np.full(N_i, processed['base'].shape[1], dtype=int)
 
@@ -452,6 +461,8 @@ class FlexibleWindowDataset(Dataset):
         'source_folder_name',
         'style_id',
         'style_onehot',
+        'traj_length',
+        'traj_lengths',
     }
 
     def _infer_style_for_trajectory(self, processed: dict, traj_idx: int) -> int:
@@ -514,10 +525,11 @@ class FlexibleWindowDataset(Dataset):
                 arr = arr[:real_T]
             pad_end = target_padded - (arr.shape[0] + pad_start)
             pad_end = max(pad_end, 0)
-            if arr.ndim == 2:
-                return np.pad(arr, ((pad_start, pad_end), (0, 0)), mode='edge')
-            else:
-                return np.pad(arr, ((0, 0),), mode='edge')
+            # Build per-axis pad widths: pad only the time axis (axis 0), zero for rest.
+            time_pad = (pad_start, pad_end)
+            no_pad = (0, 0)
+            pad_width = tuple([time_pad] + [no_pad] * (arr.ndim - 1))
+            return np.pad(arr, pad_width, mode='edge')
 
         result = {}
         for k, v in file_data.items():
@@ -564,6 +576,7 @@ class FlexibleWindowDataset(Dataset):
                     real_lengths = [int(_tl[b]) for b in range(B)]
                 else:
                     real_lengths = [T] * B
+                real_lengths = [min(max(length, 1), T) for length in real_lengths]
                 self.real_traj_lengths.append(real_lengths)
                 
                 # Data is already downsampled in _preload_from_buffer
@@ -620,6 +633,9 @@ class FlexibleWindowDataset(Dataset):
         b_slice = raw_traj['base'][read_start:read_end]
         j_slice = raw_traj['joints'][read_start:read_end]
         o_slice = raw_traj['obj'][read_start:read_end]
+        # Ensure obj is exactly (T, 7): collapse any residual extra body/object dims
+        while o_slice.ndim > 2:
+            o_slice = o_slice[:, 0, :]
         # Velocity
         if 'base_vel' in raw_traj:
             bv = raw_traj['base_vel'][read_start:read_end]
@@ -662,6 +678,7 @@ class FlexibleWindowDataset(Dataset):
             return x
 
         anchor = {k: np.array(_sq(v[0])) for k, v in anchor_b.items()}
+        obj_goal_idx = raw_traj['obj'].shape[0] - 1 if goal_frame_idx < 0 else min(goal_frame_idx, raw_traj['obj'].shape[0] - 1)
         # Use external goal if available, otherwise fall back to trajectory's final obj pos
         if 'goal_obj_world' in raw_traj:
             goal_world = raw_traj['goal_obj_world']  # (3,)
@@ -688,7 +705,7 @@ class FlexibleWindowDataset(Dataset):
                     desired_obj_rot=goal_quat,
                 )
         else:
-            anchor["final_obj_pos"] = raw_traj['obj'][goal_frame_idx, :3]
+            anchor["final_obj_pos"] = raw_traj['obj'][obj_goal_idx, :3]
             if self.task_type == "reorient":
                 # Use the window's own endpoint as the rotation goal so the
                 # model sees diverse, achievable per-window rotation deltas
@@ -712,7 +729,7 @@ class FlexibleWindowDataset(Dataset):
             else:
                 features["task_params"], _ = self._compute_task_params(
                     raw_traj['base'], raw_traj['obj'], start_idx=read_start,
-                    goal_frame_idx=goal_frame_idx,
+                    goal_frame_idx=obj_goal_idx,
                 )
 
         return features, anchor

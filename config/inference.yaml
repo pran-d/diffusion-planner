@@ -30,8 +30,8 @@ inference_mg:
   end_ground_z_tol: 0.05
   goal_multiplier: 1.0
   init_obj_offset: [0.0, 0.0]
-  enable_goal_stop: true
-  disable_goal_stop: false
+  enable_goal_stop: false
+  disable_goal_stop: true 
   enable_phys_stop: false
   enable_phys_clamp: true
   last_frame_waypoint: false
