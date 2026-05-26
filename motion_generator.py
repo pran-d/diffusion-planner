@@ -5,6 +5,7 @@ import numpy as np
 import yaml
 import os
 import math
+import sys
 import time
 from typing import List, Dict, Union, Optional
 from torch.utils.data import DataLoader, WeightedRandomSampler
@@ -27,6 +28,14 @@ from utils.data.style_conditioning import one_hot_style, style_name_to_id
 from utils.physics_limits import apply_physics_clamp
 from utils.inference_utils import build_inference_waypoints
 from diffusers import EMAModel
+
+try:
+    from mjlab.scripts.FoLM.utils.object_task_utils import resolve_fps_value, warp_object_trajectory
+except ModuleNotFoundError:
+    _SRC_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", ".."))
+    if _SRC_ROOT not in sys.path:
+        sys.path.append(_SRC_ROOT)
+    from mjlab.scripts.FoLM.utils.object_task_utils import resolve_fps_value, warp_object_trajectory
 
 class TimingContext:
     """Small helper for accumulating named wall-clock timings."""
@@ -258,7 +267,7 @@ class MotionGenerator:
         train_dataloader = DataLoader(
             self.dataset, 
             batch_size=self.data_cfg["batch_size"], 
-            num_workers=2,
+            num_workers=0,
             shuffle=shuffle,
             sampler=sampler,
             pin_memory=True,
@@ -591,10 +600,75 @@ class MotionGenerator:
         }
         return next_state_tens, batched_anchor
 
+    def _get_reference_motion_length(self, motion: Dict) -> int:
+        for key in ("traj_length", "traj_lengths"):
+            if key in motion:
+                arr = np.asarray(motion[key]).reshape(-1)
+                if arr.size > 0:
+                    return int(arr[0])
+        return int(np.asarray(motion["object_pos_w"]).shape[0])
+
+    def _prepare_handout_height_reference(
+        self,
+        goal_condition: np.ndarray,
+        reference_motion: Union[Dict, List[Dict], None],
+        target_traj_length: Optional[int],
+    ) -> tuple[np.ndarray, np.ndarray]:
+        if reference_motion is None:
+            raise ValueError("handout_height goal adapter requires reference_motion")
+
+        if isinstance(reference_motion, dict):
+            motions = [reference_motion] * int(goal_condition.shape[0])
+        else:
+            motions = list(reference_motion)
+            if len(motions) == 1 and int(goal_condition.shape[0]) > 1:
+                motions = motions * int(goal_condition.shape[0])
+
+        batch_size = int(goal_condition.shape[0])
+        if len(motions) != batch_size:
+            raise ValueError(
+                f"reference_motion batch mismatch: expected {batch_size}, got {len(motions)}"
+            )
+
+        if target_traj_length is None:
+            target_traj_length = max(self._get_reference_motion_length(motion) for motion in motions)
+
+        ref_obj_world = []
+        goal_world = np.zeros((batch_size, 3), dtype=np.float64)
+
+        for batch_idx, motion in enumerate(motions):
+            obj = np.asarray(motion["object_pos_w"], dtype=np.float64)
+            body_pos = np.asarray(motion["body_pos_w"], dtype=np.float64)
+            root = body_pos[:, 0, :] if body_pos.ndim == 3 else body_pos
+            valid_len = self._get_reference_motion_length(motion)
+            fps = resolve_fps_value(motion.get("fps"))
+
+            obj_valid = obj[:valid_len, :3]
+            root_valid = root[:valid_len, :3]
+            handout_dist = float(goal_condition[batch_idx, 0])
+            pick_height = float(goal_condition[batch_idx, 1])
+            warped_valid, _ = warp_object_trajectory(
+                obj_valid,
+                root_valid,
+                target_pick_height=pick_height,
+                target_handout_dist=handout_dist,
+                fps=fps,
+            )
+
+            ref = np.repeat(warped_valid[-1:], target_traj_length, axis=0)
+            copy_len = min(warped_valid.shape[0], target_traj_length)
+            ref[:copy_len] = warped_valid[:copy_len]
+            ref_obj_world.append(ref)
+            goal_world[batch_idx] = ref[copy_len - 1]
+
+        return np.stack(ref_obj_world, axis=0), goal_world
+
     def generate_trajectory(self,
                             initial_condition: Dict,
                             goal_condition: Union[Dict, np.ndarray],
                             style_condition: Optional[Union[str, np.ndarray, list]] = None,
+                            goal_adapter: Optional[str] = None,
+                            reference_motion: Optional[Union[Dict, List[Dict]]] = None,
                             goal_obj_rot: Optional[np.ndarray] = None,
                             target_traj_length: int = None,
                             stitch_steps: int = None,
@@ -686,15 +760,6 @@ class MotionGenerator:
         window_size = self.dataset.window_size  # model output length per segment
         history_size = self.dataset.history_size
 
-        # --- Auto-compute stitch_steps from target trajectory length ---
-        if stitch_steps is None:
-            if target_traj_length is not None:
-                # Effective frames added per window = window_size - history_size
-                _eff = max(1, window_size - history_size)
-                stitch_steps = max(1, math.ceil(target_traj_length / _eff))
-            else:
-                stitch_steps = 1
-
         # 1. Process Initial Condition
         r_hist = np.asarray(initial_condition['robot'])  # (B, H, 36) or (H, 36)
         o_hist = np.asarray(initial_condition['obj'])    # (B, H, 7) or (H, 7)
@@ -727,8 +792,17 @@ class MotionGenerator:
         init_obj_quat = o_hist[:, -1, 3:7]  # (B, 4) current object quat [qw,qx,qy,qz]
 
         goal_obj_quat_world = None  # only set for reorient
+        reference_obj_world = None
 
-        if self.task_type == "reorient":
+        if goal_adapter == "handout_height":
+            reference_obj_world, goal_world = self._prepare_handout_height_reference(
+                goal_condition=gc_np,
+                reference_motion=reference_motion,
+                target_traj_length=target_traj_length,
+            )
+            if target_traj_length is None:
+                target_traj_length = int(reference_obj_world.shape[1])
+        elif self.task_type == "reorient":
             # gc_np = [delta_x, delta_y, delta_z, delta_roll, delta_pitch, delta_yaw]
             # in initial robot yaw frame
             delta_x     = gc_np[:, 0]
@@ -778,6 +852,14 @@ class MotionGenerator:
                 goal_3d[:n] = gc_np[b, :n]
                 goal_world[b] = (R_local_to_world @ goal_3d[:, None])[:, 0] + init_obj_pos[b]
 
+        # --- Auto-compute stitch_steps from target trajectory length ---
+        if stitch_steps is None:
+            if target_traj_length is not None:
+                _eff = max(1, window_size - history_size)
+                stitch_steps = max(1, math.ceil(target_traj_length / _eff))
+            else:
+                stitch_steps = 1
+
         # 3. Replicate for num_samples (when generating multiple samples per condition)
         if num_samples > 1 and curr_state_tens.shape[0] == 1:
             curr_state_tens = curr_state_tens.repeat(num_samples, 1, 1)
@@ -786,6 +868,8 @@ class MotionGenerator:
             goal_world = np.repeat(goal_world, num_samples, axis=0)
             if goal_obj_quat_world is not None:
                 goal_obj_quat_world = np.repeat(goal_obj_quat_world, num_samples, axis=0)
+            if reference_obj_world is not None:
+                reference_obj_world = np.repeat(reference_obj_world, num_samples, axis=0)
         
         curr_state_tens = curr_state_tens.to(self.device)
         effective_batch = curr_state_tens.shape[0]
@@ -899,7 +983,23 @@ class MotionGenerator:
                     _current_obj_z = torch.from_numpy(
                         current_anchors['ref_obj_pos'][:, 2].astype(np.float32)
                     )
-                    _use_last_wp = use_last_frame_wp and self.task_type != "reorient"
+                    reference_obj_delta_xy = None
+                    reference_obj_z = None
+                    if reference_obj_world is not None:
+                        window_start = max(_frames_so_far - history_size, 0)
+                        window_end = window_start + window_size
+                        ref_window = reference_obj_world[:, window_start:window_end, :]
+                        if ref_window.shape[1] < window_size:
+                            pad = np.repeat(ref_window[:, -1:, :], window_size - ref_window.shape[1], axis=1)
+                            ref_window = np.concatenate([ref_window, pad], axis=1)
+
+                        world_delta = ref_window - current_anchors['ref_obj_pos'][:, None, :3]
+                        ref_yaw_inv = yaw_to_rot_matrix(-yaw_from_quat(current_anchors['ref_quat']))
+                        local_delta = (ref_yaw_inv[:, None, :, :] @ world_delta[..., None]).squeeze(-1)
+                        reference_obj_delta_xy = local_delta[..., :2].astype(np.float32)
+                        reference_obj_z = ref_window[..., 2:3].astype(np.float32)
+
+                    _use_last_wp = use_last_frame_wp and self.task_type != "reorient" and reference_obj_world is None
                     wv, wm = build_inference_waypoints(
                         curr_state_tens, task_actual, self.dataset,
                         model_feature_dim, window_size,
@@ -916,6 +1016,8 @@ class MotionGenerator:
                         rest_obj_z=_rest_obj_z,
                         goal_obj_z=goal_world[:, 2],
                         normalize_goal_vec=self.data_cfg.get("normalize_goal_vec", True),
+                        reference_obj_delta_xy=reference_obj_delta_xy,
+                        reference_obj_z=reference_obj_z,
                     )
 
                 # C. Generate normalized sample

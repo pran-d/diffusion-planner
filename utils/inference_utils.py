@@ -246,6 +246,51 @@ def build_last_frame_waypoints(
     return values, mask
 
 
+def build_dense_object_reference_waypoints(
+    reference_obj_delta_xy,
+    reference_obj_z,
+    dataset,
+    feature_order,
+    num_features,
+):
+    """Build dense object-position waypoints over the whole model window."""
+    ref_xy = torch.as_tensor(reference_obj_delta_xy, dtype=torch.float32)
+    ref_z = torch.as_tensor(reference_obj_z, dtype=torch.float32)
+    if ref_xy.ndim != 3 or ref_xy.shape[-1] != 2:
+        raise ValueError(f"Expected reference_obj_delta_xy shape (B, T, 2), got {tuple(ref_xy.shape)}")
+    if ref_z.ndim != 3 or ref_z.shape[-1] != 1:
+        raise ValueError(f"Expected reference_obj_z shape (B, T, 1), got {tuple(ref_z.shape)}")
+
+    B, T, _ = ref_xy.shape
+    values = torch.zeros(B, T, num_features, dtype=torch.float32)
+    mask = torch.zeros(B, T, num_features, dtype=torch.bool)
+
+    feature_idx = {}
+    idx = 0
+    layout = build_feature_layout()
+    for key in feature_order:
+        dim = layout.get(key, 0)
+        if dim > 0:
+            feature_idx[key] = slice(idx, idx + dim)
+            idx += dim
+
+    if "obj_delta_xy" in feature_idx:
+        norm_xy = dataset._normalize("obj_delta_xy", ref_xy)
+        if not isinstance(norm_xy, torch.Tensor):
+            norm_xy = torch.tensor(norm_xy, dtype=torch.float32)
+        values[:, :, feature_idx["obj_delta_xy"]] = norm_xy.reshape(B, T, -1)
+        mask[:, :, feature_idx["obj_delta_xy"]] = True
+
+    if "obj_z" in feature_idx:
+        norm_z = dataset._normalize("obj_z", ref_z)
+        if not isinstance(norm_z, torch.Tensor):
+            norm_z = torch.tensor(norm_z, dtype=torch.float32)
+        values[:, :, feature_idx["obj_z"]] = norm_z.reshape(B, T, -1)
+        mask[:, :, feature_idx["obj_z"]] = True
+
+    return values, mask
+
+
 def build_inference_waypoints(
     curr_state_tens,
     task_params_raw,
@@ -265,6 +310,8 @@ def build_inference_waypoints(
     rest_obj_z=None,
     goal_obj_z=None,
     normalize_goal_vec=True,
+    reference_obj_delta_xy=None,
+    reference_obj_z=None,
 ):
     """
     Build complete waypoint specification for inference.
@@ -281,6 +328,17 @@ def build_inference_waypoints(
     values = kf_vals.clone()
     mask = torch.zeros(B, T, D, dtype=torch.bool, device=curr_state_tens.device)
     mask[:, 0, :] = True
+
+    if reference_obj_delta_xy is not None and reference_obj_z is not None:
+        ref_vals, ref_mask = build_dense_object_reference_waypoints(
+            reference_obj_delta_xy=reference_obj_delta_xy,
+            reference_obj_z=reference_obj_z,
+            dataset=dataset,
+            feature_order=dataset.feature_order,
+            num_features=num_features,
+        )
+        values = torch.where(ref_mask.to(values.device), ref_vals.to(values.device), values)
+        mask = mask | ref_mask.to(mask.device)
 
     if use_last_frame_wp and task_params_raw is not None:
         wp_vals, wp_mask = build_last_frame_waypoints(
