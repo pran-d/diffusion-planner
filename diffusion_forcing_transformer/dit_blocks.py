@@ -47,6 +47,10 @@ class Attention(nn.Module):
         self.proj = nn.Linear(dim, dim)
         self.proj_drop = nn.Dropout(proj_drop)
         self.rope = rope
+        # Opt-in: when True, take the manual softmax path and stash the
+        # softmaxed attention tensor on self._last_attn (detached, on device).
+        self._capture_attn: bool = False
+        self._last_attn: Optional[torch.Tensor] = None
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         B, N, C = x.shape
@@ -62,7 +66,7 @@ class Attention(nn.Module):
             q = self.rope(q)
             k = self.rope(k)
 
-        if self.fused_attn:
+        if self.fused_attn and not self._capture_attn:
             # pylint: disable-next=not-callable
             x = F.scaled_dot_product_attention(
                 q,
@@ -74,6 +78,8 @@ class Attention(nn.Module):
             q = q * self.scale
             attn = q @ k.transpose(-2, -1)
             attn = attn.softmax(dim=-1)
+            if self._capture_attn:
+                self._last_attn = attn.detach()
             attn = self.attn_drop(attn)
             x = attn @ v
 
@@ -229,6 +235,10 @@ class CrossAttentionLayer(nn.Module):
             if m.bias is not None:
                 nn.init.zeros_(m.bias)
 
+        self.scale = self.head_dim ** -0.5
+        self._capture_attn: bool = False
+        self._last_attn: Optional[torch.Tensor] = None
+
     def forward(
         self, x: torch.Tensor, c: torch.Tensor, context: torch.Tensor
     ) -> torch.Tensor:
@@ -248,7 +258,13 @@ class CrossAttentionLayer(nn.Module):
         k = self.k_proj(context).reshape(B, S, self.num_heads, self.head_dim).transpose(1, 2)
         v = self.v_proj(context).reshape(B, S, self.num_heads, self.head_dim).transpose(1, 2)
 
-        attn_out = F.scaled_dot_product_attention(q, k, v)
+        if self._capture_attn:
+            attn = (q * self.scale) @ k.transpose(-2, -1)
+            attn = attn.softmax(dim=-1)
+            self._last_attn = attn.detach()
+            attn_out = attn @ v
+        else:
+            attn_out = F.scaled_dot_product_attention(q, k, v)
         attn_out = attn_out.transpose(1, 2).reshape(B, T, H)
         return gate * self.out_proj(attn_out)
 

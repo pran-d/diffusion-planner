@@ -538,9 +538,11 @@ def run_goal_sweep(mg, dataset, args):
 
     # -- Extract initial condition -----------------------------------------
     target = (args.traj_idx, args.batch_idx, args.start_time)
-    try:
-        sample_idx = dataset.indices.index(target)
-    except ValueError:
+    sample_idx = next(
+        (i for i, idx in enumerate(dataset.indices) if tuple(idx[:3]) == target),
+        None,
+    )
+    if sample_idx is None:
         raise ValueError(f"Index tuple {target} not in dataset.indices")
 
     num_task_params = data_cfg.get("num_task_params", 3)

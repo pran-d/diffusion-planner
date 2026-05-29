@@ -10,6 +10,8 @@ import tempfile
 import yaml
 import argparse
 
+from config.configure import load_yaml_with_includes
+
 # =============================================================================
 # ABLATION STUDIES CONFIGURATION
 # =============================================================================
@@ -65,14 +67,20 @@ def build_merged_temp_config(base_cfg: dict, override_cfg_path: str, suffix: str
 
     This enables ablation files to only define changed values.
     """
-    with open(override_cfg_path, "r") as f:
-        override = yaml.safe_load(f)
+    # Use the project's include-aware loader so any `includes:` directives in the
+    # ablation file are resolved (and removed) here, rather than carried into the
+    # written config.yaml where train.py's loader would try to re-resolve them
+    # from the wrong base_dir.
+    override = load_yaml_with_includes(override_cfg_path)
 
     if override is None:
         override = {}
     if not isinstance(override, dict):
         print("  [warn] Override config is not a YAML mapping; treating as empty override.")
         override = {}
+    # Defensive: load_yaml_with_includes already pops `includes`, but strip again
+    # in case the override was malformed or the loader behavior changes.
+    override.pop("includes", None)
 
     data = deep_merge(base_cfg, override)
 
@@ -229,14 +237,16 @@ def main():
             print("#" * 80 + "\n")
 
             try:
-                # 2. Overwrite Main Config with (possibly patched) ablation config
-                print(f"Copying {active_cfg} to {original_config}...")
-                shutil.copy(active_cfg, original_config)
+                # 2. Run training against the per-task patched config directly.
+                # Do NOT overwrite the shared config/config.yaml — concurrent
+                # SLURM array tasks would race and the last writer wins, causing
+                # every job to read the same suffix/run name.
+                print(f"Using patched config: {active_cfg}")
 
                 # 3. Run Training
                 print("Starting training process...")
-                cmd = [sys.executable, "train.py"]
-                
+                cmd = [sys.executable, "train.py", "--config", active_cfg]
+
                 start_t = time.time()
                 subprocess.run(cmd, check=True)
                 end_t = time.time()

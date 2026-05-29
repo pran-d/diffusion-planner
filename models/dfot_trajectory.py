@@ -212,6 +212,70 @@ class DFoTTrajectory(nn.Module):
                 "branch1_indices": b1_idx,
                 "branch2_indices": b2_idx,
             })
+        elif backbone_type == "dit1d_dual_grouped":
+            # Per-feature-group tokenization variant of dit1d_dual.  Each branch's
+            # features are split into individual group tokens; the model exposes
+            # temporal-self / group-self / group-cross attention sublayers from
+            # which softmax weights can be read directly.
+            _layout = build_feature_layout()
+            _tmp_fim = {}
+            _fidx = 0
+            for _key in data_config.get("feature_order", []):
+                _dim = _layout.get(_key, 0)
+                if _dim > 0:
+                    _tmp_fim[_key] = slice(_fidx, _fidx + _dim)
+                    _fidx += _dim
+
+            # Allow joints_lower / joints_upper as sub-groups (mirrors the
+            # logic later used for feature_index_map).
+            _js = model_config.get("joints_split", None)
+            if _js is not None and "joints" in _tmp_fim:
+                _j = _tmp_fim["joints"]
+                _tmp_fim["joints_lower"] = slice(_j.start, _j.start + _js)
+                _tmp_fim["joints_upper"] = slice(_j.start + _js, _j.stop)
+
+            _default_b1 = ["delta_xy", "delta_yaw", "body_z", "obj_rel_pos", "obj_rel_rot6d"]
+            _default_b2 = ["joints", "body_rot6d"]
+            b1_names = model_config.get("branch1_groups", model_config.get("branch1_features", _default_b1))
+            b2_names = model_config.get("branch2_groups", model_config.get("branch2_features", _default_b2))
+
+            def _resolve(names):
+                names_out, starts, stops = [], [], []
+                for n in names:
+                    sl = _tmp_fim.get(n)
+                    if sl is None:
+                        raise ValueError(f"Unknown feature group '{n}' for dit1d_dual_grouped")
+                    names_out.append(n)
+                    starts.append(sl.start)
+                    stops.append(sl.stop)
+                return names_out, starts, stops
+
+            b1_names, b1_starts, b1_stops = _resolve(b1_names)
+            b2_names, b2_starts, b2_stops = _resolve(b2_names)
+
+            covered = sum(s2 - s1 for s1, s2 in zip(b1_starts, b1_stops)) \
+                    + sum(s2 - s1 for s1, s2 in zip(b2_starts, b2_stops))
+            assert covered == data_config["num_features"], (
+                f"branch1+branch2 groups cover {covered} dims, expected {data_config['num_features']}"
+            )
+
+            backbone_cfg = Config({
+                "name": "dit1d_dual_grouped",
+                "hidden_size": model_config.get("hidden_size", 256),
+                "branch1_depth": model_config.get("branch1_depth", 4),
+                "branch2_depth": model_config.get("branch2_depth", 4),
+                "num_heads": model_config.get("num_heads", 4),
+                "mlp_ratio": model_config.get("mlp_ratio", 4.0),
+                "pos_emb_type": model_config.get("pos_emb_type", "learned_1d"),
+                "use_gradient_checkpointing": model_config.get("use_gradient_checkpointing", False),
+                "external_cond_dropout": model_config.get("external_cond_dropout", 0.1),
+                "branch1_group_names": b1_names,
+                "branch1_group_starts": b1_starts,
+                "branch1_group_stops": b1_stops,
+                "branch2_group_names": b2_names,
+                "branch2_group_starts": b2_starts,
+                "branch2_group_stops": b2_stops,
+            })
         elif backbone_type == "unet1d":
             backbone_cfg = Config({
                 "name": "unet1d",
@@ -1379,9 +1443,10 @@ class DFoTTrajectory(nn.Module):
                             )
                 
             if inpaint:
-                # Pin t=0 of the output window to the current (most recent) history frame.
-                # state_cond is (B, H, obs_dim); index -1 is the latest observation.
-                _cur = self.state_cond[..., -1, :]  # (B, obs_dim)
+                # Pin the first H frames of the output window to the observed state history.
+                # state_cond is (B, H, obs_dim).
+                _hist = self.state_cond  # (B, H, obs_dim)
+                H = min(_hist.shape[-2], xs_pred.shape[-2])
                 for key in ("joints", "body_z", "body_rot6d", "obj_rel_pos", "obj_rel_rot6d"):
                     x_sl = f_map.get(key)
                     obs_sl = obs_f_map.get(key)
@@ -1389,7 +1454,7 @@ class DFoTTrajectory(nn.Module):
                         continue
                     if (x_sl.stop - x_sl.start) != (obs_sl.stop - obs_sl.start):
                         continue
-                    xs_pred[..., 0, x_sl] = _cur[..., obs_sl]
+                    xs_pred[..., :H, x_sl] = _hist[..., :H, obs_sl]
             
             if pbar is not None:
                 pbar.update(1)

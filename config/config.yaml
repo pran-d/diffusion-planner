@@ -4,7 +4,7 @@ data:
   task_type: "pickplace"    # "pickplace" | "reorient"  (see config_pickplace.yaml / config_reorient.yaml)
   normalization_type: "min_max"
   dataset_class: "flexible"
-  batch_size: 1024
+  batch_size: 512
   num_features: 48
   num_task_params: 4        # pickplace: [goal_dir_x, goal_dir_y, goal_dir_z, goal_dist]
   num_observations: 45
@@ -13,7 +13,7 @@ data:
   state_history: 5
   stride: 2
   normalize_goal_vec: True
-  max_obj_displacement: 1.0
+  max_obj_displacement: null
   downsample: 1
   rot_type: quat
   raw_dt: 0.01
@@ -43,24 +43,15 @@ data:
       # Uses carry-while-walking trajectories as synthetic approach phases.
       # Robot pose is kept unchanged; the object is frozen at its final drop
       # location so the trajectory reads as: walk toward stationary box, bend.
-      enabled: True
+      enabled: False
       carry_walk_aug_prob: 0.5
       seed: 123
-  
-  num_styles: 3
-  style_conditioning:
-    enabled: False
-    detection_mode: motion_then_text
-    num_styles: 3
-    seed: 42
-    tasks_file: ./test_datasets/tasks.yml
 
 model:
   type: "dfot"
   inpaint: True
-  backbone_type: "dit1d_dual"
+  backbone_type: "dit1d_dual_grouped"
   state_condition: True
-  style_condition: False
   task_condition: True
   external_cond_dropout: 0.05
   hidden_size: 256
@@ -69,7 +60,7 @@ model:
   # # dit1d_dual branch depths
   branch1_depth: 4    # World branch (delta_xy, obj pose, …)
   branch2_depth: 4    # Body branch  (joints, body_z, body_rot6d)
-  # Feature groups for each branch (must cover all 51 dims, no overlap)
+  # Feature groups for each branch (must cover all 48 dims, no overlap)
   branch1_features:
     - delta_xy
     - delta_yaw
@@ -88,8 +79,8 @@ model:
   history_aggregation: "attn"
 
 training:
-  suffix: _pickplace_approachaug
-  num_epochs: 50
+  suffix: _inbetweening
+  num_epochs: 30
   balance_task_density: False
   learning_rate: 0.0005
   save_every: 5
@@ -123,7 +114,7 @@ training:
     min_keyframes: 0
     max_keyframes: 3
     always_keep_first: False
-    keep_last_partial: False
+    keep_last_partial: True
     waypoint_noise_fraction: 0.5
     arrival_ratio: 0.85
     force_all_known_prob: 0.0

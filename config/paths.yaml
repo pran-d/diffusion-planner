@@ -9,7 +9,7 @@ paths:
 
   file_names: ["top_trajectories.npz"]
 
-  task_list_path: ./test_datasets/chosen_tasks_reorient.yml
+  task_list_path: ./test_datasets/chosen_tasks_test.yml
 
   # Directory where checkpoints and norm stats are saved
   save_dir: /scratch/project/eu-26-32/diffusion-planner/results/runs/

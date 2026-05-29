@@ -1,25 +1,27 @@
 auto_conf: False
 
 data:
+  task_type: "pickplace"    # "pickplace" | "reorient"  (see config_pickplace.yaml / config_reorient.yaml)
   normalization_type: "min_max"
   dataset_class: "flexible"
-  batch_size: 1024
+  batch_size: 512
   num_features: 48
-  num_task_params: 4
+  num_task_params: 4        # pickplace: [goal_dir_x, goal_dir_y, goal_dir_z, goal_dist]
   num_observations: 45
   start_timestep: 0
-  num_timesteps: 20
-  state_history: 2
+  num_timesteps: 50
+  state_history: 5
   stride: 2
   normalize_goal_vec: True
-  max_obj_displacement: 1.0
+  max_obj_displacement: null
   downsample: 1
-  rot_type: "quat"
+  rot_type: quat
   raw_dt: 0.01
-
   feature_order:
     - delta_xy
     - delta_yaw
+    # - obj_delta_xy
+    # - obj_z
     - joints
     - body_z
     - body_rot6d
@@ -32,52 +34,67 @@ data:
     joint_pos: "dof_pos"
     object_pos_w: "object_pos"
     object_quat_w: "object_rot"
-
+  
   augmentation:
     mirror_symmetry:
       enabled: True
       prob: 0.5
+    approach_phase:
+      # Uses carry-while-walking trajectories as synthetic approach phases.
+      # Robot pose is kept unchanged; the object is frozen at its final drop
+      # location so the trajectory reads as: walk toward stationary box, bend.
+      enabled: False
+      carry_walk_aug_prob: 0.5
+      seed: 123
 
 model:
   type: "dfot"
   inpaint: True
-  backbone_type: "dit1d"
+  backbone_type: "dit1d_dual"
   state_condition: True
   task_condition: True
   external_cond_dropout: 0.05
   hidden_size: 256
+  # dit1d-only depth (kept for backward compat when backbone_type: dit1d)
   depth: 8
+  # # dit1d_dual branch depths
+  branch1_depth: 4    # World branch (delta_xy, obj pose, …)
+  branch2_depth: 4    # Body branch  (joints, body_z, body_rot6d)
+  # Feature groups for each branch (must cover all 48 dims, no overlap)
+  branch1_features:
+    - delta_xy
+    - delta_yaw
+    # - obj_delta_xy
+    # - obj_z
+    - body_z
+    - obj_rel_pos
+    - obj_rel_rot6d
+  branch2_features:
+    - joints
+    - body_rot6d
   num_heads: 4
   mlp_ratio: 4.0
   pos_emb_type: "learned_1d"
-  group_wise_embedding: True  # per-semantic-group input projections (sum into hidden)
+  group_wise_embedding: True # only used for dit1d 
   history_aggregation: "attn"
 
-  # UNet-specific (only used when backbone_type: unet1d)
-  # channel_mult: [1, 2, 4, 8]
-  # num_res_blocks: 2
-  # attn_resolutions: [2, 3]
-
 training:
-  suffix: ""
-  num_epochs: 100
+  suffix: _baseline
+  num_epochs: 30
   balance_task_density: False
   learning_rate: 0.0005
-  save_every: 25
+  save_every: 5
   condition_dropout_prob: 
     state: 0.1
+    style: 0.05
     task: 0.2
   add_obs_noise: True
   add_goal_noise: True
-
-  # Auxiliary loss weights (set > 0 to enable)
-  smoothness_loss_weight: 0.1    # penalise frame-to-frame jitter in predicted trajectory
-  grasp_consistency_loss_weight: 0.75 # penalise obj_rel_pos drift during grasping phases
-  feet_sliding_loss_weight: 0.0 # proxy: penalise ankle velocity during GT stance phases
-    # smoothness_feature_groups: [joints, body_rot6d]  # optional: restrict to specific groups
-  grasp_distance_threshold: 0.35     # obj-body distance below which grasp gate activates
-  stance_velocity_threshold: 0.02    # ankle vel magnitude below which GT is considered stance
-
+  smoothness_loss_weight: 0.1
+  grasp_consistency_loss_weight: 0.25
+  feet_sliding_loss_weight: 0.0
+  grasp_distance_threshold: 0.35
+  stance_velocity_threshold: 0.02
   state_conditioning_noise_level:
     joints: 0.025
     body_rot6d: 0.005
@@ -85,31 +102,29 @@ training:
     obj_rel_rot6d: 0.005
     task_params: 0.025
     task_magnitude: 0.0
-
   density_sigma: 0.2
   ema_decay: 0.9995
   ema_update_after_step: 0
-  batches_per_epoch: null        # null = use full dataloader length
-
+  batches_per_epoch: null
 
   # In-betweening (waypoint-masked trajectory completion)
   inbetweening:
     enabled: True
-    resample_steps: 3      # number of times to re-mask and re-predict waypoints during training
-    min_keyframes: 0        # minimum number of unmasked keyframes per window
-    max_keyframes: 3        # maximum number of unmasked keyframes per window
-    always_keep_first: True # always keep t=0 as a full keyframe
-    keep_last_partial: True # always keep t=T-1 as a keyframe
-    waypoint_noise_fraction: 0.5  # max noise level for partial waypoint frames (fraction of total timesteps)
-    arrival_ratio: 0.85            # object reaches target in this fraction of remaining time
-    force_all_known_prob: 0.1      # prob of forcing all frames fully known
-    force_near_empty_prob: 0.1     # prob of near-empty conditioning (one group, one frame)
-   
+    resample_steps: 2
+    min_keyframes: 0
+    max_keyframes: 3
+    always_keep_first: False
+    keep_last_partial: False
+    waypoint_noise_fraction: 0.5
+    arrival_ratio: 0.85
+    force_all_known_prob: 0.0
+    force_near_empty_prob: 0.0
+
     partial_masking:
       enabled: True
-      prob: 1.0             # probability a waypoint is partial (vs full)
-      joints_split: 12      # first 12 joints = lower body (6L + 6R leg DOFs); rest = upper body
-      feature_groups:       # named groups of features for partial masking
+      prob: 1.0
+      joints_split: 12
+      feature_groups:
         locomotion: [obj_delta_xy]
         pick_place: [obj_z]
         object_pos: [obj_rel_pos, obj_rel_rot6d]
@@ -117,14 +132,14 @@ training:
         upper_body: [joints_upper]   # waist + shoulder / elbow / wrist joints (indices 12-28)
         pose: [body_rot6d]
         robot_pos: [body_z, delta_xy, delta_yaw]
-      group_keep_prob:      # per-group probability of being kept clean in a partial waypoint
-        locomotion: 0.5
+      group_keep_prob:
+        locomotion: 0.2
         pick_place: 0.2
-        lower_body: 0.15
-        upper_body: 0.15
-        object_pos: 0.0
-        pose: 0.0
-        robot_pos: 0.0
+        lower_body: 0.2
+        upper_body: 0.2
+        object_pos: 0.1
+        pose: 0.1
+        robot_pos: 0.1
       per_group_noise_fractions:
         default: 1.0
         obj_delta_xy: 0.5
@@ -139,4 +154,4 @@ noise_scheduler:
   noise_level: "random_uniform"
   scheduling_matrix: "full_sequence"
   use_fourier_noise_embedding: False
-  noise_level_conditioning_reduce: "max"  # reduce (B,T,D) -> (B,T) for timestep embedding
+  noise_level_conditioning_reduce: "max"

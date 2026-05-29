@@ -46,7 +46,7 @@ def load_yaml_with_includes(path):
         merged_conf = {}
         for inc in includes:
             if not os.path.isabs(inc):
-                inc_path = os.path.abspath(inc)
+                inc_path = os.path.abspath(os.path.join(base_dir, inc))
             else:
                 inc_path = inc
                 

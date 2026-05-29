@@ -1,0 +1,1076 @@
+\documentclass{article}
+\usepackage{amssymb}
+\usepackage{amsmath}
+\usepackage{booktabs}
+\usepackage{float}
+\usepackage{graphicx}
+\usepackage{multirow}
+\usepackage{algorithm}
+\usepackage{algpseudocode}
+\usepackage{tabularx}
+
+\usepackage{corl_2026} % Use this for the initial submission.
+% \usepackage[final]{corl_2026} % Uncomment for the camera-ready ``final'' version.
+% \usepackage[preprint]{corl_2026} % Uncomment for pre-prints (e.g., arxiv); This is like ``final'', but will remove the CORL footnote.
+
+\title{Humanoid-DART: \underline{Humanoid} Loco-Manipulation using \underline{D}iffusion-\underline{A}ugmented \underline{R}elabeling and \underline{T}racking }
+
+% The \author macro works with any number of authors. There are two
+% commands used to separate the names and addresses of multiple
+% authors: \And and \AND.
+%
+% Using \And between authors leaves it to LaTeX to determine where to
+% break the lines. Using \AND forces a line break at that point. So,
+% if LaTeX puts 3 of 4 authors names on the first line, and the last
+% on the second line, try using \AND instead of \And before the third
+% author name.
+
+% NOTE: authors will be visible only in the camera-ready and preprint versions (i.e., when using the option 'final' or 'preprint'). 
+% 	For the initial submission the authors will be anonymized.
+
+\author{
+  Jane E.~Doe\\
+  Department of Electrical Engineering and Computer Sciences\\
+  University of California Berkeley 
+  United States\\
+  \texttt{janedoe@berkeley.edu} \\
+  %% examples of more authors
+  %% \And
+  %% Coauthor \\
+  %% Affiliation \\
+  %% Address \\
+  %% \texttt{email} \\
+  %% \AND
+  %% Coauthor \\
+  %% Affiliation \\
+  %% Address \\
+  %% \texttt{email} \\
+  %% \And
+  %% Coauthor \\
+  %% Affiliation \\
+  %% Address \\
+  %% \texttt{email} \\
+  %% \And
+  %% Coauthor \\
+  %% Affiliation \\
+  %% Address \\
+  %% \texttt{email} \\
+}
+
+\newcommand{\papertitle}{Humanoid-DART}
+
+\begin{document}
+\maketitle
+
+%===============================================================================
+
+\begin{abstract}
+    Imitating human demonstrations has emerged as a dominant paradigm for learning humanoid loco-manipulation policies. However, scaling these approaches remains challenging due to the high cost of collecting diverse demonstrations and the need for continual human intervention to correct policy failures. In this paper, we present a self-supervised framework that bootstraps from sparse demonstrations and progressively expands its behavioral repertoire, enabling the learning of a goal-conditioned policy that progressively explores and labels the goal space with minimal expert supervision. Our approach combines diffusion-based trajectory generation with reinforcement learning, where reinforcement learning is used to track goal-conditioned trajectories produced by the diffusion model for a range of loco-manipulation skills. Through extensive ablation studies and comparisons with state-of-the-art methods, we demonstrate the effectiveness of our framework on multiple humanoid loco-manipulation skills. 
+\end{abstract}
+
+% Two or three meaningful keywords should be added here
+\keywords{Data augmentation, Humanoid loco-manipulation} 
+
+%===============================================================================
+
+\section{Introduction}
+Humanoid loco-manipulation requires coordinated whole-body control together with dynamic object interactions. Recent advances in imitation learning and reinforcement learning (RL) have demonstrated impressive humanoid skills by tracking expert demonstrations \cite{he2024omnih2ouniversaldexteroushumantohumanoid, he2024learning, li2025cloneclosedloopwholebodyhumanoid, liao2025beyondmimicmotiontrackingversatile}. In these approaches, demonstrations are typically collected through motion capture or VR teleoperation, retargeted to the robot embodiment, and used to train tracking-based RL policies. While recent generalist humanoid tracking policies \cite{yin2025unitrackerlearninguniversalwholebody, li2026omnitrackgeneralmotiontracking, luo2026sonicsupersizingmotiontracking} achieve broad locomotion capabilities, their success relies heavily on the availability of large-scale human motion datasets \cite{AMASS:ICCV:2019}.
+
+Extending this paradigm to contact-rich loco-manipulation remains substantially more difficult. Unlike locomotion, loco-manipulation involves large continuous task spaces defined jointly by body motion, object states, and environmental interactions. Variations in object pose, transport configuration, grasp strategy, and interaction timing create a combinatorial space that is prohibitively expensive to cover with demonstrations alone. Consequently, despite progress in general motion tracking, learning a single policy capable of robustly solving diverse loco-manipulation tasks under varying environmental conditions remains an open challenge, with existing methods typically focusing on tracking a single reference behavior \cite{yang2025omniretarget, dhedin2026dynaretargetdynamicallyfeasibleretargetingusing}.
+
+In this work, we propose a curriculum-like framework that progressively expands the distribution of feasible goal-conditioned behaviors from only a small set of initial demonstrations. Our pipeline alternates between training a goal-conditioned motion generator and a motion-tracking policy, allowing both components to bootstrap one another toward increasingly diverse goals. Compared to policy-only RL curricula, this decomposition provides several advantages: the motion generator enables structured exploration in trajectory space and improves behavioral diversity in sparse-data settings; tracking rewards provide dense, task-agnostic supervision without extensive reward engineering; and separating high-level motion generation from low-level control reduces the burden on the generative model, enabling a more efficient and scalable learning pipeline.
+% Humanoid loco-manipulation tasks require coordinated whole-body control while handling dynamic object interactions. Recent works using imitation learning and reinforcement Learning (RL) have demonstrated impressive dynamic skills by mimicking expert demonstrations \cite{he2024omnih2ouniversaldexteroushumantohumanoid, he2024learning, li2025cloneclosedloopwholebodyhumanoid, liao2025beyondmimicmotiontrackingversatile}. Traditionally, humanoid robot demonstrations are collected through motion capture or VR teleoperation by a human operator, producing a reference trajectory in human motion space. This trajectory is then retargeted to the robot embodiment and used as the target reference for a tracking-based RL policy.
+% %
+% While generalist humanoid tracking policies capable of reproducing a wide variety of motions \cite{yin2025unitrackerlearninguniversalwholebody, li2026omnitrackgeneralmotiontracking, luo2026sonicsupersizingmotiontracking} have recently achieved impressive results, these successes rely heavily on the large-scale motion datasets available from the character animation community \cite{AMASS:ICCV:2019}.
+
+% In contrast, scaling this paradigm to contact-rich loco-manipulation tasks remains far more challenging. Unlike locomotion, loco-manipulation tasks span large continuous task spaces defined not only by body motion, but also by object states and environmental interactions. For example, an object relocation task may vary in target object pose, transport height, interaction timing or grasp configuration. Capturing demonstrations that sufficiently cover this combinatorial space across many goals and objects is prohibitively labor-intensive and difficult to scale.
+
+% As a result, although motion-tracking policies have become increasingly general for locomotion behaviors, equally general loco-manipulation tracking policies remain an open problem. In particular, learning a single policy capable of robustly relocating arbitrary objects between arbitrary locations under varying environmental conditions has yet to be achieved and recent works in this area focus mainly on tracking a single reference \cite{yang2025omniretarget, dhedin2026dynaretargetdynamicallyfeasibleretargetingusing}.
+
+% In this work, we propose a curriculum-like algorithm that expands the distribution of feasible goal-conditioned behaviors from a very small set of initial demonstrations.
+% The proposed pipeline trains alternatively a goal-conditioned generator and a motion tracking policy, which bootstrap one another to reach an increasingly diverse set of goals.
+% This decomposition offers several advantages compared to traditional policy-only RL-curriculum: (i) the motion generator provides structured exploration in the space of state trajectories and improves behavioral diversity even in sparse-data settings, whereas a policy-only curriculum must discover feasible actions directly through trial-and-error; (ii) tracking rewards provide dense, task-agnostic supervision for the controller, avoiding difficult reward engineering for each task; and (iii) separating high-level motion generation from low-level control reduces the computational burden on the generative model, enabling faster and more scalable pipelines.
+
+% We separate the kinematic motion planning from the dynamic control for two main reasons: (i) it increases the expressiveness of the generative model in a sparse data setting, (ii) tracking rewards provide strong and task-agnostic training signals for the controller, and (iii) it reduces computational overload for the generative model enabling it to run faster.
+
+
+% The generated motions are iteratively refined and added back into the training distribution, enabling scalable data augmentation and subsequent large-scale policy learning across continuous task spaces. Crucially, prior simulation-based pipelines~\cite{10.1145/3721238.3730616, 10.1145/3450626.3459774} either require significant compute or rely on task-specific rewards tied to time-indexed deviations from base motions; {\papertitle} addresses both limitations through goal-conditioned generation and relabeling.
+
+% Recent simulation-based motion generation pipelines \cite{10.1145/3721238.3730616, 10.1145/3450626.3459774} demonstrate how iterative physics-based simulation can scale skill learning for character control beyond the coverage of available demonstrations. We extend those to a more general setting of goal-conditioned humanoid robot loco-manipulation.
+
+In summary, this paper makes the following contributions:
+\begin{itemize}
+    \item We present {\papertitle}, to the best of our knowledge, the first iterative trajectory augmentation pipeline for learning   
+    goal-conditioned loco-manipulation skills.%, from extremely sparse demonstrations.
+    \item We introduce three key design choices. A two-stage hierarchical goal-conditioned Diffusion Transformer (DiT) for generating humanoid \textit{and} object reference trajectories; an RL whole-body controller, conditioned on the object pose, to track those trajectories; and a curriculum-based algorithm with a goal relabeling strategy that converts near-missed rollouts into valid training signals while guiding exploration across the task space.
+    \item We introduce two architecture choices for the motion generator that improve out-of-distribution trajectory synthesis in the sparse-data regime: a \textit{dual-branch} diffusion transformer architecture that separates root and object motion from local features such as joints, and a \textit{structured partial unmasking} scheme that selectively reveals future feature groups during training to learn useful correlations. 
+    \item We validate {\papertitle} on a suite of humanoid loco-manipulation tasks (push, kick, hand-off, and pick \& place), demonstrating task-space coverage from as few as four base demonstrations and generalization to goals well 
+    beyond the seed distribution.
+\end{itemize}
+
+% Recent methods \cite{araujo2025retargetingmattersgeneralmotion, he2024learninghumantohumanoidrealtimewholebody} address the burden of manual data collection by retargeting human motions to humanoid robot embodiments - however, kinematic retargeting poses problems in loco-manipulation tasks as the robot-object contacts are difficult to infer and may be inaccurate. \cite{yang2025omniretargetinteractionpreservingdatageneration} retargets human-object-terrain interactions to humanoid embodiments while explicitly preserving spatial and contact relationships through interaction meshes. These approaches improve the accessibility of demonstrations across diverse loco-manipulation tasks. However, the resulting trajectories are often only kinematically plausible and may still contain physically inconsistent interactions, such as foot penetration, floating contacts, or unstable dynamics arising from embodiment mismatch. More importantly, such methods remain fundamentally constrained by the diversity of the human motion datasets, which restricts their state-space coverage and behavioral diversity and limits their direct usability for learning robust policies.
+
+% Moreover, many loco-manipulation problems are inherently goal-conditioned and span large continuous task spaces. For example, object relocation tasks may vary in target object pose, transport height, interaction timing, or terrain configuration. Learning policies that generalize across such continuous task distributions without task-specific reward engineering requires demonstrations covering a broad range of task parameters and robot state configurations. Retargeting pipelines therefore face a scalability bottleneck, as collecting a large number of demonstrations for every task variation incurs substantial human effort and time.
+
+% An alternative direction is to instead collect a small initial set of demonstrations for a task, and leverage physics-based simulation to synthetically generate diverse motion trajectories covering various task parameters. Recent simulation-based motion generation pipelines \cite{10.1145/3721238.3730616, 10.1145/3450626.3459774}, demonstrate the potential of iterative physics-based augmentation for scalable humanoid learning. 
+
+%===============================================================================
+
+\section{Related Work}
+\label{sec:relatedwork}
+
+\subsection{Humanoid Loco-Manipulation from Human Demonstration}
+
+The high-dimensional and underactuated dynamics of humanoid robots make loco-manipulation
+especially difficult.
+A dominant paradigm collects demonstrations via teleoperation and trains imitation-learning policies from the resulting data \cite{seo2023deep, he2024omnih2ouniversaldexteroushumantohumanoid, he2024humanplus}.
+To reduce the cost of direct data collection, retargeting pipelines transfer human motions to robot embodiments: \cite{araujo2025retargeting} and \cite{he2024learning} retarget kinematic pose sequences, while \cite{yang2025omniretarget} explicitly preserves object and terrain contact relationships through interaction meshes. \cite{dhedin2026dynaretargetdynamicallyfeasibleretargetingusing, pan2025spider} refines kinematic retargeted trajectories (which usually contain artifacts) into dynamically feasible ones which improved the RL training efficiency and performance.
+%
+Despite these advances, these approaches remain fundamentally limited by the coverage of the initial dataset. {\papertitle} addresses this bottleneck by leveraging generative models to iteratively expand the set of trajectory references, achieving an increasingly larger set of goals.
+
+% Another line of work that does not rely on human demonstrations focuses on learning contact-conditioned policies \cite{zhang2024wococo, omar2026learningactcontactunified}. These methods can execute predefined contact sequences for whole-body control, but generating such contact plans online remains challenging in practice.
+
+\subsection{Diffusion and Generative Models for Human/Humanoid Motion Synthesis}
+
+Diffusion models \cite{ho2020denoisingdiffusionprobabilisticmodels} have emerged as a powerful class of generative models, achieving strong performance in high-dimensional generation tasks such as text-conditioned image synthesis \cite{rombach2022highresolutionimagesynthesislatent}.
+In motion generation, MDM~\cite{tevet2022humanmotiondiffusionmodel} and MLD~\cite{chen2023mld} show that diffusion models can synthesize diverse and coherent human motions from text or action conditioning. More recently, \cite{xie2026textoprealtimeinteractivetextdriven, Kimodo2026} extended this line of work to directly generate retargeted humanoid trajectories.
+%
+Our motion generator adopts a similar diffusion transformer backbone but targets kinematic loco-manipulation trajectories (object trajectory included) conditioned on task goals rather than language.
+
+\subsection{Curriculum Learning and Simulation-Based Skill Discovery}
+
+In RL, curriculum learning refers to training agents by adapting task distributions or success criteria so that a single policy gradually acquires more advanced behaviors, leveraging what it previously learned \cite{JMLR:v21:20-212}. This is common practice in humanoid control as well as character animation \cite{huang2025learninghumanoidstandingupcontrol, zhang2024wococo, liu2026humanoidwholebodybadmintonmultistage, LeeLearning2021} but usually rely on a single policy that must both explore and acquire skills through environment interaction, often requiring careful reward design to cover a broad range of behaviors.
+
+Related to our work, PARC \cite{xu2025parc} introduces an iterative simulation-based augmentation framework that alternates between motion generation and physics-based tracking. Humanoid-DART addresses a fundamentally different problem: goal-conditioned loco-manipulation over a continuous object-goal space, where task completion requires explicit reasoning over robot-object contact. Beyond architecture, we introduce a curriculum and goal relabeling scheme to achieve coverage in a continuous object-goal space from as few as two seed demonstrations.
+
+% This reduces the need for extensive reward engineering, as the tracking objective is largely task-agnostic and primarily focused on reproducing generated motions rather than explicitly shaping each behavior.
+
+% Hindsight experience replay (HER) \cite{andrychowicz2017her} improve exploration in sparse-reward settings by revisiting promising states or relabeling failed rollouts into alternative goals.
+
+
+% \subsection{Diffusion Models for Motion Generation}
+
+% imitation
+% learning in manipulation. Diffusion Policy~\cite{chi2023diffusion}
+% reformulates visuomotor control as a conditional denoising process
+% over action sequences, while DP3~\cite{ze2024dp3} extends this to
+% 3D point-cloud observations and demonstrates sample-efficient
+% generalization with as few as 10 demonstrations.
+
+
+% Our motion generator
+% adopts a similar diffusion transformer backbone but targets
+% kinematic loco-manipulation trajectories conditioned on task goals
+% rather than language, and is embedded within an iterative
+% physics-based refinement loop.
+
+% Unlike these approaches, which operate in offline or single-task
+% settings, {\papertitle} embeds the diffusion generator within an iterative
+% online loop where generated trajectories are validated in physics and
+% fed back to improve the generator, enabling continuous
+% task-space expansion.
+
+
+% \subsection{Physics-Based Motion Generation and Tracking}
+
+% DeepMimic~\cite{peng2018deepmimic} established reference-state
+% initialization and motion-tracking rewards as the foundation for
+% physics-based character control via RL.
+% AMP~\cite{peng2021amp} replaced explicit tracking objectives with
+% adversarial imitation, allowing controllers to draw from large,
+% unstructured motion datasets without clip selection.
+% ASE~\cite{peng2022ase} factored this into reusable low-level skill
+% embeddings, enabling compositional high-level policies.
+
+% Directly relevant to our work, PARC~\cite{xu2025parc} iteratively
+% co-trains a kinematic motion generator and a physics-based tracking
+% controller in a self-consuming loop, progressively expanding the
+% controller's terrain traversal repertoire. 
+
+% Our framework shares this
+% co-training philosophy but extends it in three key directions:
+% (i) we operate in the goal-conditioned loco-manipulation setting
+% rather than terrain traversal, (ii) we incorporate a structured
+% quality-diversity archive and frontier curriculum to guide goal
+% sampling, and (iii) we introduce goal relabeling to preserve
+% physically plausible rollouts that miss the requested goal.
+
+% \subsection{Goal-Conditioned Learning and Goal Relabeling}
+% Goal-conditioned reinforcement learning~\cite{kaelbling1993learning}
+% frames control as learning a universal policy conditioned on a
+% desired goal state. Hindsight Experience Replay
+% (HER)~\cite{andrychowicz2017her} introduced the insight that failed
+% trajectories can be repurposed as successes under a relabeled goal,
+% dramatically improving sample efficiency in sparse-reward settings.
+
+% Our goal relabeling mechanism is inspired by this principle: rollouts
+% that miss the requested goal are relabeled with their achieved task
+% metric and retained in the archive, converting near-misses into
+% useful training signal for the diffusion generator. While HER
+% operates in the RL replay buffer, we apply relabeling to a
+% quality-diversity archive of kinematic trajectories, combining it
+% with physics-based filtering to maintain motion quality.
+	
+
+%===============================================================================
+
+\section{Methodology}
+\label{sec:methodology}
+In this work, we present {\papertitle}, a pipeline that learns loco-manipulation skills from sparse demonstrations. An overview of the pipeline can be seen on Figure \ref{fig:overview}.
+%
+\begin{figure}[t]
+    \centering
+    \includegraphics[width=0.9\linewidth]{corl_2026_template_submission/figures/Overview_4.0.1.png}
+    \caption{Overview of the proposed {\papertitle} pipeline}
+    \label{fig:overview}
+\end{figure}
+%
+Our framework consists of three tightly coupled components: a \emph{Kinematic Motion Generator} implemented as a task-conditioned diffusion model, a \emph{Physics-Based Evaluator} that validates generated motions in simulation, to discriminate good motions from bad, and a \emph{Motion Tracking Policy} trained to execute the generated trajectories. We later provide a high-level overview of each component (Sections \ref{sec:kinematic_motion_generator}, \ref{sec:physics_based_motion_evaluator}, \ref{sec:dynamic_motion_tracker} respectively), with details in the Appendix. This section focuses on the main algorithm (Section \ref{sec:algo}) and the curriculum (Section \ref{sec:curriculum}), which are key novelties of the proposed pipeline.
+
+% Thanks to a curriculum (Section \ref{sec:curriculum}), our pipeline works in a sparse data regime and requires minimal expert demonstrations to generalize to a task space.
+% How those components are coupled is presented below.
+% These components are tightly coupled in a goal curriculum (Section \ref{sec:curriculum}) that simultaneously explore new goal regions while also refining already-learned skills.
+
+\subsection{Algorithm}
+\label{sec:algo}
+
+The pipeline operates as an iterative curriculum over the current skill distribution, defined by the set of task goals covered by the existing trajectory archive $\mathcal{E}$. At each iteration, we sample $N_{\text{sampled}}$ goal states around this distribution, effectively expanding exploration to nearby but previously underrepresented regions of the task space. Conditioned on these goals, the motion generator $\pi_\theta$ produces kinematic reference trajectories, which may contain physical inconsistencies such as foot sliding, penetrations, or dynamic infeasibility.
+
+These kinematic references are then executed in a physics simulator using the motion tracking policy $\pi_\phi$, which acts as a dynamic filter by converting potentially infeasible motion plans into physically consistent rollouts. The resulting trajectories are evaluated using a fitness function $F(\tau)$, and only those exceeding a threshold $\tau_f$ are retained in the elite archive $\mathcal{E}$. Additionally, before being added to the archive, rollouts trajectories are relabelled to preserve valid goal-conditioned demonstrations.
+
+Finally, both components are updated using the expanded archive: the motion generator is retrained on $\mathcal{E}$ to improve goal-conditioned synthesis, while the tracking policy is refined via reinforcement learning to better reproduce the growing set of behaviors. Repeating this cycle progressively expands both the diversity of feasible trajectories and the coverage of the task space, enabling learning from a minimal set of initial demonstrations in a sparse-data regime.
+
+
+% The pipeline follows a curriculum, based on the current skill distribution, i.e. the task goals that were achieved by the current recorded dataset of demonstrations. It samples $N_{sampled}$ desired task goals around this skill distribution, which is then used by the motion generator to produce kinematic motion references. These reference motions need not be physically feasible - they may contain dynamic inconsistencies such as penetration, foot sliding, etc. Any such artifacts are resolved as the generated motions are then tracked by the RL policy in a physics simulator such as MuJoCo, and dynamically consistent trajectories (resulting from the RL roll-outs) are recorded from the simulator. These recorded motions are evaluated based on a fitness score, and the clean trajectories whose score passes a tunable threshold are added into the dataset of the motion generator. The whole process is repeated, thus improving the motion generator, motion tracker, and task-space coverage of the dataset with each iteration. An overview of the pipeline can be seen on Figure \ref{fig:overview}.
+
+
+\begin{algorithm}[t]
+\caption{\papertitle}
+\label{alg:dart}
+\begin{algorithmic}[1]
+
+\Require Base demonstrations $\mathcal{D}_0$, fitness threshold $\tau_f$, 
+         sampling budget $N_{\text{sampled}}$
+\Ensure  Elite archive $\mathcal{E}$, diffusion model $\pi_\theta$, 
+         motion tracker $\pi_\phi$
+
+\If{$\mathcal{D}_0$ is kinematically feasible (KF)}
+    \State Pretrain $\pi_\phi$ on $\mathcal{D}_0$; roll out $\mathcal{D}_0$ under $\pi_\phi$
+           \Comment{dynamic feasibility bootstrapping}
+    \State $\mathcal{E} \leftarrow \{\tau^* \mid F(\tau^*) \geq \tau_f\}$
+           \Comment{seed archive with DF rollouts}
+\Else
+    \State $\mathcal{E} \leftarrow \mathcal{D}_0$
+           \Comment{DF demonstrations seed archive directly}
+\EndIf
+\State Pretrain $\pi_\theta$ on $\mathcal{E}$
+       \Comment{Motion generator pretraining}
+
+\For{each generation $g$}
+    \For{each iteration $k$}
+        \State Sample $\{g_i\}_{i=1}^{N_{\text{sampled}}}$ via curriculum over $\mathcal{E}$
+               \Comment{Goal sampling}
+        \State Generate kinematic trajectories 
+               $\hat{\tau}_i \sim p_\theta(\tau \mid \tau_{\text{hist}}, g_i)$
+               \Comment{Goal-conditioned diffusion}
+        \State Roll out $\hat{\tau}_i$ under $\pi_\phi$; 
+               compute fitness $F_i$ $\forall$ $\tau^*_i$
+               \Comment{Physics evaluation}
+        \State $\mathcal{E} \leftarrow \mathcal{E} \cup \{\tau^*_i \mid F_i \geq \tau_f\}$
+               \Comment{Update elites with goal relabeling}
+        \State Retrain $\pi_\theta$ on updated $\mathcal{E}$
+               \Comment{Motion Generator Training}
+    \EndFor
+    \State Retrain $\pi_\phi$ on $\mathcal{E}$ via PPO
+           \Comment{Motion Tracker training }
+\EndFor
+
+\State \Return $\mathcal{E},\, \pi_\theta,\, \pi_\phi$
+
+\end{algorithmic}
+\end{algorithm}
+
+
+% \begin{figure}[t]
+%     \centering
+%     \includegraphics[width=\linewidth]{corl_2026_template_submission/figures/Overview.png}
+%     \caption{Overview of the proposed {\papertitle} pipeline}
+%     \label{fig:overview}
+% \end{figure}
+% \begin{figure}[t]
+%     \centering
+%     \includegraphics[width=\linewidth]{corl_2026_template_submission/figures/Overview_3.0.png}
+%     \caption{Overview of the proposed {\papertitle} pipeline}
+%     \label{fig:overview}
+% \end{figure}
+% \begin{figure}[t]
+%     \centering
+%     \includegraphics[width=\linewidth]{corl_2026_template_submission/figures/overview_new_ai.png}
+%     \caption{Overview of the proposed {\papertitle} pipeline}
+%     \label{fig:overview}
+% \end{figure}
+% \begin{figure}[t]
+%     \centering
+%     \includegraphics[width=\linewidth]{corl_2026_template_submission/figures/overview_new.png}
+%     \caption{Overview of the proposed {\papertitle} pipeline}
+%     \label{fig:overview}
+% \end{figure}
+
+
+% The three tightly coupled components are: a \textbf{Kinematic Motion Generator} (a task-conditioned diffusion transformer that synthesises robot-object trajectories from existing demonstrations), a \textbf{Dynamic Motion Tracker} (a PPO-trained RL policy that executes kinematic references in simulation), and a \textbf{Physics-Based Evaluator} (a fitness function that retains dynamically feasible \textit{elites} and discards failures).
+
+
+\subsection{Kinematic Motion Generator}\label{sec:kinematic_motion_generator}
+For motion generation, we adopt a generative modelling approach, using a goal-conditioned diffusion transformer to produce motions that lie close to the demonstration manifold. The generated motions are thus kinematically plausible, and are taken as reference trajectories for the downstream tracking controller.
+% which refines them to be dynamically feasible. 
+
+The key design decisions for improving the expressivity and the kinematic consistency of the motion generator were the motion representation, the network architecture, and training and inference techniques, which are described in the Appendix \ref{app:generator}. Namely, we introduce a \textit{dual-branch backbone} and \textit{structured partial unmasking} that increased the quality of the generated motion, as shown later in the results.
+
+% \subsection{Kinematic Motion Generator}\label{sec:kinematic_motion_generator}
+% For motion generation, we adopt a generative modelling approach, using a goal-conditioned diffusion transformer to produce motions that lie close to the demonstration manifold. The generated motions are thus kinematically plausible, and are taken as reference trajectories for the downstream tracking controller which refines them to be dynamically feasible. 
+
+% % The key design decisions for improving the expressivity and the kinematic consistency of the motion generator were the motion representation, the network architecture, and training and inference techniques, which are described in the appendix.
+
+% \subsubsection{Motion Representation}
+% The expert demonstrations are converted into a segmented egocentric representation to increase data density and enable smoother motion stitching across trajectories~\cite{shi2024interactivecharactercontrolautoregressive, seo2023deep, Guo_2022_CVPR, tevet2022humanmotiondiffusionmodel}. All features are expressed relative to the robot's local coordinate frame at $t_0$, with trajectories translated and yaw-aligned~\cite{luo2024universalhumanoidmotionrepresentations} with respect to the robot's global heading at $t_0$. This normalization removes dependence on global position and heading, allowing motion priors from different demonstrations to be more easily combined. The robot and object state at each frame $t$ is represented by (see Table~\ref{tab:feat_repr} in Appendix~\ref{app:generator}):
+% \begin{equation} \label{eq:vector_representation}
+%     \tau_t = [\Delta p_{rob,xy},\; p_{rob,z},\; \Delta \psi_{rob},\; j_{pos},\; r_{rob,xy},\; {}^{rob} p_{obj},\; {}^{rob} r_{obj}]
+% \end{equation}
+% Robot heading (yaw) is separated from the remaining base orientation to mirror the hierarchical global/local structure of the generator; the robot-relative object pose mitigates kinematic artifacts such as floating and penetration.
+
+% At inference, the motion denoiser models the conditional distribution:
+% \begin{equation} \label{eq:motion_generator_formulation}
+%     p_{\theta}(\tau_{(t_0-t_h):(t_0+t_p)} \mid \tau_{(t_0-t_h):t_0},\, g)
+% \end{equation}
+% Long-horizon sequences are synthesised auto-regressively~\cite{shi2024interactivecharactercontrolautoregressive} over overlapping segments, each conditioned on $h$ history frames from the previous segment and task goal $g$. History frames are inpainted during denoising in the style of~\cite{lugmayr2022repaint} to enforce temporal consistency, and classifier-free guidance~\cite{ho2022classifierfreediffusionguidance} is applied at inference.
+
+% \subsubsection{Network Architecture \& Training}
+% The generator uses a dual-branch diffusion transformer (DiT1D): a \textit{global stream} over root motion and object-relative features, conditioned on task goals and motion history via AdaLN \cite{peebles2023dit} modulation; and a \textit{local stream} over joint angles and body tilt, which cross-attends to the global stream to stay synchronized with the global trajectory. This hierarchical decomposition decouples coarse navigation from fine-grained pose synthesis.
+
+% Training uses partial feature masking to decorrelate feature groups and reduce memorization. Additionally, feature groups from the future frames are selectively revealed during training, encouraging the planner to infer missing motion components from partially observed states and learn useful correlations. More details on training are provided in Appendix~\ref{app:generator}.
+
+% \subsubsection{Model Inference}
+% The motion denoiser models:
+% \begin{equation} \label{eq:motion_generator_formulation}
+%     p_{\theta}(\tau_{(t_0-t_h):(t_0+t_p)} \mid \tau_{(t_0-t_h):t_0},\, g)
+% \end{equation}
+% Long-horizon sequences are synthesised auto-regressively over overlapping segments, each conditioned on $h$ history frames from the previous segment and goal $g$. History frames are inpainted during denoising in the style of~\cite{lugmayr2022repaint} to enforce temporal consistency; classifier-free guidance is applied at inference.
+
+
+\subsection{Physics-Based Motion Evaluator}\label{sec:physics_based_motion_evaluator}
+
+% \subsubsection{Physics-Based Fitness Score}
+In each iteration of the evolutionary pipeline, the motion generator produces $N_{\text{sampled}}$ candidate trajectories attempting to realize different tasks, of which several may be dynamically infeasible, untrackable, or fail to solve the task. A rigorous selection mechanism is therefore essential to keep only the high-quality \textit{elites}.
+The fitness function evaluates physical feasibility and task compliance as the product of several terms:
+\begin{equation}
+\text{Fitness}
+=
+R_{\text{pos}}
+\cdot R_{\text{vel}}
+\cdot R_{\text{contact}}
+\cdot R_{\text{root,pos}}
+\cdot R_{\text{root,ori}}
+\cdot R_{\text{leg}}
+\cdot R_{\text{obj}} .
+\end{equation}
+
+Those terms evaluate the quality of the generated motions along two axes: \textit{tracking fidelity} and 
+\textit{contact compliance}. Tracking fidelity is measured via 
+Gaussian kernel error terms over key body positions, velocities, 
+root position and orientation, and leg pose, penalizing deviation 
+from the reference trajectory. Contact compliance is enforced via 
+an indicator term that checks whether the correct end-effector 
+contacts are made at each timestep, as specified by the reference. Fitness terms are detailed in the Appendix \ref{app:fitness}.
+
+
+\subsection{Dynamic Motion Tracker}\label{sec:dynamic_motion_tracker}
+We implement a DeepMimic-inspired \cite{peng2018deepmimic} tracking controller extended to handle object-robot contacts. Rewards penalise deviations from the reference root pose, body keypoints, joint positions, and end-effector contact states. The asymmetric actor-critic policy observes a 5-step reference horizon, proprioceptive state, and object pose; the critic additionally receives privileged simulation state. Following \cite{liao2025beyondmimicmotiontrackingversatile}, we used adaptive trajectory- and state-level sampling (episodes initialised mid-trajectory) accelerates learning. Training uses massively parallelised PPO with GAE and domain randomisation over object pushes, friction, and mass for robust sim-to-real transfer. Full reward terms and network sizes are in Appendix~\ref{app:tracker}.
+
+
+
+\subsection{Curriculum}\label{sec:curriculum}
+The order in which goal targets in the task space are sampled affect the pipelines learning dynamics, both the rate at which the task space is covered and the stability of convergence. We define a task-space curriculum that governs how targets are queried across iterations. New goals are sampled inside and around an elite set $\mathcal{E}$ in order to both refine and explore skills, as described in Section \ref{sec:frontier}. We additionally relabel near goal successes to provide a better learning signal, as described in Section \ref{sec:relabel}.
+% Finally, we describe how to make the base trajectory seed dynamically feasible in Section \ref{sec:base_traj_seed}, which improved the efficiency of the pipeline as shown later in the results. 
+
+\subsubsection{Frontier Target Sampling}
+\label{sec:frontier}
+
+Let \(\mathcal{B}\) denote the set of all task-space bins induced by the
+task configuration and let \(c_b \in \mathbb{R}^{d}\) be the center of
+bin \(b\). For example, in the pick-and-place task, the task space is the 2D goal displacement $(x, y)$ of the box, discretised into a uniform
+grid of bins with resolution $\Delta = 0.02$\,m.
+% Bin centers and elite task metrics are normalised dimension-wise before comparison. 
+
+Given the current elite set
+\(\mathcal{E} = \{e_1, \dots, e_n\}\), the curriculum computes the minimum distance from the elites $d(b)$, for each bin $b$:
+\[
+    d(b) = \min_{e \in \mathcal{E}} \lVert \tilde{c}_b - \tilde{m}_e \rVert_2 ,
+\]
+
+where \(\tilde{c}_b\) is the normalized bin center and
+\(\tilde{m}_e\) is the normalized task metric of elite \(e\).
+
+Two distance thresholds partition the task space into three zones:
+\[
+    \mathcal{R} = \{ b \in \mathcal{B} \mid d(b) < \delta_{\mathrm{ref}} \},
+    \hspace{3mm}
+    \mathcal{X} = \{ b \in \mathcal{B} \mid \delta_{\mathrm{ref}} \le d(b) < \delta_{\mathrm{exp}} \},
+    \hspace{3mm}
+    \mathcal{F} = \{ b \in \mathcal{B} \mid d(b) \ge \delta_{\mathrm{exp}} \}
+\]
+
+corresponding respectively to \emph{refine} ($\mathcal{R}$), \emph{explore} ($\mathcal{X}$), and
+\emph{frontier} ($\mathcal{F}$) regions. Bins near existing elites are treated as
+refinement targets, bins at intermediate distance encourage controlled
+coverage expansion, and far-away bins represent as-yet unsolved regions
+of the task space.
+
+The archive assigns each bin a sampling weight; the probability of sampling a bin is the ratio of its weight to the sum of weights across all bins.
+
+\begin{minipage}[c]{0.48\linewidth}
+    \[
+        P(b) = \frac{w_b}{\sum_{b' \in \mathcal{B}} w_{b'}}.
+    \]
+\end{minipage}
+\hspace{-2cm} 
+\begin{minipage}[c]{0.48\linewidth}
+    \[
+        w_b =
+        \begin{cases}
+            w_{\mathrm{ref}},      & b \in \mathcal{R}, \\
+            w_{\mathrm{exp}},      & b \in \mathcal{X}, \\
+            w_{\mathrm{frontier}}, & b \in \mathcal{F},
+        \end{cases}
+    \]
+\end{minipage}
+
+
+In the reference implementation, exploration bins receive the highest
+weight, refinement bins receive a smaller but non-zero weight, and
+frontier bins receive a small probability mass so that the search
+occasionally proposes more ambitious outlying tasks. The concrete threshold and weight values, along with the remaining evolution hyperparameters, are given in Appendix~\ref{app:evolution}.
+
+\subsubsection{Goal Relabeling}
+\label{sec:relabel}
+
+The diffusion planner is conditioned on a sampled target, but the executed trajectory need not match it exactly. Rather than treating such deviations as failures, the pipeline relabels physically valid rollouts with their \emph{achieved} task metrics. This mechanism is analogous to Hindsight Experience Replay (HER)~\cite{andrychowicz2017her}, which recovers learning signal from failed goal-conditioned RL trajectories by retroactively treating the achieved state as the intended goal, and is particularly effective in early pipeline iterations where the generator is undertrained and systematic goal misses are common.
+
+% \subsubsection{Base Trajectory Seeding}
+% \label{sec:base_traj_seed}
+% Based on \cite{dhedin2026dynaretargetdynamicallyfeasibleretargetingusing, pan2025spider}, a critical consideration is the dynamic feasibility of the seed demonstrations used to initialize $\mathcal{E}$, as kinematically-feasible trajectories may contain some artifacts. When base trajectories are already dynamically feasible (DF), they are used to seed the archive directly. When only kinematically feasible (KF) demonstrations are available (often in the case of direct embodiment retargeting), a bootstrapping step is first applied: the pretrained tracker $\pi_\phi$ rolls out each KF trajectory in simulation, and the resulting physically-consistent rollouts are filtered by fitness $F \leq \tau_f$ to produce a 
+% DF-compatible seed archive. The main algorithm then proceeds identically in both cases. 
+
+%===============================================================================
+
+
+
+\section{Experimental Results}
+\label{sec:result}
+
+We evaluate {\papertitle} through a combination of real-world deployment and large-scale simulation. Our experiments are designed to answer the following questions:
+\begin{enumerate}\itemsep0em
+    \item Can extremely sparse skills be scaled to a generalized task space using a curriculum-based approach?
+    \item Can out-of-distribution skills be learned through a combination of goal-conditioned motion generation and reinforcement learning?
+    \item How does the quality and number of seed trajectories affect the pipeline's coverage rate and convergence?
+\end{enumerate}
+We use reference motions from the OmniRetarget dataset~\cite{yang2025omniretargetinteractionpreservingdatageneration}, containing hundreds of object-robot loco-manipulation trajectories. These serve as our kinematically feasible (KF) base demonstrations. To obtain dynamically feasible (DF) counterparts, each trajectory is refined using Sampling-Based Trajectory Optimisation (SBTO)~\cite{dhedin2026dynaretargetdynamicallyfeasibleretargetingusing}, which resolves artifacts and ensures contact consistency. 
+
+
+\subsection{Implementation}
+We implement {\papertitle} in MuJoCo using mjlab \cite{Zakka_mjlab_A_Lightweight_2026} for GPU-accelerated RL. The motion tracking policy runs at 50Hz, while the motion generator generates full sequences of trajectories through autoregressive stitching with inpainting to ensure successive frames are continuous. We use a timestep $\Delta t=0.005$ in MuJoCo with a decimation of 4 for the controller, and consider the full collision model of the robot. All experiments are run on a single NVIDIA RTX 5090 GPU.
+
+We evaluate our pipeline on four loco-manipulation tasks of increasing complexity: \textit{push}, \textit{kick}, \textit{hand-off}, and \textit{pick-and-place}. In pick-and-place, the robot 
+must grasp an object and transport it to a target location within a 
+planar task space parameterised by goal displacement $(x, y)$ relative to the robot's starting root pose. Push and kick share the same planar parameterisation but require distinct contact modes, 
+whole-body pushing without a grasp, and foot-contact kicking 
+respectively. Hand-off requires the robot to present an object at a target height and distance.
+For each task, we initialise the pipeline with a small set of sparse 
+base demonstrations, each capturing a distinct reference trajectory 
+to a different goal configuration. The full task parameterizations 
+are summarised in Table~\ref{tab:task_params}.
+
+% \begin{figure}[t]
+%     \centering
+%     \includegraphics[width=\linewidth]{corl_2026_template_submission/figures/results/Base_Traj.png}
+%     \caption{Sparse demonstrations used to initialise the pipeline.}
+%     \label{fig:sparse_demo_montage}
+% \end{figure}
+
+The pipeline runs for $g=4$ generations, with $k=10$ iterations per generation. At each iteration, $N_{sampled}=3000$ candidate trajectories are sampled via the curriculum and the motion generator is updated. At the end of each generation, the motion tracker is retrained on the elite buffer.
+
+\begin{figure}[t]
+    \centering
+    \includegraphics[width=\linewidth]{corl_2026_template_submission/figures/plot_bin_coverage.png}
+    \vspace{-7mm}
+    \caption{Bins are coloured by discovery order (dark purple = earliest, bright yellow = latest); green stars mark seed demonstrations; the dashed region is the target task space. Coverage grows from 0.1\% at initialisation to 96.6\% by the final generation, showing systematic task-space exploration.}
+        \label{fig:elites_progression}
+\end{figure}
+
+\subsection{Curriculum Performance}
+
+Figure \ref{fig:elites_progression} illustrates the progression of elite trajectories at representative stages throughout the pipeline for the \textit{pick-and-place} task. In early iterations, generated trajectories cluster around the base demonstrations, as expected. As the evolutionary process advances, the elite set progressively expands its coverage of the task space. By the end of the third generation, the pipeline achieves near-complete coverage of the target task space.
+A notable emergent property of the pipeline is its ability to generate and track long-horizon, task-conditioned trajectories well beyond the scope of the base demonstrations. The base trajectories are approximately 5 seconds in duration, with goal placement distances in the range of 1--2\,m. Despite this, the pipeline successfully generates trajectories to goals 4-5x further away, demonstrating generalisation across the full task space. Fig. \ref{fig:pipeline_output} shows the pipelines output, at various timestamps. 
+
+ \begin{figure}[t]
+    \centering
+    \includegraphics[width=\linewidth]{corl_2026_template_submission/figures/results/pipeline_output.png}
+    \caption{Family of learnt locomanipulation skills from the \textit{pick-and-place} task. Motions in green are the base trajectories used to seed the pipeline, the others are produced by the motion generator trained using the {\papertitle} framework}
+    \label{fig:pipeline_output}
+\end{figure}
+
+
+\subsection{Comparison with Baselines}
+We evaluate against two baselines chosen to isolate the contributions of our pipeline. Parameterised Motion~\cite{10.1145/3450626.3459774} represents the closest prior work in the space of parameterised skill generation from sparse demonstrations. Hierarchical Diffusion + RL is a method in which the diffusion trajectory generator and the RL tracker are trained jointly in a single stage on the seed trajectories only, without the evolutionary loop; following the paradigm of \cite{lin2025simgenhoi}. This isolates the benefit of our pipeline from the architectural choice of combining RL with diffusion.
+
+\begin{table}[h]
+\centering
+\caption{Final task-space coverage (\%), average fitness scores, and object stability across the loco-manipulation task suite.}
+\small
+\label{tab:coverage_tasks}
+\begin{tabular}{llcccc}
+\toprule
+\textbf{Method} & \textbf{Metric}
+  & \textbf{Push} 
+  & \textbf{Kick} 
+  & \textbf{Hand-off} 
+  & \textbf{Pick \& Place} \\
+\midrule
+\multirow{3}{*}{\textbf{\papertitle}}
+  & Cov. (\%) $\uparrow$              & \textbf{61.1} & \textbf{54.8} & \textbf{51.5} & \textbf{96.4} \\
+  & Fitness$^\dagger$ $\uparrow$      & \textbf{3.28 $\pm$ 4.10} & \textbf{19.8 $\pm$ 15.5} & 3.2 $\pm$ 2.65 & 4.9 $\pm$ 3.82 \\
+  & Obj. Stab.$^\ddagger$ $\uparrow$ & 0.60 $\pm$ 0.09 & \textbf{0.59 $\pm$ 0.08} & 0.43 $\pm$ 0.12 & \textbf{0.60 $\pm$ 0.09} \\
+\cmidrule(lr){1-6}
+\multirow{3}{*}{Param. Motion~\cite{10.1145/3450626.3459774}}
+  & Cov. (\%) $\uparrow$              & 3.86 & 23.89   & 24.4 & 5.7 \\
+  & Fitness$^\dagger$ $\uparrow$      & 2.92 $\pm$ 2.27 & 4.79 $\pm$ 1.13 & \textbf{6.91 $\pm$ 4.96} & \textbf{10.0 $\pm$ 8.48} \\
+  & Obj. Stab.$^\ddagger$ $\uparrow$ & \textbf{0.62 $\pm$ 0.15} & 0.52 $\pm$ 0.11 & \textbf{0.51 $\pm$ 0.16} & 0.52 $\pm$ 0.11 \\
+\cmidrule(lr){1-6}
+\multirow{3}{*}{Hier. Diff. + RL}
+  & Cov. (\%) $\uparrow$              & 2.2  & 2.6  & 32.0 & 6.2 \\
+  & Fitness$^\dagger$ $\uparrow$      & 1.1 $\pm$ 0.95 & 1.77 $\pm$ 0.48 & 4.1 $\pm$ 2.21 & 0.9 $\pm$ 0.19 \\
+  & Obj. Stab.$^\ddagger$ $\uparrow$ & 0.53 $\pm$ 0.08 & 0.38 $\pm$ 0.06 & 0.38 $\pm$ 0.12 & 0.37 $\pm$ 0.12 \\
+\bottomrule
+\addlinespace[4pt]
+\multicolumn{6}{l}{\small $^\dagger$ Avg. Fitness scaled by $\times 10^{-3}$.} \\
+\multicolumn{6}{l}{\small $^\ddagger$ Object deviation from reference, exponentially penalised; 1 = perfect.} \\
+\normalsize
+\end{tabular}
+\end{table}
+
+Humanoid-DART achieves dominant task-space coverage across all four tasks, demonstrating the effectiveness of the iterative pipeline. The fitness and object stability results reveal a trade-off: Parameterised Motion achieves higher fitness on hand-off and pick-and-place, as it concentrates its limited coverage on a narrow region of the task space where it can produce high-quality trajectories. In contrast, the lower average fitness of Humanoid-DART for these tasks reflects the challenge of maintaining trajectory quality across a far broader and more diverse set of goals. Hierarchical Diff. + RL consistently underperforms on both metrics, confirming that the evolutionary loop is the primary driver of performance.
+
+
+\subsection{Motion Generator Architecture}
+
+To justify our two main design decisions in isolation, we train each variant on the same four base loco-manipulation motions and evaluate it on a sweep of 20 \emph{out-of-distribution} goals. All metrics are computed directly on the generated kinematic trajectories, \emph{without} the downstream RL tracking policy, in order to isolate the quality of the planner's output independent of the controller, and capture goal-reaching accuracy, path quality, and grasp consistency. As shown in Table~\ref{tab:ablations}, the \textit{dual-branch backbone} is decisive for goal-reaching: collapsing both streams into a single flat DiT drops the success rate from $1.00$ to $0.25$, reflecting poor coordination between locomotion, manipulation, and whole-body pose. \textit{Structured partial unmasking} then improves path quality and grasp consistency: straighter, shorter object paths and lower hand–object distance. The two components together increase the attention between the robot whole-body pose and the relative object pose, which is a useful correlation in humanoid loco-manipulation, as shown in Appendix \ref{app:cross_attention}.
+% — and, as a byproduct, lets the model handle keyframe and in-betweening conditioning at inference, which is out-of-distribution for a standard full-sequence denoiser. Extended motivation for both choices is given in Appendix~\ref{app:gen_ablations}.
+
+\begin{table}[h]
+\centering
+\caption{Goal error is the
+distance between the final object position in the generated kinematic trajectory and the
+commanded goal (m); success rate reports the fraction of goals reached within $20$\,cm;
+straightness is the ratio of net displacement to path length of the object travel
+($1{=}$straight line); obj path is the total length of the object's trajectory (m);
+hand--obj is the mean hand-to-object-centre distance while the object is in the air (m).}
+\label{tab:ablations}
+\begin{tabular}{lccccc}
+\toprule
+Variant & Goal Err.\,$\downarrow$ & Success\,$\uparrow$ & Straight.\,$\uparrow$ & Obj path\,$\downarrow$ & Hand--obj\,$\downarrow$ \\
+\midrule
+\textbf{Dual-branch}(Ours)        & \textbf{0.115} & \textbf{1.00} & \textbf{0.68} & \textbf{4.70} & \textbf{0.26} \\
+Dual-branch (no unmasking)  & 0.121 & 1.00 & 0.58 & 6.30 & 0.32 \\
+Single-branch DiT           & 0.316 & 0.25 & 0.34 & 13.96 & 0.42 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\subsection{Pipeline Ablations}
+We conduct ablation studies varying the number of base demonstrations provided at initialisation, allowing us to isolate the effect of initialisation sparsity on downstream task-space coverage.
+% We evaluate scaling behaviour along two axes: \textit{Coverage rate:} The wall-clock time required to reach 20\%, 50\%, and 80\% task-space coverage as a function of the number of base trajectories.
+% \textit{Sample efficiency:} Task-space coverage achieved per number of base trajectories under a fixed computational budget.
+
+Additionally, we ablate the nature of the base trajectory used to seed the pipeline. We consider two initialisation conditions: \textit{dynamically feasible} (DF) trajectories, which exhibit correct contact sequences and are free of physical artifacts such as foot sliding and interpenetration; and \textit{kinematically feasible} (KF) trajectories, produced via kinematic retargeting only, which may contain contact inconsistencies and penetration.
+Results are summarised in Table~\ref{tab:coverage_ablation}.
+
+\begin{table}[h]
+\centering
+\caption{Task-space coverage as a function of the number and type of base 
+demonstrations. $t_{x\%}$ denotes the time (h) to reach $x\%$ coverage; 
+\textbf{--} indicates the threshold was not reached within the evaluation 
+window. Final coverage is reported at the end of the evaluation window.}
+\label{tab:coverage_ablation}
+\begin{tabular}{lllccccc}
+\toprule
+\small
+\textbf{Task} & \textbf{Init. Type} & \textbf{\# Trajs}
+  & \textbf{$t_{20\%}$} & \textbf{$t_{50\%}$}
+  & \textbf{$t_{80\%}$} & \textbf{Final Cov. (\%)} & \textbf{Avg. Fitness$^\dagger$} \\
+\midrule
+\multirow{4}{*}{\textit{pick-and-place}}
+  & \multirow{3}{*}{DF} & 1 & 1.82 & 3.64 & --   & 77.3 & $3.69 \pm 2.68$ \\
+  &                     & 2 & 1.2  & 2.0  & 3.65 & 91.2 & $4.17 \pm 4.31$ \\
+  &                     & 4 & 0.6  & 1.5  & 3.3  & 96.4 & $4.9 \pm 3.82$ \\
+\cmidrule(lr){2-8}
+  & KF                  & 2 & 2.38 & --   & --   & 28.8 & $1.37 \pm 1.02$ \\
+\midrule
+\addlinespace[4pt]
+\multicolumn{8}{l}{\small $^\dagger$ Avg. Fitness scaled by $\times 10^{-3}$.} \\
+\normalsize
+\end{tabular}
+\end{table}
+The performance gap between KF and DF initialisation (Fig \ref{tab:coverage_ablation} reflects a fundamental 
+property of the pipeline: the diffusion generator approximates the elite 
+archive distribution, and when seed trajectories are kinematically retargeted only, the generator must learn from a distribution already biased toward physically inconsistent motions. Even with fitness gating, this degrades the quality of generated candidates, reducing the fraction that pass the fitness threshold and significantly slowing coverage growth
+This is further corroborated by the average fitness scores: the KF run achieves a mean elite fitness of $1.37 \times 10^{-3}$, substantially lower 
+than all DF conditions, confirming that poor seed quality suppresses trajectory quality. Within the DF conditions, increasing the number of base trajectories consistently accelerates convergence; $t_{20\%}$ drops from 1.82h to 0.6h as demonstrations increase from 1 to 4 while also yielding higher average elite fitness, suggesting that a more 
+geometrically diverse seed set not only expands coverage faster but also produces higher-quality trajectories throughout the evolutionary process.
+
+	
+
+%===============================================================================
+
+\section{Conclusion}
+\label{sec:conclusion}
+
+We present {\papertitle}, an iterative pipeline for learning goal-conditioned 
+humanoid loco-manipulation policies from sparse demonstrations. By 
+coupling a goal-conditioned diffusion motion generator with a 
+physics-based RL tracking controller through an evolutionary pipeline, {\papertitle} progressively expands the set of physically feasible behaviors across a continuous task space without requiring large-scale human supervision. We successfully applied our framework to multiple humanoid loco-manipulation settings. 
+%
+In particular, in a pick-and-place setting parameterized by 2D goal displacement, 
+{\papertitle} achieves near-complete task-space coverage from as few as two 
+base demonstrations (20 seconds of motion), generalizing to goals four to five times beyond 
+the range of the seed trajectories. Ablation studies confirm that 
+geometric diversity of the initialisation set is a harder requirement 
+than its size, and that dynamic feasibility of seed trajectories 
+meaningfully accelerates convergence. Cross-attention analysis of the 
+trained motion generator further validates the hierarchical design: 
+local body pose synthesis attends synchronously to global navigation 
+features, and most strongly to object-relative state, consistent 
+with the intended decoupling.
+
+% We believe the iterative co-training of a generative planner and a 
+% physics-grounded controller, mediated by a quality-diversity-style 
+% archive, is a broadly applicable principle for scalable humanoid skill 
+% acquisition. Future directions include extending the pipeline to 
+% multi-object interactions, incorporating terrain variation into the 
+% task parameterization, and using reusable score-matching motion priors (SMP) to shape the elite distribution towards naturalistic behaviors.
+
+
+\section{Limitations}
+The proposed pipeline inherits the stylistic and kinematic biases of the seed demonstrations, meaning that artifacts such as unnatural contact sequences or poor posture can propagate and be amplified during generation. As a result, the fitness function plays a critical role in shaping the trajectory distribution, and poorly calibrated thresholds can either admit degenerate behaviors or overly restrict exploration. In addition, the diffusion generator is fundamentally limited by the diversity of the elite archive and cannot discover qualitatively new strategies outside the demonstrated manifold. Consequently, performance strongly depends on the geometric diversity of the seed demonstrations, which still requires human curation. Finally, our evaluation is restricted to a single object geometry and flat terrain; extending the framework to more diverse objects, contact properties, and uneven environments remains important future work.
+% While {\papertitle} demonstrates promising task-space coverage from sparse demonstrations, several limitations remain.
+
+% \paragraph{Seed quality propagation.}
+% The evolutionary pipeline inherits the stylistic and kinematic characteristics of the seed demonstrations: any artifacts present in the initial elite set, such as unnatural contact sequences or poor body posture, can be reproduced and amplified by the diffusion generator in subsequent iterations. The fitness function is therefore critical not only as a filter but as a shaping mechanism for the trajectory distribution. Poorly calibrated fitness thresholds can either allow degenerate motions to accumulate in the archive or over-constrain early exploration, stalling coverage growth. This sensitivity motivates future work on learned or adaptive fitness functions.
+
+% \paragraph{Seed diversity is a hard requirement.}
+% The diffusion generator interpolates and extrapolates within the manifold defined by the elite archive. It cannot spontaneously produce qualitatively different motion strategies that are not in the initial demonstrations. As shown in Table~\ref{tab:coverage_ablation}, a single seed demonstration leads to early saturation regardless of additional compute, as the generator lacks sufficient trajectory diversity to escape the local neighbourhood of the initial demonstration. The pipeline's performance is therefore contingent on the geometric diversity of the seed set, which itself requires some human effort to curate across representative goal regions. 
+
+% \paragraph{Low-dimensional task spaces.}
+% Current experiments parameterise the task by 2D planar goal displacement. Scaling to higher-dimensional task spaces — such as 3D goal pose, multi-object interactions, or tasks with discrete mode changes (e.g. opening a door before placing an object) — may require richer archive structures and more expressive goal conditioning, and is left to future work.
+
+% \paragraph{Fixed object and terrain configuration.}
+% The pipeline is evaluated on a single object geometry and flat terrain. Real-world loco-manipulation involves varied object shapes, masses, and surface properties, as well as uneven terrain that can alter feasible contact strategies. Incorporating such variation into the task parameterisation and domain randomisation scheme is a natural extension.
+
+%===============================================================================
+
+\clearpage
+% The acknowledgments are automatically included only in the final and preprint versions of the paper.
+\acknowledgments{If a paper is accepted, the final camera-ready version will (and probably should) include acknowledgments. All acknowledgments go at the end of the paper, including thanks to reviewers who gave useful comments, to colleagues who contributed to the ideas, and to funding agencies and corporate sponsors that provided financial support.}
+
+%===============================================================================
+
+% no \bibliographystyle is required, since the corl style is automatically used.
+\bibliography{example}  % .bib
+
+\clearpage
+\appendix
+\section{Appendix}
+\label{sec:appendix}
+
+This appendix reports the full implementation details for the components described in Section~\ref{sec:methodology}. 
+
+\subsection{Kinematic Motion Generator}
+\label{app:generator}
+
+\subsubsection{Motion Representation}
+\label{app:motion_representation}
+The expert demonstrations are converted into a segmented egocentric representation to increase data density and enable smoother motion stitching across trajectories~\cite{shi2024interactivecharactercontrolautoregressive, seo2023deep, Guo_2022_CVPR, tevet2022humanmotiondiffusionmodel}. All features are expressed relative to the robot's local coordinate frame at $t_0$, with trajectories translated and yaw-aligned~\cite{luo2024universalhumanoidmotionrepresentations} with respect to the robot's global heading at $t_0$. This normalization removes dependence on global position and heading, allowing motion priors from different demonstrations to be more easily combined. The robot and object state at each frame $t$ is represented by (see Table~\ref{tab:feat_repr} in Appendix~\ref{app:generator}):
+\begin{equation} \label{eq:vector_representation}
+    \tau_t = [\Delta p_{rob,xy},\; p_{rob,z},\; \Delta \psi_{rob},\; j_{pos},\; r_{rob,xy},\; {}^{rob} p_{obj},\; {}^{rob} r_{obj}]
+\end{equation}
+Robot heading (yaw) is separated from the remaining base orientation to mirror the hierarchical global/local structure of the generator; the robot-relative object pose mitigates kinematic artifacts such as floating and penetration.
+
+Table~\ref{tab:feat_repr} lists the per-frame features comprising $\tau_t$ (Eq.~\eqref{eq:vector_representation}).
+
+\begin{table}[h]
+\centering\small
+\caption{Per-frame trajectory features $\tau_t$.}
+\label{tab:feat_repr}
+\setlength{\tabcolsep}{4pt}
+\begin{tabular}{@{}llp{6cm}@{}}
+\toprule
+\textbf{Symbol} & \textbf{Dim} & \textbf{Description} \\
+\midrule
+$\Delta p_{rob,xy}$ & $\mathbb{R}^2$     & Root x-y displacement in yaw-aligned egocentric frame at $t_0$ \\
+$p_{rob,z}$         & $\mathbb{R}^1$     & Absolute root height in world frame \\
+$\Delta\psi_{rob}$  & $\mathbb{R}^1$     & Root yaw rotation about $z$-axis \\
+$j_{pos}$           & $\mathbb{R}^{N_j}$ & Joint angles relative to robot default pose \\
+$r_{rob,xy}$        & $\mathbb{R}^6$     & Root pitch \& roll in 6D rotation representation~\cite{zhou2019continuity} \\
+${}^{rob}p_{obj}$   & $\mathbb{R}^3$     & Object position in robot base frame \\
+${}^{rob}r_{obj}$   & $\mathbb{R}^6$     & Object orientation in robot base frame (6D) \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\subsubsection{Network Architecture}
+\label{app:network_architecture}
+
+Two design choices distinguish our generator from a standard diffusion transformer.\\
+\textbf{(i) Dual-branch backbone.} The generator is a dual-branch DiT1D with a \textit{global stream} over root motion and object-relative features $\{\Delta p_{rob,xy}, \Delta\psi_{rob}, p_{rob,z}, {}^{rob}p_{obj}, {}^{rob}r_{obj}\}$, conditioned on task goals and motion history via AdaLN~\cite{peebles2023dit} modulation, and a \textit{local stream} over body pose features $\{j_{pos}, r_{rob,xy}\}$. The local stream cross-attends to the global stream to stay synchronized with the global trajectory, decoupling coarse navigation from fine-grained pose synthesis. Factorizing the state this way---coupling a world/navigation stream and a body-kinematics stream via cross-attention---has been shown to improve motion diversity in human motion generation~\citep{Kimodo2026}, whereas a single flat stream mixes locomotion, manipulation, and whole-body pose and hinders their coordination.\\
+\textbf{(ii) Structured partial unmasking.} Inspired by diffusion forcing~\cite{chen2024diffusionforcingnexttokenprediction}, which exposes the denoiser to partially denoised contexts via independent per-token noise levels, we selectively reveal feature groups from future frames during training. This encourages the planner to infer the remaining motion components from partially observed states and to learn correlations between feature groups rather than treating each independently. As a byproduct, the model natively supports keyframe and motion in-betweening at inference.
+
+The backbone uses a hidden size of $256$, $8$ transformer blocks total ($4$ per branch), $4$ attention heads, and an MLP ratio of $4.0$. Positional information uses a learned 1D embedding with group-wise feature embeddings; history is aggregated via attention; goal and state conditioning are injected via AdaLN-Zero modulation. The trajectory feature dimension is $C=48$. The model is conditioned on a $4$-dimensional task goal $g=[\,g_{dir,x}, g_{dir,y}, g_{dir,z}, g_{dist}\,]$ and a $45$-dimensional observation, with $t_h=2$ history frames. Each denoised segment spans a horizon of $p=10$ frames at a stride of $2$ (reference $\Delta t = 0.02$\,s).
+
+\subsubsection{Training}
+\label{app:training}
+We use a $v$-prediction objective with a sigmoid $\beta$-schedule and $200$ training noise steps, and train for $100$ epochs with batch size $1024$, learning rate $5\times10^{-4}$, and an EMA of decay $0.9995$.
+
+Demonstrations are augmented with mirror-symmetry (probability $0.5$), and structured state-conditioning noise is injected into history frames per feature group to improve out-of-distribution robustness. Following \cite{tessler2024maskedmimicunifiedphysicsbasedcharacter}, we additionally drop state conditioning signals from the history at random during training: classifier-free guidance uses condition dropout of $0.1$ (state) and $0.2$ (task goal). 
+
+The denoising objective $\mathcal{L}_{\mathrm{diff}}$ is augmented with a temporal-smoothness term ($\lambda_s = 0.1$) and a grasp-consistency term ($\lambda_g = 0.25$), both computed only over valid consecutive-frame pairs, to suppress floating, penetration, and jerk artifacts:
+\[
+\mathcal{L} = \mathcal{L}_{\mathrm{diff}} + \lambda_s\,\mathcal{L}_{\mathrm{smooth}} + \lambda_g\,\mathcal{L}_{\mathrm{grasp}}.
+\]
+
+\subsubsection{Inference}
+\label{app:inference}
+At inference, the motion denoiser models the conditional distribution:
+\begin{equation} \label{eq:motion_generator_formulation}
+    p_{\theta}(\tau_{(t_0-t_h):(t_0+t_p)} \mid \tau_{(t_0-t_h):t_0},\, g)
+\end{equation}
+using $10$ deterministic DDIM steps. Long-horizon sequences are synthesised auto-regressively~\cite{shi2024interactivecharactercontrolautoregressive, lin2025simgenhoi} over overlapping segments, each conditioned on $h$ history frames from the previous segment and task goal $g$. History frames are inpainted (RePaint-style)~\cite{lugmayr2022repaint} during denoising to enforce temporal consistency, and classifier-free guidance~\cite{ho2022classifierfreediffusionguidance} is applied with a tunable guidance weight.
+
+
+\subsubsection{Cross-attention analysis}
+\label{app:cross_attention}
+
+To verify that the local stream exploits the global stream as intended in Section \ref{sec:methodology}, we inspect the local-to-global cross-attention of the trained motion generator with and without structured partial unmasking. Each query token in the local stream---a single feature group of $\tau_t$ at one time step---attends to the global-stream key tokens; Figure~\ref{fig:cross_attn} reports the resulting group cross-attention from the local-stream queries (rows) to the global-stream keys (columns), averaged over the attention heads and cross-attention layers. Without unmasking (Fig.~\ref{fig:cross_attn}, Left), attention collapses heavily onto the root height $p_{rob,z}$ and largely ignores the object-relative pose. With unmasking (Right), the local stream additionally attends to the object-relative position and orientation (${}^{rob}p_{obj}, {}^{rob}r_{obj}$), recovering a correlation between whole-body pose synthesis and object interaction that is highly relevant to humanoid loco-manipulation.
+
+\begin{figure}[h!]
+    \centering
+    \includegraphics[width=\linewidth]{corl_2026_template_submission/figures/cross-attn-comparison.png}
+    \caption{Effect of structured partial unmasking on local-to-global cross-attention. Structured partial unmasking increases the attention of robot joints and pose to the object pose.}
+    \label{fig:cross_attn}
+\end{figure}
+
+
+
+% \subsubsection{Network Architecture \& Training}
+% \label{app:network_architecture}
+
+% \paragraph{Architecture.}
+% Two design choices distinguish our generator from a standard diffusion transformer. \\
+% \textbf{(i) Dual-branch backbone.} The generator is a dual-branch DiT1D with a \textit{global stream} over root motion and object-relative features $\{\Delta p_{rob,xy}, \Delta\psi_{rob}, p_{rob,z}, {}^{rob}p_{obj}, {}^{rob}r_{obj}\}$, conditioned on task goals and motion history via AdaLN~\cite{peebles2023dit} modulation, and a \textit{local stream} over body pose features $\{j_{pos}, r_{rob,xy}\}$. The local stream cross-attends to the global stream to stay synchronized with the global trajectory, decoupling coarse navigation from fine-grained pose synthesis.\\
+% \textbf{(ii) Structured Partial Conditioning.} During training, feature groups from future frames are selectively revealed, encouraging the planner to infer the remaining motion components from partially observed states and learn useful cross-feature correlations. As a byproduct, the model natively supports keyframe and motion in-betweening at inference. 
+
+% The backbone uses a hidden size of $256$, $8$ transformer blocks total ($4$ per branch), $4$ attention heads, and an MLP ratio of $4.0$. Positional information uses a learned 1D embedding with group-wise feature embeddings; history is aggregated via attention; goal and state conditioning are injected via AdaLN-Zero modulation.
+
+% \paragraph{Training.}
+% Demonstrations are augmented with mirror-symmetry (probability $0.5$) and structured state-conditioning noise is injected into history frames per feature group to improve out-of-distribution robustness. The denoising objective is augmented with temporal-smoothness ($\lambda_s = 0.1$) and grasp-consistency ($\lambda_g = 0.25$) losses to suppress floating, penetration, and jerk artifacts:
+% \[
+% \mathcal{L} = \mathcal{L}_{\mathrm{diff}} + \lambda_s\,\mathcal{L}_{\mathrm{smooth}} + \lambda_g\,\mathcal{L}_{\mathrm{grasp}}.
+% \]
+
+% \subsubsection{Network Architecture}
+% \label{app:network_architecture}
+% Two design choices distinguish our generator from a standard diffusion transformer:
+
+% \textbf{(i) Dual-branch backbone.} The generator is a dual-branch diffusion transformer (DiT1D) with a \textit{global stream} over root motion and object-relative features, conditioned on task goals and motion history via AdaLN \cite{peebles2023dit} modulation, and a \textit{local stream} over body pose (joint angles and body tilt). The local stream cross-attends to the global stream to stay synchronized with the global trajectory, decoupling coarse navigation from fine-grained pose synthesis.
+
+% \textbf{(ii) Structured feature unmasking.} During training, feature groups from the future frames are selectively revealed, encouraging the planner to infer the remaining motion components from partially observed states and to learn useful cross-feature correlations. As a byproduct, the model natively supports keyframe and motion in-betweening at inference.
+
+% \subsubsection{Architecture}
+% The motion generator is a dual-branch diffusion transformer (DiT1D) trained with the diffusion-forcing formulation. It uses a hidden size of $256$, a total depth of $8$ transformer blocks ($4$ in the global branch and $4$ in the local branch), $4$ attention heads, and an MLP ratio of $4.0$. Positional information uses a learned 1D embedding with group-wise feature embeddings, and history is aggregated via attention. The two streams of Section~\ref{sec:methodology} are realized as: a \emph{global branch} over $\{\Delta p_{rob,xy}, \Delta\psi_{rob}, p_{rob,z}, {}^{rob}p_{obj}, {}^{rob}r_{obj}\}$, and a \emph{local branch} over $\{j_{pos}, r_{rob,xy}\}$. Goal and state conditioning are injected via AdaLN-Zero modulation, and the local branch cross-attends to the global branch.
+
+ % Figure~\ref{fig:cross_attn} (left) exposes the temporal coupling between the local stream at body time $t$ and the global stream at time $t'$: attention concentrates along the diagonal $t = t'$, indicating that whole-body pose synthesis attends to the global trajectory \emph{synchronously} rather than anticipating or lagging it.
+ 
+ % Figure~\ref{fig:cross_attn} (right) reveals which components of $\tau_t$ drive each local-stream feature group: the joint configuration and the body tilt attend most strongly to the object-relative pose $\,{}^{rob}p_{obj}$ and $\,{}^{rob}r_{obj}$. This confirms that the cross-attention layers learn an interpretable task-relevant correlation between global navigation and local pose prediction.
+
+% \begin{figure}[h]
+%     \centering
+%     \includegraphics[width=\linewidth]{corl_2026_template_submission/figures/cross-attn-comparison.png}
+%     \caption{Cross-attention correlation from the local stream (query) to the global stream (key) in the trained motion generator, summed over cross-attention layers and averaged over attention heads. \textbf{Left:} temporal coupling between local-stream time $t$ and global-stream time $t'$; the dashed line marks $t = t'$. \textbf{Right:} feature-group coupling, showing the attention placed by each local-stream feature group (rows) on each global-stream feature group (columns); feature groups follow the trajectory representation in Eq.~\eqref{eq:vector_representation}.}
+%     \label{fig:cross_attn}
+% \end{figure}
+
+% \subsubsection{Training}
+% Few techniques are used for training the diffusion model to improve out-of-distribution generalization. Demonstrations are augmented with mirror-symmetry augmentation and structured state-conditioning noise injection into history frames per feature group. It uses partial information masking to reduce overfitting and decorrelate features. The denoising objective is augmented with temporal-smoothness and grasp-consistency losses to suppress floating, penetration, and jerk artifacts.
+
+% \subsubsection{Inference}
+
+% At inference, the motion denoiser models the conditional distribution:
+% \begin{equation} \label{eq:motion_generator_formulation}
+%     p_{\theta}(\tau_{(t_0-t_h):(t_0+t_p)} \mid \tau_{(t_0-t_h):t_0},\, g)
+% \end{equation}
+% Long-horizon sequences are synthesised auto-regressively~\cite{shi2024interactivecharactercontrolautoregressive} over overlapping segments, each conditioned on $h$ history frames from the previous segment and task goal $g$. History frames are inpainted during denoising in the style of~\cite{lugmayr2022repaint} to enforce temporal consistency, and classifier-free guidance~\cite{ho2022classifierfreediffusionguidance} is applied at inference.
+
+
+% \subsubsection{Physics-aware auxiliary losses}
+% In addition to the standard denoising loss $\mathcal{L}_{\mathrm{diff}}$, we apply a temporal-smoothness term ($\lambda_s = 0.1$) and a grasp-consistency term ($\lambda_g = 0.25$), both computed only over valid consecutive-frame pairs. 
+% \[
+% \mathcal{L} = \mathcal{L}_{\mathrm{diff}} + \lambda_s\,\mathcal{L}_{\mathrm{smooth}} + \lambda_g\,\mathcal{L}_{\mathrm{grasp}}.
+% \]
+
+% \subsubsection{Inputs and horizon}
+% The trajectory feature dimension is $C=48$. The model is conditioned on a $4$-dimensional task goal $g=[\,g_{dir,x}, g_{dir,y}, g_{dir,z}, g_{dist}\,]$ and a $45$-dimensional observation, with $t_h=2$ history frames. Each denoised segment spans a horizon of $p=10$ frames at a stride of $2$ (reference $\Delta t = 0.02$\,s).
+
+% \subsubsection{Diffusion process}
+% We use a $v$-prediction objective with a sigmoid $\beta$-schedule, $200$ training noise steps and $10$ deterministic (DDIM) inference steps. The model is trained for $100$ epochs with batch size $1024$, learning rate $5\times10^{-4}$, and an EMA of decay $0.9995$.
+
+% \subsubsection{Conditioning and guidance.}
+% Classifier-free guidance uses condition dropout of $0.1$ (state) and $0.2$ (task goal) during training, with a tunable guidance weight at inference. History frames are inpainted (RePaint-style) during denoising to enforce temporal consistency.
+
+
+\subsection{Physics-Based Fitness Score}
+\label{app:fitness}
+
+The fitness function is the product of Gaussian tracking terms and an indicator contact term; a zero-gate sets fitness to $0$ on early termination. Table~\ref{tab:fitness_terms} lists all terms and their $\sigma$ values.
+\begin{table}[h]
+\centering
+\caption{Fitness terms used for rollout evaluation (Gaussian: $\exp(-\|\cdot\|^2/\sigma^2)$; Indicator: $\mathbb{I}[\cdot]$; Zero-gate: sets fitness to $0$ on early termination).}
+\label{tab:fitness_terms}
+\small
+\setlength{\tabcolsep}{5pt}
+\renewcommand{\arraystretch}{1.2}
+\begin{tabular}{@{}lccp{6.0cm}@{}}
+\toprule
+\textbf{Term} & \textbf{Error Type} & $\sigma$ & \textbf{Description} \\
+\midrule
+\multicolumn{4}{l}{\textit{Tracking}} \\
+\midrule
+Body Position    $R_{\text{pos}}$       & Gaussian  & 0.05 & Global position error across all body links \\
+Body Velocity    $R_{\text{vel}}$       & Gaussian  & 1.0  & Linear velocity error across all body links \\
+Root Position    $R_{\text{root,pos}}$  & Gaussian  & 0.05 & Global position error of the pelvis root \\
+Root Orientation $R_{\text{root,ori}}$  & Gaussian  & 0.4  & Orientation error of the pelvis root frame \\
+Leg Tracking     $R_{\text{leg}}$       & Gaussian  & 0.04 & Joint-space error for lower-limb links only \\
+\midrule
+\multicolumn{4}{l}{\textit{Object Interaction}} \\
+\midrule
+Contact $R_{\text{contact}}$            & Indicator & ---  & Binary check for expected hand-object contact \\
+Object  $R_{\text{obj}}$                & Gaussian  & 1.0  & 6-DoF pose error of the manipulated object \\
+\midrule
+\multicolumn{4}{l}{\textit{Failure Handling}} \\
+\midrule
+Failure Gating                          & Zero-gate & ---  & Zeros total fitness on fall or early termination \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\subsection{Dynamic Motion Tracker}
+\label{app:tracker}
+
+The motion trackers' network architectures are summarised in Table \ref{tab:actor_critic}, observation terms in Table \ref{tab:Obs Motion Tracker}, and tracking rewards are in Table~\ref{tab:tracker_rewards}.
+
+\begin{table}[h]
+\centering
+\caption{Actor-critic network architecture for the tracking controller.}
+\small
+\begin{tabular}{@{}ll@{}}
+\toprule
+Hyperparameter & Value \\
+\midrule
+Architecture & MLP actor + MLP critic \\
+Actor hidden layers & $512 \to 256 \to 128$ \\
+Critic hidden layers & $512 \to 256 \to 128$ \\
+Activation & ELU \\
+Initial action noise $\sigma_0$ & 1.0 \\
+Actor observation normalisation & Yes \\
+Critic observation normalisation & Yes \\
+Action clipping & None \\
+\bottomrule
+\end{tabular}
+\label{tab:actor_critic}
+\end{table}
+
+
+\begin{table}[t]
+\centering
+\caption{Observation terms used by the motion-tracking policy. A = actor observation; C = privileged critic observation.}
+\label{tab:Obs Motion Tracker}
+\small
+\begin{tabular}{@{}l p{6.5cm} c c@{}}
+\toprule
+Term & Description & Dim & Type \\
+\midrule
+reference & Current reference $[q^{\text{ref}}, \dot{q}^{\text{ref}}]$ plus five future reference frames at offsets $[2,3,5,17,33]$, each containing relative anchor position, 6D orientation, and reference joint positions and velocities. & $460$ & A, C \\[4pt]
+body\_pos & Actual tracked-body positions in the current robot anchor frame. & $3{\times}14 = 42$ & C \\[4pt]
+body\_ori & Actual tracked-body orientations in the current robot anchor frame, using 6D rotation representation. & $6{\times}14 = 84$ & C \\[4pt]
+base\_lin\_vel & Robot IMU linear velocity. & $3$ & A, C \\[4pt]
+base\_ang\_vel & Robot IMU angular velocity. & $3$ & A, C \\[4pt]
+joint\_pos & Actual joint positions relative to the default pose. & $29$ & A, C \\[4pt]
+joint\_vel & Actual joint velocities relative to the default baseline. & $29$ & A, C \\[4pt]
+actions & Last action applied by the policy, one value per actuated joint. & $29$ & A, C \\[4pt]
+object\_global\_pos & Reference object position in the current robot anchor frame. & $3$ & A, C \\[4pt]
+object\_global\_ori & Reference object orientation in the current robot anchor frame. & $3$ & A, C \\[4pt]
+\bottomrule
+\end{tabular}
+\vspace{4pt}
+\end{table}
+
+
+
+\begin{table}[tp]
+\centering
+\caption{Dynamic motion tracker reward terms (exponential form $\exp(-\lVert\cdot\rVert^2/\sigma^2)$ unless noted). Negative weights are penalties; \textbf{---} indicates no $\sigma$ parameter.}
+\label{tab:tracker_rewards}
+\small
+\begin{tabular}{@{}llcc@{}}
+\toprule
+\textbf{Group} & \textbf{Term} & \textbf{Weight} & $\sigma$ \\
+\midrule
+\multirow{6}{*}{\textit{Motion tracking}}
+ & Global root position      & $0.5$   & $0.30$ \\
+ & Global root orientation   & $0.5$   & $0.40$ \\
+ & Relative body position    & $1.0$   & $0.30$ \\
+ & Relative body orientation & $1.0$   & $0.40$ \\
+ & Body linear velocity      & $1.0$   & $1.00$ \\
+ & Body angular velocity     & $1.0$   & $3.14$ \\
+\cmidrule(l){2-4}
+\multirow{4}{*}{\textit{Object interaction}}
+ & EEF contact match         & $2.0$   & ---    \\
+ & Object global position    & $1.0$   & $0.25$ \\
+ & Object global orientation & $0.65$  & $0.40$ \\
+ & Relative EEF position     & $1.1$   & $0.10$ \\
+\cmidrule(l){2-4}
+\multirow{4}{*}{\textit{Regularization}}
+ & Action rate ($\ell_2$)    & $-0.1$   & ---    \\
+ & Joint-limit violation     & $-10.0$  & ---    \\
+ & Self-collision            & $-10.0$  & ---    \\
+ & Bad termination           & $-100.0$ & ---    \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+
+\begin{table}[h]
+\centering
+\caption{PPO algorithm hyperparameters for the tracking controller.}
+\small
+\begin{tabular}{@{}ll@{}}
+\toprule
+Hyperparameter & Value \\
+\midrule
+Number of environments & 4\,096 \\
+Steps per environment per update & 24 \\
+Learning epochs per update & 5 \\
+Mini-batches per epoch & 4 \\
+Learning rate & $1\times10^{-3}$ \\
+LR schedule & Adaptive (KL-target) \\
+Discount factor $\gamma$ & 0.99 \\
+GAE $\lambda$ & 0.95 \\
+PPO clip parameter $\varepsilon$ & 0.2 \\
+Value loss coefficient & 1.0 \\
+Entropy coefficient & 0.005 \\
+Desired KL divergence & 0.01 \\
+Max gradient norm & 1.0 \\
+Clipped value loss & Yes \\
+\bottomrule
+\end{tabular}
+\label{tab:ppo}
+\end{table}
+
+\begin{table}[h]
+\centering
+\caption{Domain randomisation applied during tracking controller training. $^\dagger$Box-manipulation variants only.}
+\small
+\begin{tabular}{@{}lll@{}}
+\toprule
+Name & Description & Range \\
+\midrule
+Push robot & Random velocity impulse applied to robot body & Lin.: $\pm0.5$ m/s; Ang.: $\pm0.52$ rad/s \\
+Base CoM offset & Additive noise to torso link inertial position (startup) & $x$: $\pm0.025$ m;\ $y,z$: $\pm0.05$ m \\
+Joint default pos. & Additive noise to all joint default positions (startup) & $\pm0.01$ rad \\
+Foot friction & Absolute foot geom friction coefficient (startup) & $[0.8,\ 1.1]$ \\
+Push object$^\dagger$ & Random velocity impulse applied to box & Lin.: $\pm0.5$ m/s; Ang.: $\pm1.5$ rad/s; \\
+Object mass$^\dagger$ & Scale factor on box body mass (startup) & $[0.7,\ 1.3]\times$ \\
+Hand friction$^\dagger$ & Absolute wrist geom friction coefficient (startup) & $[0.9,\ 1.1]$ \\
+\midrule
+\multicolumn{3}{@{}l}{\textit{Reference State Initialisation (RSI)}} \\
+\midrule
+Root position & Per-episode random offset to initial root position & $\pm0.05$ m $(x,y)$;\ $\pm0.01$ m $(z)$ \\
+Root orientation & Per-episode random offset to initial root orientation & $\pm0.1$ \\
+Root linear vel. & Per-episode random offset to initial linear velocity & $\pm0.5$ m/s $(x,y,z)$ \\
+Root angular vel. & Per-episode random offset to initial angular velocity & $\pm0.52$ rad/s \\
+Joint positions & Per-episode random offset to initial joint positions & $\pm0.1$ rad \\
+\bottomrule
+\end{tabular}
+\label{tab:domain_randomisation}
+\end{table}
+
+\subsection{Pipeline Hyperparameters and Curriculum}
+\label{app:evolution}
+
+\begin{center}
+\begin{tabular}{lc}
+\toprule
+\textbf{Hyperparameter} & \textbf{Value} \\
+\midrule
+Generations & 4 \\
+Iterations per generation & 10 \\
+Candidates sampled per iteration & 3000 \\
+Elite fitness threshold $\tau_f$ & $5 \times 10^{-4}$ \\
+Goal relabeling neighbors $k$ & 5 \\
+Goal relabeling tolerance radius & 0.02 \\
+Max elites for generator retraining & 200 \\
+Generator epochs per iteration & 20 \\
+Generator epochs (initial fit) & 40 \\
+Generation chunk size & 3000 \\
+\midrule
+Refine threshold $\delta_\text{ref}$ & 0.01 \\
+Explore threshold $\delta_\text{exp}$ & 0.025 \\
+Frontier sampling probability & 0.01 \\
+Bin resolution $\Delta$ & 0.02 m \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\subsection{Robot, Object, and Task}
+\label{app:robot}
+
+Experiments use the Unitree G1 humanoid with $29$ actuated degrees of freedom. The policy observation comprises a $5$-step horizon of the reference motion, the current proprioceptive state, and the object pose; the critic additionally receives privileged simulation state. The manipulated object is a box with randomized friction (range $[0.8, 1.1]$) and mass about its nominal value. The pick-and-place task is parameterized by the planar $(x, y)$ displacement of the target object relative to the starting root pose.
+
+\subsubsection{Task Space Parameterisations}
+\begin{table}[h]
+\centering
+\caption{Task parameterizations used in evaluation. Each task is defined 
+by one or more continuously varying axes; the pipeline is evaluated on 
+its ability to cover the full Cartesian product of these ranges.}
+\label{tab:task_params}
+\renewcommand{\arraystretch}{1.2}
+\begin{tabular}{llcc}
+\toprule
+\textbf{Task} & \textbf{Task Axis} & \textbf{Range} & \textbf{\#Base Trajs} \\
+\midrule
+\multirow{2}{*}{Pick \& Place} 
+  & Final box $x$ (m) & $[-3.0,\ 5.0]$ & \multirow{2}{*}{4} \\
+  & Final box $y$ (m) & $[\ 4.4,\ 1.6]$ & \\
+\midrule
+\multirow{2}{*}{Push}
+  & Final box $x$ (m) & $[-0.5,\ 2.5]$ & \multirow{2}{*}{4} \\
+  & Final box $y$ (m) & $[\ -1.8,\ 1.2]$ & \\
+\midrule
+\multirow{2}{*}{Kick}
+  & Final box $x$ (m) & $[-0.5,\ 2.5]$ & \multirow{2}{*}{4} \\
+  & Final box $y$ (m) & $[\ -1.8,\ 1.2]$ & \\
+\midrule
+\multirow{2}{*}{Hand-off}
+  & Hand-off height (m)   & $[0.7,\ 1.3]$ & \multirow{2}{*}{2} \\
+  & Hand-off distance (m) & $[0.25,\ 0.55]$ & \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\end{document}

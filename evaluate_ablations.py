@@ -46,6 +46,7 @@ except ImportError:
 
 from config.configure import (
     load_config,
+    load_yaml_with_includes,
     get_save_path,
     get_data_path,
     get_norm_path,
@@ -97,12 +98,16 @@ def build_merged_temp_config(
     tmp_dir: str | None = None,
 ) -> str:
     """Return path to a temp YAML that is base+override, with optional suffix override."""
-    with open(override_cfg_path, "r", encoding="utf-8") as f:
-        override = yaml.safe_load(f) or {}
-    if not isinstance(override, dict):
+    # Use include-aware loader so any `includes:` directives in the ablation file
+    # are resolved (and removed) here, rather than carried into the merged temp
+    # YAML where load_config would try to re-resolve them from the wrong base_dir.
+    override = load_yaml_with_includes(override_cfg_path)
+    if override is None or not isinstance(override, dict):
         override = {}
+    override.pop("includes", None)
 
     data = deep_merge(base_cfg, override)
+    data.pop("includes", None)
     if suffix is not None:
         data.setdefault("training", {})["suffix"] = suffix
 

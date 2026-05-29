@@ -45,6 +45,7 @@ dependencies = [
     "sympy==1.14.0",
     "networkx==3.4.2",
     "setuptools>=82.0.1",
+    "imageio[ffmpeg]>=2.37.3",
 ]
 
 [tool.uv]
