@@ -9,8 +9,8 @@ data:
   num_task_params: 4        # pickplace: [goal_dir_x, goal_dir_y, goal_dir_z, goal_dist]
   num_observations: 45
   start_timestep: 0
-  num_timesteps: 50
-  state_history: 5
+  num_timesteps: 20
+  state_history: 4
   stride: 2
   normalize_goal_vec: True
   max_obj_displacement: 1.0
@@ -36,14 +36,14 @@ data:
     object_quat_w: "object_rot"
   
   augmentation:
-    mirror_symmetry:
+    mirror_symmetry:  
       enabled: True
       prob: 0.5
     approach_phase:
       # Uses carry-while-walking trajectories as synthetic approach phases.
       # Robot pose is kept unchanged; the object is frozen at its final drop
       # location so the trajectory reads as: walk toward stationary box, bend.
-      enabled: True
+      enabled: False
       carry_walk_aug_prob: 0.5
       seed: 123
   
